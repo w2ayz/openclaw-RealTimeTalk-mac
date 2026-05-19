@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+.DS_Store
+venv/
+*.log
+speaker_cal_store.json
