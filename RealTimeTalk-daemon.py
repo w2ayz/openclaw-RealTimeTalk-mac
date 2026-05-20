@@ -159,6 +159,7 @@ _post_busy_until:  list = [0.0] # timestamp; mic sends silence until this time a
 _http_interrupt:   list = [False]  # set by /interrupt HTTP route to cut TTS mid-playback
 _is_speaking:      list = [False]  # True while speak() is playing audio
 _current_think_task: list = [None]  # asyncio.Task for current gw.ask(); cancelled by /interrupt
+_last_mic_cb:        list = [0.0]   # epoch of last _mic_cb invocation — used for hot-plug detection
 
 
 def _list_audio_devices() -> dict:
@@ -1381,8 +1382,11 @@ class RealtimeSession:
         self._active      = False             # start silent; wake phrase enables voice
         self._monitoring  = False             # passive capture-only mode (no Zeebot, no TTS)
         self._multilang   = False             # False = only show/process EN/ZH
+        self._mic_stream_ref: list = [None]   # current sd.InputStream; swapped on hot-plug
 
     def _mic_cb(self, indata, frames, time_info, status):
+        import time as _tcb0
+        _last_mic_cb[0] = _tcb0.time()
         raw = indata[::RESAMPLE_RATIO, 0]
         raw_peak = int(np.max(np.abs(raw)))
         with _mic_level_lock:
@@ -1476,7 +1480,7 @@ class RealtimeSession:
             )
             return
         noise_peak = max(peaks)
-        new_gate = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.25)))
+        new_gate = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.5)))
         MIC_GATE_PEAK = new_gate
         log.info("Calibration: noise_peak=%d → MIC_GATE_PEAK=%d", noise_peak, new_gate)
         # Persist to service file so it survives restarts
@@ -1486,6 +1490,79 @@ class RealtimeSession:
             f"Done. Noise gate set to {new_gate}. Speak normally now.",
             self.alsa_output
         )
+
+    async def _watch_mic_stream(self):
+        """Detect USB mic hot-unplug and reopen the stream when replugged."""
+        import time as _wm
+        await asyncio.sleep(5.0)   # let stream settle before watching
+        while not self.stop_event.is_set():
+            await asyncio.sleep(2.0)
+            if self.stop_event.is_set():
+                break
+            elapsed = _wm.time() - _last_mic_cb[0]
+            if elapsed < 4.0:
+                continue
+            # Callbacks stopped for 4 s — assume hot-unplug. Try to reopen.
+            log.warning("Mic silent %.1fs — hot-plug recovery starting", elapsed)
+            old = self._mic_stream_ref[0]
+            try:
+                if old:
+                    old.stop()
+                    old.close()
+            except Exception:
+                pass
+            self._mic_stream_ref[0] = None
+
+            # PortAudio caches the device list at init time — it won't see the
+            # replugged USB mic without a full terminate + reinitialize cycle.
+            # Wait briefly first so the OS has time to enumerate the new device.
+            await asyncio.sleep(1.5)
+            try:
+                sd._terminate()
+                sd._initialize()
+                log.info("PortAudio reinitialized for hot-plug")
+            except Exception as e:
+                log.warning("PortAudio reinit error: %s", e)
+
+            # Resolve new device index via subprocess (same technique used by
+            # /device-status) so we get a fresh enumeration, not the stale cache.
+            prefs = _load_device_prefs()
+            saved_name = prefs.get("input_device_name") if prefs else None
+            new_idx = self.input_device  # fallback
+            if saved_name:
+                try:
+                    _qr = subprocess.run(
+                        [sys.executable, "-c",
+                         "import sounddevice as sd, json;"
+                         "print(json.dumps([d['name'] for d in sd.query_devices()]))"],
+                        capture_output=True, text=True, timeout=5)
+                    if _qr.returncode == 0:
+                        names = json.loads(_qr.stdout)
+                        for i, n in enumerate(names):
+                            if (saved_name.lower() in n.lower()
+                                    or n.lower() in saved_name.lower()):
+                                new_idx = i
+                                break
+                except Exception as e:
+                    log.warning("Subprocess device query failed: %s", e)
+
+            log.info("Hot-plug: attempting to reopen mic on device idx=%s (%s)",
+                     new_idx, saved_name or "default")
+            try:
+                new_stream = sd.InputStream(
+                    samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
+                    blocksize=DEVICE_BLOCKSIZE, callback=self._mic_cb,
+                    device=new_idx,
+                )
+                new_stream.start()
+                self._mic_stream_ref[0] = new_stream
+                _selected_input_device[0] = new_idx
+                _last_mic_cb[0] = _wm.time()   # reset to avoid immediate re-trigger
+                log.info("Mic stream reopened after hot-plug (device idx=%s)", new_idx)
+                _log_entry("system", "Mic reconnected.")
+            except Exception as e:
+                log.warning("Mic reconnect failed (%s) — will retry in 2s", e)
+                _last_mic_cb[0] = _wm.time()   # back off; don't spam
 
     async def _send_mic(self, ws):
         while not self.stop_event.is_set():
@@ -1761,23 +1838,34 @@ class RealtimeSession:
             }))
             log.info("Session active — speak now (routed through Zeebot / OpenClaw)")
 
+            import time as _rt
             in_stream = sd.InputStream(
                 samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
                 blocksize=DEVICE_BLOCKSIZE, callback=self._mic_cb,
                 device=self.input_device,
             )
+            in_stream.start()
+            self._mic_stream_ref[0] = in_stream
+            _last_mic_cb[0] = _rt.time()   # seed so watchdog doesn't fire immediately
 
-            with in_stream:
+            try:
                 tasks = [
                     asyncio.create_task(self._send_mic(ws)),
                     asyncio.create_task(self._recv_ws(ws)),
                     asyncio.create_task(self.stop_event.wait()),
+                    asyncio.create_task(self._watch_mic_stream()),
                 ]
                 done, pending = await asyncio.wait(
                     tasks, return_when=asyncio.FIRST_COMPLETED
                 )
                 for task in pending:
                     task.cancel()
+            finally:
+                s = self._mic_stream_ref[0]
+                if s:
+                    try: s.stop(); s.close()
+                    except Exception: pass
+                self._mic_stream_ref[0] = None
 
 # ── HTTP toggle server ────────────────────────────────────────────────────────
 
@@ -2326,7 +2414,7 @@ function setCalMode(mode){{
                             peaks.append(_mic_level_current[0])
                     peaks = peaks[2:]
                     noise_peak = max(peaks) if peaks else 0
-                    new_gate = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.25)))
+                    new_gate = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.5)))
                     _mic_gate_ref[0] = new_gate
                     MIC_GATE_PEAK = new_gate
                     log.info("HTTP calibration: noise_peak=%d → gate=%d", noise_peak, new_gate)
@@ -3070,7 +3158,7 @@ def calibrate_mic(input_device=None, duration: float = 3.0) -> int:
         import time; time.sleep(duration)
     peaks = peaks[2:]  # discard first two frames (hardware warmup)
     noise_peak = max(peaks) if peaks else 0
-    recommended = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.25)))
+    recommended = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.5)))
     print(f"Noise floor peak: {noise_peak}  →  recommended MIC_GATE_PEAK: {recommended} (clamped {MIC_GATE_MIN}–{MIC_GATE_MAX})")
     return recommended
 
