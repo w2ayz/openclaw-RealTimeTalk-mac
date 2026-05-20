@@ -5,7 +5,7 @@ description: >
   openclaw-RealTimeTalk). Captures mic via CoreAudio (sounddevice), streams to
   OpenAI Realtime API for STT, routes transcripts through the OpenClaw gateway,
   and synthesises replies with Edge TTS (with macOS `say` fallback).
-  Voice activation: "Five wake up" / "Five go to sleep".
+  Voice activation: "Zeebot wake up" / "Zeebot go to sleep".
 ---
 
 # RealTimeTalk Mac — Skill Guide

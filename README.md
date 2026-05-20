@@ -1,11 +1,11 @@
 # openclaw-RealTimeTalk-mac
 
-Real-time voice conversations with the OpenClaw agent (Five), adapted from
+Real-time voice conversations with the OpenClaw agent (Zeebot), adapted from
 [openclaw-RealTimeTalk](https://github.com/w2ayz/openclaw-RealTimeTalk) (Raspberry Pi)
 to run on a Mac Mini.
 
 ```
-Mic → OpenAI Realtime API (VAD + STT) → OpenClaw gateway → Five → Edge TTS → Speaker
+Mic → OpenAI Realtime API (VAD + STT) → OpenClaw gateway → Zeebot → Edge TTS → Speaker
 ```
 
 A web dashboard on `http://localhost:19000/dashboard` exposes wake/sleep, a
@@ -100,7 +100,7 @@ Or via HTTP:
 - `GET http://localhost:19000/sleep` — deactivate
 - `GET http://localhost:19000/restart` — restart daemon
 
-Or via voice (when active): say "Five wake up", "Five go to sleep",
+Or via voice (when active): say "Zeebot wake up", "Zeebot go to sleep",
 "calibrate mic", etc.
 
 ---
@@ -156,7 +156,7 @@ Mic (CoreAudio)
                     └─ transcript event
                         ├─ Wake/sleep / command matcher  (skip if matched)
                         └─ GatewayClient.ask()  (OpenClaw chat.send → agent.wait)
-                            └─ Five's reply text
+                            └─ Zeebot's reply text
                                 └─ speak()
                                     ├─ _split_by_script()  (en / zh)
                                     ├─ Edge TTS  (per segment)  ← timeout 8s → say fallback
@@ -168,7 +168,7 @@ Mic (CoreAudio)
 ```
 
 End-to-end latency: ~4–12 seconds, dominated by VAD silence window (1.1s)
-and Five's reasoning time.
+and Zeebot's reasoning time.
 
 ---
 
