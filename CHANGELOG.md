@@ -1,6 +1,54 @@
 # Changelog
 
-## [1.0-mac] — 2026-05-18
+## [1.1.0] — 2026-05-19
+
+### Added
+- Dashboard **interrupt button** on "Zeebot is thinking…" line — cancels
+  in-flight `gw.ask()` task via `asyncio.Task.cancel()`.
+- Dashboard **✕ Stop** button on "Zeebot is speaking…" banner — stops TTS
+  mid-sentence and saves text for resume.
+- Dashboard **▶ Continue** button — resumes paused TTS via `/continue` route
+  and `RealtimeSession._resume_from_http()`.
+- `/interrupt`, `/continue` HTTP routes; `start_http_server` now receives the
+  asyncio loop for thread-safe task cancellation.
+- `_is_speaking`, `_current_think_task`, `_http_interrupt` global flags for
+  cross-thread interrupt coordination.
+- Voice commands: **"Zeebot start/stop monitoring"** toggle monitoring mode
+  without going through the gateway (`MONITOR_ON_PHRASES` / `MONITOR_OFF_PHRASES`).
+- `langdetect` integration for non-EN/ZH filtering of Latin-script hallucinations.
+- History fallback for `message`-tool replies: when gateway returns a status
+  token ("Sent.", "Done."), daemon fetches real content from `chat.history`
+  instead of erroring.
+- `__version__` constant in daemon for version tracking.
+
+### Changed
+- Wake/sleep/monitor phrases now checked **before** the language gate — fixes
+  "Zeebot wake up" being dropped as non-English.
+- Dashboard nav reordered: Clear Log → Restart → Gateway Reset → Calibration.
+- "Reset" renamed **Clear Log**; separate **Gateway Reset** button added.
+- **Restart** button fixed to use `launchctl kickstart -k` (was `systemctl`).
+- Thinking entries now resolve in the log when any "system" entry follows them
+  (fixes stale "thinking…" counter after gateway errors or cancellation).
+- Removed automatic gateway restart on status-token responses — Gateway Reset
+  is manual only.
+- History fallback sleep increased 0.6 s → 1.2 s for tool-call persistence.
+- Dashboard state banner now shows THINKING / SPEAKING / PAUSED states.
+
+### Audio tuning
+- `MIC_GAIN` 3.0 → 5.0×
+- `MIC_GATE_PEAK` 300 → 20 (ambient noise floor)
+- `MIC_GATE_MIN` 300 → 15
+- OpenAI VAD `threshold` 0.45 → 0.35 (more sensitive)
+- `prefix_padding_ms` 300 → 500 ms (capture speech onset)
+- `silence_duration_ms` 1100 → 700 ms (faster end-of-utterance)
+- WebRTC noise suppression aggressiveness 1 → 2
+- `SPEAK_INTERRUPT_PEAK` floor 300 → 150
+- `SPEAK_INTERRUPT_BLOCKS` 6 → 3 (150 ms sustained to interrupt)
+- `INTERRUPT_SAFETY` factor 3.0 → 1.8×
+
+---
+
+## [1.0.0] — 2026-05-18
 
 Initial Mac Mini fork of [openclaw-RealTimeTalk](https://github.com/w2ayz/openclaw-RealTimeTalk) (v1.3 Pi).
 
