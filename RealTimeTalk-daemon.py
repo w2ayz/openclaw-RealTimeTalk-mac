@@ -1955,25 +1955,25 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
 {headset_notice}
 <table style="border-collapse:collapse;margin:4px 0;width:100%;">
   <tr>
-    <td style="color:#aaa;font-size:13px;width:32px;">Vol</td>
-    <td style="font-weight:bold;font-size:1.1em;width:62px;" id="volval">{ds["spk_vol"]}</td>
+    <td style="color:#5a7088;font-size:13px;width:32px;font-family:'JetBrains Mono',monospace;">Vol</td>
+    <td style="font-weight:bold;font-size:1.1em;width:62px;font-family:'JetBrains Mono',monospace;" id="volval">{ds["spk_vol"]}</td>
     <td><div class="row" style="margin:0;gap:5px;">
       <button class="bQ" onclick="adjVol(-10)">− Quieter</button>
       <button class="bL" onclick="adjVol(+10)">+ Louder</button>
     </div></td>
   </tr>
   <tr>
-    <td style="color:#aaa;font-size:13px;">SW</td>
-    <td style="font-weight:bold;font-size:1.1em;" id="swval">{ds["sw_pct"]}%</td>
+    <td style="color:#5a7088;font-size:13px;font-family:'JetBrains Mono',monospace;">SW</td>
+    <td style="font-weight:bold;font-size:1.1em;font-family:'JetBrains Mono',monospace;" id="swval">{ds["sw_pct"]}%</td>
     <td><div class="row" style="margin:0;gap:5px;">
       <button class="bQ" onclick="adjSW(-10)">− Softer</button>
       <button class="bL" onclick="adjSW(+10)">+ Louder</button>
     </div></td>
   </tr>
   <tr>
-    <td style="color:#aaa;font-size:13px;">Eff</td>
-    <td style="font-weight:bold;font-size:1.1em;color:#5f5;" id="effval">{ds["effective_pct"]}%</td>
-    <td style="color:#888;font-size:12px;">Vol × SW combined</td>
+    <td style="color:#5a7088;font-size:13px;font-family:'JetBrains Mono',monospace;">Eff</td>
+    <td style="font-weight:bold;font-size:1.1em;color:#34d399;font-family:'JetBrains Mono',monospace;" id="effval">{ds["effective_pct"]}%</td>
+    <td style="color:#5a7088;font-size:12px;">Vol × SW combined</td>
   </tr>
 </table>
 <div class="row" style="margin:4px 0;">
@@ -1990,75 +1990,91 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
 <div class="row"><button id="acbtn" onclick="runCal()">Run auto calibration</button></div>
 </div>""")
                 body = f"""<!DOCTYPE html><html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Calibration</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Calibration — RealTimeTalk</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
 <style>
-body{{font-family:sans-serif;font-size:14px;background:#111;color:#eee;padding:8px 12px;max-width:640px;}}
-h3{{margin:0 0 6px;font-size:16px;}} h4{{margin:4px 0 2px;font-size:14px;color:#9cf;}}
-.info{{color:#aaa;font-size:13px;margin:2px 0;}}
-.warn{{background:#5a1a00;border-radius:5px;padding:5px 8px;margin-bottom:4px;font-size:13px;}}
-.devpanel{{background:#1a1a2a;border-radius:6px;padding:6px 10px;margin-bottom:6px;font-size:13px;line-height:1.6;}}
-.devpanel b{{color:#eee;}}
-.sect{{border-top:1px solid #333;margin-top:8px;padding-top:6px;}}
-canvas{{width:100%;height:36px;border-radius:5px;display:block;margin:4px 0;}}
-#micinfo{{font-size:13px;color:#aaa;margin:2px 0;min-height:16px;}}
-#micresult{{margin-top:6px;padding:6px;background:#1a3a1a;border-radius:5px;font-size:13px;color:#7f7;display:none;}}
-#calstatus{{margin:4px 0;font-size:13px;min-height:16px;}}
-#mstatus{{margin-top:3px;font-size:13px;}}
-.row{{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0;}}
-button{{padding:7px 14px;border:none;color:#fff;border-radius:6px;font-size:13px;cursor:pointer;}}
-#micbtn{{background:#2a5;}} #micbtn:disabled{{background:#555;cursor:default;}}
-#acbtn{{background:#2a5;}} #acbtn:disabled{{background:#555;cursor:default;}}
-.bQ{{background:#555;}} .bL{{background:#2a5;}} .bP{{background:#226;}}
-.bS{{background:#622;}} .bSet{{background:#a62;}}
-.snrtbl{{border-collapse:collapse;font-size:12px;margin:4px 0;width:100%;}}
-.snrtbl th,.snrtbl td{{border:1px solid #333;padding:3px 6px;text-align:left;}}
-.snrtbl tr.active-row{{background:#1a3a1a;}}
-.use-btn{{padding:3px 10px;font-size:12px;background:#446;border:none;color:#fff;border-radius:4px;cursor:pointer;white-space:nowrap;}}
-.use-btn:hover{{background:#558;}}
-.use-btn.active{{background:#272;cursor:default;}}
-#devbtn{{background:#446;font-size:13px;padding:6px 14px;}}
-#devtoggle{{color:#9cf;cursor:pointer;font-size:13px;background:none;border:none;padding:0;margin-left:6px;}}
-#devlist{{margin-top:6px;}}
-#devmsg{{font-size:13px;color:#fa0;}}
-a{{color:#7af;font-size:14px;}}
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+:root{{--bg:#07090f;--sf:#0d1119;--sf2:#121925;--bd:#1a2535;--tx:#dde4ef;--mu:#5a7088;--di:#253344;--you:#38bdf8;--bot:#f59e0b;--bb:#130e02;--rd:#ef4444;--rdb:#150303;--gn:#34d399;--gnb:#021a0e;--r:8px;}}
+body{{font-family:'Outfit',system-ui,sans-serif;font-size:15px;background:var(--bg);color:var(--tx);padding:12px 16px;max-width:680px;-webkit-text-size-adjust:100%;}}
+.ph{{display:flex;align-items:center;gap:10px;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--bd);}}
+.pt{{font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;color:var(--tx);letter-spacing:.08em;text-transform:uppercase;}}
+a.back{{margin-left:auto;display:inline-flex;align-items:center;gap:4px;padding:5px 12px;border-radius:8px;font-size:13px;font-weight:500;color:var(--mu);background:var(--sf2);border:1px solid var(--bd);text-decoration:none;transition:border-color .12s,color .12s;}}
+a.back:hover{{border-color:var(--you);color:var(--you);}}
+.devpanel{{font-family:'JetBrains Mono',monospace;font-size:12px;color:#8aa0b8;line-height:1.7;padding:7px 10px;background:var(--bg);border-radius:5px;border:1px solid var(--di);margin-bottom:10px;}}
+.devpanel b{{color:var(--tx);}}
+.sect{{border-top:1px solid var(--bd);margin-top:14px;padding-top:10px;}}
+h4{{font-family:'Outfit',sans-serif;font-size:14px;font-weight:600;color:var(--you);margin:0 0 6px;}}
+.info{{color:var(--mu);font-size:13px;margin:3px 0;}}
+.warn{{background:#3a1500;border:1px solid #7a3000;border-radius:6px;padding:6px 10px;margin-bottom:6px;font-size:13px;color:var(--bot);}}
+canvas{{width:100%;height:38px;border-radius:5px;display:block;margin:6px 0;}}
+#micinfo{{font-size:12px;color:var(--mu);margin:2px 0;min-height:16px;font-family:'JetBrains Mono',monospace;}}
+#micresult{{margin-top:6px;padding:7px 10px;background:var(--gnb);border:1px solid var(--gn);border-radius:6px;font-size:13px;color:var(--gn);display:none;}}
+#calstatus{{margin:4px 0;font-size:13px;min-height:16px;color:var(--mu);font-family:'JetBrains Mono',monospace;}}
+#mstatus{{margin-top:4px;font-size:13px;color:var(--mu);}}
+.row{{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0;}}
+button{{padding:7px 14px;border:1px solid var(--bd);color:var(--mu);background:var(--sf2);border-radius:8px;font-family:'Outfit',sans-serif;font-size:14px;font-weight:500;cursor:pointer;transition:border-color .12s,color .12s,background .12s;}}
+button:hover{{border-color:var(--you);color:var(--you);background:#1e2d3d;}}
+button:disabled{{opacity:.4;cursor:default;border-color:var(--bd);color:var(--mu);background:var(--sf2);}}
+#micbtn,#acbtn{{color:var(--gn);border-color:var(--gn);background:var(--gnb);}}
+#micbtn:hover,#acbtn:hover{{background:#042e18;color:var(--gn);border-color:var(--gn);}}
+.bL{{color:var(--gn);border-color:var(--gn);background:var(--gnb);}}
+.bL:hover{{background:#042e18;}}
+.bP{{color:var(--you);border-color:var(--you);background:#051928;}}
+.bP:hover{{background:#0a2840;}}
+.bS{{color:var(--rd);border-color:var(--rd);background:var(--rdb);}}
+.bS:hover{{background:#2a0808;}}
+.bSet{{color:var(--bot);border-color:var(--bot);background:var(--bb);}}
+.bSet:hover{{background:#261b03;}}
+.snrtbl{{border-collapse:collapse;font-size:12px;margin:6px 0;width:100%;font-family:'JetBrains Mono',monospace;}}
+.snrtbl th{{background:var(--sf2);color:var(--mu);font-weight:600;border:1px solid var(--bd);padding:4px 8px;text-align:left;}}
+.snrtbl td{{border:1px solid var(--bd);padding:4px 8px;color:var(--tx);}}
+.snrtbl tr.active-row{{background:var(--gnb);}}
+.use-btn{{padding:4px 10px;font-size:12px;background:var(--sf2);border:1px solid var(--bd);color:var(--mu);border-radius:5px;cursor:pointer;white-space:nowrap;font-family:'Outfit',sans-serif;transition:border-color .12s,color .12s;}}
+.use-btn:hover{{border-color:var(--you);color:var(--you);}}
+.use-btn.active{{background:var(--gnb);border-color:var(--gn);color:var(--gn);cursor:default;}}
+#devbtn{{color:var(--you);border-color:var(--you);background:#051928;}}
+#devbtn:hover{{background:#0a2840;color:var(--you);border-color:var(--you);}}
+#devtoggle{{color:var(--you);cursor:pointer;font-size:13px;background:none;border:none;padding:0;margin-left:6px;font-family:'Outfit',sans-serif;}}
+#devlist{{margin-top:8px;}}
+#devmsg{{font-size:13px;color:var(--bot);font-family:'JetBrains Mono',monospace;}}
+a{{color:var(--you);text-decoration:none;}}
+a:hover{{text-decoration:underline;}}
 </style></head><body>
-<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">
-  <h3 style="margin:0;">Calibration</h3>
-  <a href="/dashboard" style="font-size:13px;color:#7af;">← Dashboard</a>
+<div class="ph">
+  <span class="pt">&#9679;&nbsp;Calibration</span>
+  <a href="/dashboard" class="back">&#8592; Dashboard</a>
 </div>
 <div class="devpanel" id="curdev">
-  <b>Mic:</b> {ds["mic"]} &nbsp;|&nbsp; Gate: <span id="panelgate">{ds["gate"]}</span> &nbsp;|&nbsp; Gain: {ds["gain"]}x<br>
-  <b>Speaker:</b> {ds["speaker_name"]} &nbsp;|&nbsp; Vol: <span id="panelvol">{ds["spk_vol"]}</span> &nbsp;|&nbsp; SW: <span id="panelsw">{ds["sw_pct"]}%</span>
-  &nbsp;|&nbsp; <b>Effective: <span id="paneleff" style="color:#5f5">{ds["effective_pct"]}%</span></b>
+  <b>Mic:</b> {ds["mic"]} &nbsp;&middot;&nbsp; Gate: <span id="panelgate">{ds["gate"]}</span> &nbsp;&middot;&nbsp; Gain: {ds["gain"]}x<br>
+  <b>Speaker:</b> {ds["speaker_name"]} &nbsp;&middot;&nbsp; Vol: <span id="panelvol">{ds["spk_vol"]}</span> &nbsp;&middot;&nbsp; SW: <span id="panelsw">{ds["sw_pct"]}%</span> &nbsp;&middot;&nbsp; <b>Eff: <span id="paneleff" style="color:var(--gn)">{ds["effective_pct"]}%</span></b>
 </div>
-<div style="display:flex;align-items:center;gap:8px;margin:4px 0 6px;">
-  <span style="font-size:12px;color:#aaa;">Cal mode:</span>
-  <b style="font-size:13px;color:{'#fa0' if is_headset else '#5f5'};">{_mode_label}</b>
-  <button onclick="setCalMode('headset')" style="padding:3px 10px;font-size:12px;background:{'#622' if is_headset and _override else '#444'};border:none;color:#fff;border-radius:4px;cursor:pointer;">Headset</button>
-  <button onclick="setCalMode('speaker')" style="padding:3px 10px;font-size:12px;background:{'#2a5' if not is_headset and _override else '#444'};border:none;color:#fff;border-radius:4px;cursor:pointer;">Speaker</button>
-  <button onclick="setCalMode('auto')" style="padding:3px 10px;font-size:12px;background:{'#446' if _override is None else '#444'};border:none;color:#fff;border-radius:4px;cursor:pointer;">Auto</button>
+<div style="display:flex;align-items:center;gap:8px;margin:4px 0 10px;flex-wrap:wrap;">
+  <span style="font-size:12px;color:var(--mu);font-family:'JetBrains Mono',monospace;">Cal mode:</span>
+  <b style="font-size:13px;color:{'#f59e0b' if is_headset else '#34d399'};">{_mode_label}</b>
+  <button onclick="setCalMode('headset')" style="padding:4px 11px;font-size:13px;{'color:#f59e0b;border-color:#f59e0b;background:#130e02;' if is_headset and _override else ''}">Headset</button>
+  <button onclick="setCalMode('speaker')" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if not is_headset and _override else ''}">Speaker</button>
+  <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
 </div>
 {spk_adj_section}
-<div style="margin:10px 0 4px;display:flex;align-items:center;gap:10px;">
+<div style="margin:14px 0 6px;display:flex;align-items:center;gap:10px;">
   <button id="devbtn" onclick="toggleDevices()">Audio Devices</button>
-  <span id="devtoggle" onclick="toggleDevices()">▼ expand</span>
+  <span id="devtoggle" onclick="toggleDevices()">&#9660; expand</span>
 </div>
 <div id="devlist" style="display:none;">
   <div id="devout" style="font-size:14px;">Loading…</div>
 </div>
-
-
 <div class="sect"><h4>Mic calibration</h4>
-<p class="info">Yellow line = gate threshold. Speech above the line passes; noise below is silenced.</p>
+<p class="info">Yellow line = gate threshold. Speech above passes; noise below is silenced.</p>
 <canvas id="meter" height="36"></canvas>
-<div id="micinfo" style="font-size:12px;color:#aaa;margin:2px 0;min-height:14px;"></div>
+<div id="micinfo"></div>
 <div style="display:flex;align-items:center;gap:8px;margin:6px 0;">
-  <span style="font-size:12px;color:#aaa;white-space:nowrap;">Gate:</span>
+  <span style="font-size:12px;color:var(--mu);white-space:nowrap;font-family:'JetBrains Mono',monospace;">Gate:</span>
   <input type="range" id="gateslider" min="{MIC_GATE_MIN}" max="{MIC_GATE_MAX}" step="25"
-         value="{gate}" style="flex:1;accent-color:#ff0;" oninput="onGateSlide(this.value)"
+         value="{gate}" style="flex:1;accent-color:#f59e0b;" oninput="onGateSlide(this.value)"
          onchange="saveGate(this.value)">
-  <span id="gateval" style="font-size:13px;color:#ff0;font-weight:bold;width:36px;text-align:right;">{gate}</span>
+  <span id="gateval" style="font-size:13px;color:#f59e0b;font-weight:bold;width:40px;text-align:right;font-family:'JetBrains Mono',monospace;">{gate}</span>
 </div>
 <div id="micresult"></div>
 <div class="row">
@@ -2066,7 +2082,6 @@ a{{color:#7af;font-size:14px;}}
 </div>
 </div>
 {auto_cal_section}
-<p><a href="/dashboard">← Dashboard</a></p>
 <script>
 /* --- Mic level meter --- */
 const MAX=32768, gate0={gate};
@@ -2877,13 +2892,10 @@ setInterval(upd, 2000);
                 # All device info gathered outside do_GET to avoid UnboundLocalError scoping
                 _ds = _get_device_status()
                 device_panel = (
-                    f'<div style="background:#1a1a2a;border-radius:8px;padding:8px 12px;'
-                    f'margin-bottom:8px;font-size:12px;color:#aaa;line-height:1.8;">'
-                    f'<b style="color:#eee">Audio devices</b><br>'
-                    f'Mic: {_ds["mic"]}<br>'
-                    f'Speaker: {_ds["speaker_name"]} &nbsp;|&nbsp; '
-                    f'Vol {_ds["spk_vol"]} &nbsp;|&nbsp; SW {_ds["sw_pct"]}%<br>'
-                    f'Mic gate: {_ds["gate"]} &nbsp;|&nbsp; Gain: {_ds["gain"]}x'
+                    f'<div id="dp">'
+                    f'&#127908; {_ds["mic"]} &ensp;'
+                    f'&#128266; {_ds["speaker_name"]} &middot; Vol {_ds["spk_vol"]} &middot; SW {_ds["sw_pct"]}% &ensp;'
+                    f'Gate {_ds["gate"]} &middot; Gain {_ds["gain"]}x'
                     f'</div>'
                 )
 
@@ -2895,6 +2907,11 @@ setInterval(upd, 2000);
                          else "THINKING" if thinking
                          else "PAUSED" if (active and paused)
                          else "ACTIVE" if active else "SILENT")
+                _sc = {"ACTIVE":("#0d2818","#34d399"),"SILENT":("#141d2b","#64748b"),
+                       "THINKING":("#1c1304","#f59e0b"),"SPEAKING":("#031a10","#2dd4bf"),
+                       "PAUSED":("#150d2e","#a5b4fc"),"MONITORING":("#071a2e","#60a5fa"),
+                       }.get(state, ("#141d2b","#64748b"))
+                state_pill_style = f"background:{_sc[0]};color:{_sc[1]};border-color:{_sc[1]};"
                 speaking_banner = (
                     '<div class="speaking">&#128266; Zeebot is speaking&hellip;'
                     ' &nbsp;<a href="/interrupt" class="irupt">&#10005; Stop</a></div>'
@@ -2904,34 +2921,49 @@ setInterval(upd, 2000);
                     if (active and paused) else ""
                 )
                 body = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta http-equiv="refresh" content="3">
-<title>RealTimeTalk Dashboard</title>
+<title>RealTimeTalk</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
 <style>
-html,body{{height:100%;margin:0;}}
-body{{font-family:sans-serif;font-size:17px;background:#111;color:#eee;display:flex;flex-direction:column;}}
-#top{{padding:12px 12px 0;flex-shrink:0;}}
-#log{{flex:1;overflow-y:auto;padding:0 12px 12px;}}
-.you{{background:#1a3a1a;border-radius:8px;padding:8px;margin:6px 0;}}
-.zeebot{{background:#1a2a3a;border-radius:8px;padding:8px;margin:6px 0;}}
-.mon{{background:#2a2030;border-left:3px solid #b58;border-radius:6px;padding:8px;margin:6px 0;}}
-.sys{{color:#888;font-size:0.85em;text-align:center;margin:4px 0;}}
-.thinking{{color:#f90;background:#1a1400;border-left:3px solid #f90;border-radius:6px;padding:8px;margin:6px 0;font-style:italic;}}
-.speaking{{color:#4cf;background:#001a2a;border-left:3px solid #4cf;border-radius:6px;padding:8px;margin:6px 0;font-style:italic;}}
-.ts{{color:#666;font-size:0.8em;font-family:monospace;}}
-h3{{margin:0 0 10px;}}
-a{{color:#7af;margin-right:14px;font-size:17px;}}
-a.on{{color:#5f5;font-weight:bold;}}
-a.reset{{color:#f86;}}
-a.irupt{{color:#f44;background:#2a0000;border:1px solid #f44;border-radius:4px;padding:2px 8px;font-size:0.85em;font-style:normal;text-decoration:none;margin-left:6px;}}
-a.irupt:hover{{background:#f44;color:#fff;}}
-a.cont{{color:#4f4;background:#002a00;border:1px solid #4f4;border-radius:4px;padding:2px 8px;font-size:0.85em;font-style:normal;text-decoration:none;margin-left:6px;}}
-a.cont:hover{{background:#4f4;color:#000;}}
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+:root{{--bg:#07090f;--sf:#0d1119;--sf2:#121925;--bd:#1a2535;--tx:#dde4ef;--mu:#5a7088;--di:#253344;--you:#38bdf8;--yb:#051928;--bot:#f59e0b;--bb:#130e02;--mon:#a78bfa;--mb:#0e0820;--sy:#304558;--rd:#ef4444;--rdb:#150303;--gn:#34d399;--gnb:#021a0e;--r:8px;}}
+html,body{{height:100%;}}
+body{{font-family:'Outfit',system-ui,sans-serif;font-size:16px;background:var(--bg);color:var(--tx);display:flex;flex-direction:column;overflow:hidden;-webkit-text-size-adjust:100%;}}
+#top{{flex-shrink:0;background:var(--sf);border-bottom:1px solid var(--bd);padding:10px 14px 8px;}}
+.hrow{{display:flex;align-items:center;gap:8px;margin-bottom:8px;}}
+.brand{{font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;color:var(--tx);letter-spacing:.08em;text-transform:uppercase;}}
+.spill{{margin-left:10px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:5px 14px;border-radius:20px;border:2px solid transparent;white-space:nowrap;}}
+.nav{{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:7px;}}
+a.btn{{display:inline-flex;align-items:center;gap:3px;padding:7px 14px;border-radius:8px;font-family:'Outfit',sans-serif;font-size:14px;font-weight:500;color:var(--mu);background:var(--sf2);border:1px solid var(--bd);text-decoration:none;min-height:36px;white-space:nowrap;transition:background .12s,border-color .12s,color .12s;}}
+a.btn:hover{{background:#1e2d3d;border-color:var(--you);color:var(--you);}}
+a.btn.on{{background:var(--gnb);border-color:var(--gn);color:var(--gn);}}
+a.btn.on:hover{{background:#053d20;border-color:var(--gn);color:#fff;}}
+a.btn.danger{{color:var(--rd);}}
+a.btn.danger:hover{{background:var(--rdb);border-color:var(--rd);}}
+#dp{{font-family:'JetBrains Mono',monospace;font-size:12px;color:#8aa0b8;line-height:1.7;padding:6px 10px;background:var(--bg);border-radius:5px;border:1px solid var(--di);margin-top:4px;}}
+#log{{flex:1;overflow-y:auto;padding:10px 14px;}}
+.you{{background:var(--yb);border-left:3px solid var(--you);border-radius:var(--r);padding:8px 10px;margin:3px 0;}}
+.you b{{color:var(--you);}}
+.zeebot{{background:var(--bb);border-left:3px solid var(--bot);border-radius:var(--r);padding:8px 10px;margin:3px 0;}}
+.zeebot b{{color:var(--bot);}}
+.mon{{background:var(--mb);border-left:3px solid var(--mon);border-radius:var(--r);padding:8px 10px;margin:3px 0;}}
+.sys{{color:var(--sy);font-size:.8em;text-align:center;margin:3px 0;font-family:'JetBrains Mono',monospace;}}
+.thinking{{background:var(--bb);border-left:3px solid var(--bot);border-radius:var(--r);padding:8px 10px;margin:3px 0;color:var(--bot);font-style:italic;}}
+.speaking{{background:var(--gnb);border-left:3px solid var(--gn);border-radius:var(--r);padding:8px 10px;margin:3px 0;color:var(--gn);font-style:italic;}}
+.ts{{font-family:'JetBrains Mono',monospace;font-size:.75em;color:var(--di);margin-right:4px;}}
+a.irupt{{color:var(--rd);background:var(--rdb);border:1px solid var(--rd);border-radius:4px;padding:2px 8px;font-size:.82em;font-style:normal;text-decoration:none;margin-left:8px;}}
+a.irupt:hover{{background:var(--rd);color:#fff;}}
+a.cont{{color:var(--gn);background:var(--gnb);border:1px solid var(--gn);border-radius:4px;padding:2px 8px;font-size:.82em;font-style:normal;text-decoration:none;margin-left:8px;}}
+a.cont:hover{{background:var(--gn);color:#000;}}
+@media(max-width:520px){{body{{font-size:15px;}}#top{{padding:10px 12px 8px;}}a.btn{{padding:9px 13px;min-height:42px;font-size:14px;}}#dp{{font-size:12px;}}#log{{padding:8px 10px;}}}}
+@media(min-width:900px){{body{{font-size:17px;}}#top{{padding:14px 24px 10px;}}a.btn{{font-size:15px;padding:8px 16px;min-height:38px;}}#dp{{font-size:13px;}}#log{{padding:14px 24px;}}}}
 </style></head><body>
 <div id="top">
-<h3>RealTimeTalk Dashboard — {state}</h3>
-<a href="/wake">Wake</a><a href="/sleep">Sleep</a><a href="/monitor/start" class="{'on' if monitoring else ''}">Start Monitor</a><a href="/monitor/stop" class="{'' if monitoring else 'on'}">Stop Monitor</a><a href="/multilang" class="{'on' if multilang else ''}">Multi-lang: {'ON' if multilang else 'OFF'}</a><a href="/reset" class="reset">Clear Log</a><a href="/restart">Restart</a><a href="/gateway-reset" class="reset">Gateway Reset</a><a href="/calibration">Calibration</a><a href="/dashboard">Dashboard</a>
-<hr>{device_panel}{device_banner}</div>
+<div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" style="margin-left:10px;">&#127908; Calibrate</a></div>
+<div class="nav"><a href="/wake" class="btn">&#9889; Wake</a><a href="/sleep" class="btn">&#128276; Sleep</a><a href="/monitor/start" class="btn {'on' if monitoring else ''}">&#128065; Monitor On</a><a href="/monitor/stop" class="btn">Monitor Off</a><a href="/multilang" class="btn {'on' if multilang else ''}">&#127760; {'ON' if multilang else 'OFF'} Multi-lang</a><a href="/reset" class="btn danger">&#10006; Clear Log</a><a href="/restart" class="btn">&#8635; Restart</a><a href="/gateway-reset" class="btn danger">&#9888; Gateway Reset</a><a href="/dashboard" class="btn">&#8635;</a></div>
+{device_panel}{device_banner}</div>
 <div id="log">{rows if rows else "<div class='sys'>No conversation yet</div>"}{speaking_banner}</div>
 <script>
 setInterval(function(){{
