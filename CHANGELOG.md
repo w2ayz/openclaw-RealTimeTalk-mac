@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.2.0] — 2026-05-19
+
+### Dashboard redesign
+- New design system: **Outfit** (UI) + **JetBrains Mono** (monospace) fonts via
+  Google Fonts; shared CSS custom properties across dashboard and calibration page.
+- **State pill** in header (next to brand) — colour-coded badge for SILENT /
+  ACTIVE / THINKING / SPEAKING / PAUSED / MONITORING with full-opacity border.
+- **Nav buttons** restyled as rounded rectangles (radius 8 px) to visually
+  distinguish interactive controls from the round status pill; all buttons now
+  have hover effects including `.on`-state buttons.
+- **Calibrate** button moved to header row next to state pill for faster access.
+- **Monitor Off** no longer styled as active when monitoring is off (redundant
+  with state pill); `.on` hover rule added for Monitor On when active.
+- Device status bar: larger font (12 px), brighter text colour for readability.
+- Responsive breakpoints: 15 px / 42 px touch targets on phone ≤ 520 px;
+  17 px / 38 px on monitor ≥ 900 px; `viewport-fit=cover` for notched phones.
+- **Calibration page** redesigned to match dashboard: same header layout,
+  device panel, button palette, SNR table, section headings, and cal mode
+  toggles (Headset / Speaker / Auto highlight active choice in accent colour).
+
+---
+
 ## [1.1.0] — 2026-05-19
 
 ### Added
