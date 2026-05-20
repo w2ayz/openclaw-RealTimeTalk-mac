@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.3.0] — 2026-05-19
+
+### Added
+- **USB mic hot-plug recovery**: `_watch_mic_stream()` watchdog coroutine
+  detects when mic callbacks stop for > 4 s, calls `sd._terminate()` /
+  `sd._initialize()` to force PortAudio to refresh its device list, resolves
+  the device by saved name via subprocess, and reopens the stream — all
+  without dropping the OpenAI WebSocket session. Logs "Mic reconnected." in
+  the dashboard on success.
+
+### Changed
+- `sd.InputStream` switched from `with`-block to manual `start()` / `stop()`
+  / `close()` with `try/finally` so the session survives hot-plug without
+  a full reconnect.
+- Gate calibration multiplier **1.25× → 1.5×** noise floor peak across all
+  three calibration paths (voice command, HTTP `/calibrate/run`, `--calibrate`
+  CLI). Gives a more comfortable margin above noise spikes; speech (typically
+  5–20× above the noise floor) still passes cleanly into the AGC stage.
+
+---
+
 ## [1.2.0] — 2026-05-19
 
 ### Dashboard redesign
