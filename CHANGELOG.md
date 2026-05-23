@@ -1,19 +1,23 @@
 # Changelog
 
-## [2.0.1] — 2026-05-23
+## [2.0.2] — 2026-05-23
 
 ### Fixed
-- **Auto-sleep now cuts the OpenAI Realtime connection** instead of just going
-  silent. After 10 min of inactivity the daemon speaks a goodbye, sets
-  `_sleep_event`, and exits `session.run()` — closing the WebSocket and stopping
-  mic streaming so no VAD/transcription tokens are billed while idle.
-- `main()` outer loop detects the sleep exit (`_sleep_requested`) and blocks on
-  `_wake_event` instead of reconnecting automatically. Pressing **Wake** on the
-  dashboard (or calling `/wake`) sets the event and triggers an immediate
-  OpenAI reconnect.
+- **Auto-sleep idle watcher overhauled** to match Debian reference build:
+  - Renamed `_auto_sleep_watchdog` → `_idle_watcher(ws)` and passes the live
+    WebSocket; calls `await ws.close()` directly so the `async with` context in
+    `run()` exits cleanly — no `_sleep_event` side-channel needed.
+  - **Critical bug**: removed `if not self._active: continue` guard that
+    prevented the watcher from firing in SILENT and MONITORING states. The watcher
+    now runs against all states (ACTIVE, SILENT, MONITORING).
+  - Disabled only when `multilang != "off"` (non-English sessions stay alive
+    indefinitely, matching Debian behaviour).
+  - Idle clock (`_last_interaction`) seeded in `main()` before the first session
+    starts, not inside the watcher, so the clock is correct from daemon boot.
+  - HTTP `/wake` now stamps `_last_interaction` on both paths (sleep-reconnect
+    and live-session wake) so pressing Wake fully resets the idle countdown.
 - Dashboard shows **SLEEPING** state pill (warm-grey) while disconnected from
-  OpenAI due to auto-sleep, distinct from SILENT (which means connected but
-  inactive).
+  OpenAI due to auto-sleep, distinct from SILENT (connected but inactive).
 
 ---
 

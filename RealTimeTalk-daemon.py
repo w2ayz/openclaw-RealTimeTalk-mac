@@ -26,7 +26,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 
 import argparse
 import asyncio
@@ -1611,7 +1611,6 @@ class RealtimeSession:
         self._monitoring  = _persist_monitoring[0]  # restored across 60-min OpenAI reconnects
         self._multilang   = _persist_multilang[0]   # "off"|"en-zh"|"whitelist"|"any"
         self._mic_stream_ref: list = [None]   # current sd.InputStream; swapped on hot-plug
-        self._sleep_event: asyncio.Event = asyncio.Event()  # set by watchdog to disconnect cleanly
 
     def _mic_cb(self, indata, frames, time_info, status):
         import time as _tcb0
@@ -1720,33 +1719,38 @@ class RealtimeSession:
             self.alsa_output
         )
 
-    async def _auto_sleep_watchdog(self):
-        """Go silent after AUTO_SLEEP_SECS of no user→LLM interaction."""
+    async def _idle_watcher(self, ws):
+        """Disconnect from OpenAI after AUTO_SLEEP_SECS of inactivity.
+
+        Runs regardless of active/monitoring/silent state. Disabled while
+        multilang != 'off' (non-English sessions should never auto-sleep).
+        Resets on wake phrase and any LLM route. Closes ws directly so the
+        async-with context in run() exits cleanly (matches Debian behaviour).
+        """
         import time as _as
-        _last_interaction[0] = _as.time()   # seed on session start
         while not self.stop_event.is_set():
             await asyncio.sleep(30.0)
-            if not self._active:
+            if self._multilang != "off":
+                continue   # multilang active — never auto-sleep
+            idle = _as.time() - _last_interaction[0]
+            if idle < AUTO_SLEEP_SECS:
                 continue
-            if _as.time() - _last_interaction[0] < AUTO_SLEEP_SECS:
-                continue
-            log.info("Auto-sleep: no interaction for %ds — disconnecting OpenAI", AUTO_SLEEP_SECS)
+            mins = int(idle / 60)
+            log.info("Auto-sleep: idle %d min — disconnecting OpenAI", mins)
             self._active = False
             if self._monitoring:
                 self._monitoring = False
                 _persist_monitoring[0] = False
-            if self._multilang != "off":
-                self._multilang = "off"
-                _persist_multilang[0] = "off"
-            _log_entry("system", "Auto-sleep: disconnected from OpenAI to save costs. Press Wake to resume.")
+                log.info("Auto-sleep: monitoring cleared")
+            _log_entry("system", f"Auto-sleep after {mins} min idle. Press Wake to reconnect.")
             await asyncio.get_running_loop().run_in_executor(
                 None, speak,
-                "Going quiet. Disconnecting to save costs. Press Wake to resume.",
+                "Going to sleep. Press Wake to reconnect.",
                 self.alsa_output,
             )
             _sleep_requested[0] = True
             _is_sleeping[0] = True
-            self._sleep_event.set()   # causes run() to exit via FIRST_COMPLETED, closing OpenAI WS
+            await ws.close()   # closes OpenAI WS; run()'s async-with exits cleanly
             return
 
     async def _watch_mic_stream(self):
@@ -2167,8 +2171,7 @@ class RealtimeSession:
                     asyncio.create_task(self._recv_ws(ws)),
                     asyncio.create_task(self.stop_event.wait()),
                     asyncio.create_task(self._watch_mic_stream()),
-                    asyncio.create_task(self._auto_sleep_watchdog()),
-                    asyncio.create_task(self._sleep_event.wait()),
+                    asyncio.create_task(self._idle_watcher(ws)),
                 ]
                 done, pending = await asyncio.wait(
                     tasks, return_when=asyncio.FIRST_COMPLETED
@@ -2290,12 +2293,19 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                     ])
                 ), daemon=True).start()
             elif self.path == "/wake":
+                import time as _twk
                 if _is_sleeping[0] and _wake_event[0] and loop:
-                    # Waking from auto-sleep: signal main() to reconnect OpenAI
+                    # Waking from auto-sleep: stamp idle clock then signal main() to reconnect
+                    _last_interaction[0] = _twk.time()
                     loop.call_soon_threadsafe(_wake_event[0].set)
                     log.info("HTTP wake — reconnecting from auto-sleep")
-                elif sess and not sess._active:
+                elif sess:
                     sess._active = True
+                    if sess._monitoring:
+                        sess._monitoring = False
+                        _persist_monitoring[0] = False
+                        log.info("HTTP wake — exiting monitoring mode")
+                    _last_interaction[0] = _twk.time()
                     log.info("HTTP wake")
                 self.send_response(302)
                 self.send_header("Location", "/log")
@@ -3519,6 +3529,7 @@ async def main(http_port: int, input_device=None, output_device=None,
     gw_task = asyncio.create_task(gw.listen(stop_event))
 
     _wake_event[0] = asyncio.Event()
+    _last_interaction[0] = __import__("time").time()   # seed idle clock before first session
 
     session_ref: list = [None]
     start_http_server(http_port, lambda: loop.call_soon_threadsafe(stop_event.set), session_ref, loop=loop)
