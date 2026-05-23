@@ -26,7 +26,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 import argparse
 import asyncio
@@ -173,6 +173,9 @@ _last_interaction:   list = [0.0]   # epoch of last user→LLM interaction; driv
 _clear_audio_buffer: list = [False] # set after TTS interrupt; _send_mic sends input_audio_buffer.clear
 _persist_monitoring: list = [False] # monitoring state across 60-min OpenAI session reconnects
 _persist_multilang:  list = ["off"] # multilang state across reconnects: "off"|"en-zh"|"whitelist"|"any"
+_sleep_requested:    list = [False] # watchdog sets this; main() waits for /wake before reconnecting
+_wake_event:         list = [None]  # asyncio.Event created in main(); HTTP /wake sets it to reconnect
+_is_sleeping:        list = [False] # True while OpenAI is intentionally disconnected (auto-sleep)
 
 
 def _list_audio_devices() -> dict:
@@ -1608,6 +1611,7 @@ class RealtimeSession:
         self._monitoring  = _persist_monitoring[0]  # restored across 60-min OpenAI reconnects
         self._multilang   = _persist_multilang[0]   # "off"|"en-zh"|"whitelist"|"any"
         self._mic_stream_ref: list = [None]   # current sd.InputStream; swapped on hot-plug
+        self._sleep_event: asyncio.Event = asyncio.Event()  # set by watchdog to disconnect cleanly
 
     def _mic_cb(self, indata, frames, time_info, status):
         import time as _tcb0
@@ -1726,22 +1730,24 @@ class RealtimeSession:
                 continue
             if _as.time() - _last_interaction[0] < AUTO_SLEEP_SECS:
                 continue
-            log.info("Auto-sleep: no interaction for %ds", AUTO_SLEEP_SECS)
+            log.info("Auto-sleep: no interaction for %ds — disconnecting OpenAI", AUTO_SLEEP_SECS)
             self._active = False
             if self._monitoring:
                 self._monitoring = False
                 _persist_monitoring[0] = False
-                log.info("Auto-sleep: monitoring cleared")
             if self._multilang != "off":
                 self._multilang = "off"
                 _persist_multilang[0] = "off"
-                log.info("Auto-sleep: multilang reset to off")
-            _log_entry("system", "Auto-sleep: going quiet after inactivity.")
+            _log_entry("system", "Auto-sleep: disconnected from OpenAI to save costs. Press Wake to resume.")
             await asyncio.get_running_loop().run_in_executor(
                 None, speak,
-                "Going quiet — no activity for a while. Say Zeebot wake up to resume.",
+                "Going quiet. Disconnecting to save costs. Press Wake to resume.",
                 self.alsa_output,
             )
+            _sleep_requested[0] = True
+            _is_sleeping[0] = True
+            self._sleep_event.set()   # causes run() to exit via FIRST_COMPLETED, closing OpenAI WS
+            return
 
     async def _watch_mic_stream(self):
         """Detect USB mic hot-unplug and reopen the stream when replugged."""
@@ -2162,6 +2168,7 @@ class RealtimeSession:
                     asyncio.create_task(self.stop_event.wait()),
                     asyncio.create_task(self._watch_mic_stream()),
                     asyncio.create_task(self._auto_sleep_watchdog()),
+                    asyncio.create_task(self._sleep_event.wait()),
                 ]
                 done, pending = await asyncio.wait(
                     tasks, return_when=asyncio.FIRST_COMPLETED
@@ -2283,7 +2290,11 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                     ])
                 ), daemon=True).start()
             elif self.path == "/wake":
-                if sess and not sess._active:
+                if _is_sleeping[0] and _wake_event[0] and loop:
+                    # Waking from auto-sleep: signal main() to reconnect OpenAI
+                    loop.call_soon_threadsafe(_wake_event[0].set)
+                    log.info("HTTP wake — reconnecting from auto-sleep")
+                elif sess and not sess._active:
                     sess._active = True
                     log.info("HTTP wake")
                 self.send_response(302)
@@ -3367,14 +3378,18 @@ setInterval(upd, 2000);
                 paused   = _paused_speech[0] is not None
                 speaking = _is_speaking[0]
                 thinking = _current_think_task[0] is not None
+                sleeping = _is_sleeping[0]
                 state = ("SPEAKING" if speaking
                          else "THINKING" if thinking
                          else "PAUSED" if paused
                          else "MONITORING" if monitoring
-                         else "ACTIVE" if active else "SILENT")
+                         else "ACTIVE" if active
+                         else "SLEEPING" if sleeping
+                         else "SILENT")
                 _sc = {"ACTIVE":("#0d2818","#34d399"),"SILENT":("#141d2b","#64748b"),
                        "THINKING":("#1c1304","#f59e0b"),"SPEAKING":("#031a10","#2dd4bf"),
                        "PAUSED":("#150d2e","#a5b4fc"),"MONITORING":("#071a2e","#60a5fa"),
+                       "SLEEPING":("#1a1205","#78716c"),
                        }.get(state, ("#141d2b","#64748b"))
                 state_pill_style = f"background:{_sc[0]};color:{_sc[1]};border-color:{_sc[1]};"
                 speaking_banner = (
@@ -3503,6 +3518,8 @@ async def main(http_port: int, input_device=None, output_device=None,
         return
     gw_task = asyncio.create_task(gw.listen(stop_event))
 
+    _wake_event[0] = asyncio.Event()
+
     session_ref: list = [None]
     start_http_server(http_port, lambda: loop.call_soon_threadsafe(stop_event.set), session_ref, loop=loop)
     log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say 'Zeebot wake up' to activate)")
@@ -3523,7 +3540,24 @@ async def main(http_port: int, input_device=None, output_device=None,
         except Exception as e:
             log.error("Session error: %s", e)
 
-        if not stop_event.is_set():
+        session_ref[0] = None
+
+        if _sleep_requested[0] and not stop_event.is_set():
+            # Auto-sleep: OpenAI WS closed intentionally. Wait for /wake before reconnecting.
+            _sleep_requested[0] = False
+            log.info("Auto-sleep: OpenAI disconnected. Waiting for /wake to reconnect…")
+            _wake_event[0].clear()
+            wake_task = asyncio.create_task(_wake_event[0].wait())
+            stop_task = asyncio.create_task(stop_event.wait())
+            done, pending = await asyncio.wait([wake_task, stop_task], return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+            _is_sleeping[0] = False
+            if stop_event.is_set():
+                break
+            log.info("Wake received — reconnecting to OpenAI…")
+            _log_entry("system", "Reconnecting…")
+        elif not stop_event.is_set():
             log.info("Reconnecting in %ds…", RECONNECT_DELAY)
             await asyncio.sleep(RECONNECT_DELAY)
 

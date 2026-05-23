@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.0.1] — 2026-05-23
+
+### Fixed
+- **Auto-sleep now cuts the OpenAI Realtime connection** instead of just going
+  silent. After 10 min of inactivity the daemon speaks a goodbye, sets
+  `_sleep_event`, and exits `session.run()` — closing the WebSocket and stopping
+  mic streaming so no VAD/transcription tokens are billed while idle.
+- `main()` outer loop detects the sleep exit (`_sleep_requested`) and blocks on
+  `_wake_event` instead of reconnecting automatically. Pressing **Wake** on the
+  dashboard (or calling `/wake`) sets the event and triggers an immediate
+  OpenAI reconnect.
+- Dashboard shows **SLEEPING** state pill (warm-grey) while disconnected from
+  OpenAI due to auto-sleep, distinct from SILENT (which means connected but
+  inactive).
+
+---
+
 ## [2.0.0] — 2026-05-23
 
 ### Breaking changes
