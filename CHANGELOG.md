@@ -1,5 +1,83 @@
 # Changelog
 
+## [2.0.0] — 2026-05-23
+
+### Breaking changes
+- **OpenAI TTS** replaces Edge TTS as the primary synthesis engine. Mixed
+  Chinese/English is now handled natively in a single API call without
+  script-splitting. Edge TTS dependency is retained but unused by default.
+- `sess._multilang` is now a `str` (`"off"` | `"en-zh"` | `"whitelist"` |
+  `"any"`) instead of a `bool` — callers that read it as a bool need updating.
+
+### Added
+- **Auto-sleep watchdog** (`_auto_sleep_watchdog`): goes silent after 10 min
+  (`AUTO_SLEEP_SECS = 600`) of no user→LLM interaction. Resets monitoring and
+  multilang mode. Timer stamps on every query, wake phrase, and active
+  monitoring capture.
+- **`_clear_audio_buffer` flag**: set when TTS is interrupted mid-sentence;
+  `_send_mic` sends `input_audio_buffer.clear` to OpenAI before the next mic
+  chunk so stale VAD audio does not generate a spurious post-interrupt
+  transcript.
+- **`_persist_monitoring` / `_persist_multilang`** module-level lists: preserve
+  monitoring and multilang state across the 60-min OpenAI Realtime session
+  reconnect. `RealtimeSession.__init__` reads these instead of resetting to
+  defaults.
+- **Multi-language 4-state cycle** (`off` → `en-zh` → `whitelist` → `any`):
+  `off` = EN/ZH only with auto-sleep; `en-zh` = EN/ZH but auto-sleep
+  suppressed; `whitelist` = languages in `MULTILANG_WHITELIST_LANGS`; `any` =
+  all pass. `/multilang` cycles through the four states and persists.
+- **`_is_in_multilang_whitelist()`**: Unicode script range detection (Hangul,
+  Kana, Arabic, Cyrillic, Devanagari, CJK) plus `langdetect` fallback for
+  Latin-script text.
+- **Short-word noise guard**: single transcribed words < 6 characters not in
+  `_SHORT_CMDS` are dropped before LLM routing (OpenAI Realtime STT sometimes
+  hallucinates single words from background noise).
+- **CJK↔Latin boundary splitting** in `_normalize()`: inserts a space between
+  CJK and ASCII characters so mixed phrases like `"我係wake up"` tokenise
+  correctly for phrase matching.
+- **Monitoring phrase robustness**: non-ASCII stripped before matching + `"star"`
+  added as a `_start_words` alias for "start" (common STT mishear). Bare
+  `"monitoring"` alone (≤ 3 words after strip) is treated as ON. Expanded
+  `MONITOR_ON_PHRASES` / `MONITOR_OFF_PHRASES` sets.
+- **Chinese TTS preprocessing**: `_num_to_zh` / `_zh_numbers` convert ASCII
+  digit sequences in Chinese segments to Chinese numerals; `_preprocess_zh_time`
+  rewrites `H:MM` patterns to `X点Y分` form before synthesis.
+- **Acronym expansion** (`_preprocess_acronyms`): 2–4-letter uppercase codes
+  (e.g. `ICN`, `JFK`) are space-separated so TTS reads them letter by letter.
+- **Live mic hot-switch** (`_switch_mic_stream`): selecting a mic via the
+  dashboard now does a live stream swap without restarting the daemon. The
+  `_watch_mic_stream` watchdog timestamp is reset first to avoid a race.
+- **Agent timeout** hardened: `asyncio.wait_for` + `asyncio.shield` guard
+  `gw.ask()` so a stalled agent raises `TimeoutError` cleanly instead of
+  hanging the transcript handler indefinitely.
+- **Dashboard hover hints**: `<div id="hzone">` below the device panel shows
+  button descriptions on mouse hover; hints fade after 60 s or on mouseleave.
+  Button symbols updated to BMP-safe Unicode (✏ ☾ ◎ ⊕) matching the
+  [UI-BUTTONS.md](https://github.com/w2ayz/openclaw-RealTimeTalk/blob/main/UI-BUTTONS.md)
+  spec from the Debian reference build.
+- **Auto-refresh pauses on hover**: replaced `<meta http-equiv="refresh">` with
+  JS `setTimeout`/`clearTimeout` so the page does not reload while the cursor
+  is over the nav.
+
+### Fixed
+- **Monitoring check order** (critical): the monitoring passive-log `return` was
+  evaluated *before* wake/sleep/calibrate/monitoring-toggle phrase checks, so
+  "wake up" while monitoring was silently dropped. Control phrase checks now
+  all precede the monitoring block.
+- **Wake phrase exits monitoring**: if `_monitoring` is True when the wake
+  phrase fires, monitoring is cleared and voice is activated rather than
+  being ignored.
+- **Sleep button clears monitoring**: `/sleep` route condition was
+  `if sess._active` — monitoring sets `_active=False`, so the button had no
+  effect while monitoring. Fixed to `sess._active or sess._monitoring`.
+- **"No device change detected" noisy banner**: green banner in the no-change
+  branch suppressed (`device_banner = ""`); orange device-change alert still
+  appears.
+- **PAUSED state display**: PAUSED badge no longer requires `_active=True`;
+  speaking banner moved above conversation log for visibility.
+
+---
+
 ## [1.3.0] — 2026-05-19
 
 ### Added

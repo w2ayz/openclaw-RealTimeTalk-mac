@@ -26,7 +26,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "1.3.0"
+__version__ = "2.0.0"
 
 import argparse
 import asyncio
@@ -58,13 +58,19 @@ OPENCLAW_CONFIG   = os.path.expanduser("~/.openclaw/openclaw.json")
 OPENCLAW_GW_URL   = "ws://127.0.0.1:18789"
 OPENCLAW_SESSION  = "agent:main:main"
 
-# Edge TTS skill — primary TTS engine on Mac (online, high quality)
+# OpenAI TTS — primary TTS engine (handles mixed Chinese/English natively)
+OPENAI_TTS_MODEL  = "tts-1"
+OPENAI_TTS_VOICE  = "nova"        # nova works well for Chinese and English
+OPENAI_TTS_TIMEOUT = 15.0         # seconds before falling back to say
+_openai_tts_key: list = [""]      # set from openai_key in main()
+
+# Edge TTS skill — kept for reference but no longer primary
 EDGE_TTS_SCRIPT   = os.path.expanduser(
     "~/.openclaw/workspace/skills/edge-tts/scripts/tts-converter.js"
 )
 EDGE_VOICE_EN     = "en-US-AriaNeural"
 EDGE_VOICE_ZH     = "zh-CN-XiaoxiaoNeural"
-EDGE_TTS_TIMEOUT  = 8.0       # seconds — fall back to `say` if Edge takes longer
+EDGE_TTS_TIMEOUT  = 8.0
 # macOS `say` — offline fallback. Voices are pre-installed on macOS.
 SAY_VOICE_EN      = "Samantha"
 SAY_VOICE_ZH      = "Tingting"
@@ -80,7 +86,10 @@ BLOCKSIZE         = 2400         # 100 ms at 24 kHz
 DEVICE_BLOCKSIZE  = BLOCKSIZE    # same as BLOCKSIZE when RESAMPLE_RATIO == 1
 DEFAULT_HTTP_PORT = 19000
 RECONNECT_DELAY   = 5
-AGENT_TIMEOUT_S   = 45
+AGENT_TIMEOUT_S   = 60
+AUTO_SLEEP_SECS   = 600          # go silent after 10 min of no interaction
+# Languages accepted in multi-lang WHITELIST mode (langdetect codes + script tokens).
+MULTILANG_WHITELIST_LANGS: list = ["en", "zh-cn", "zh-tw", "zh", "ko", "ja", "es", "ms"]
 MIC_GAIN          = 5.0
 MIC_GATE_PEAK     = 20           # noise gate — pre-gain peak below this → silence
 MIC_GATE_MIN      = 15           # calibration clamp — quietest usable room
@@ -160,6 +169,10 @@ _http_interrupt:   list = [False]  # set by /interrupt HTTP route to cut TTS mid
 _is_speaking:      list = [False]  # True while speak() is playing audio
 _current_think_task: list = [None]  # asyncio.Task for current gw.ask(); cancelled by /interrupt
 _last_mic_cb:        list = [0.0]   # epoch of last _mic_cb invocation — used for hot-plug detection
+_last_interaction:   list = [0.0]   # epoch of last user→LLM interaction; drives auto-sleep
+_clear_audio_buffer: list = [False] # set after TTS interrupt; _send_mic sends input_audio_buffer.clear
+_persist_monitoring: list = [False] # monitoring state across 60-min OpenAI session reconnects
+_persist_multilang:  list = ["off"] # multilang state across reconnects: "off"|"en-zh"|"whitelist"|"any"
 
 
 def _list_audio_devices() -> dict:
@@ -500,10 +513,23 @@ TRANSCRIPTION_PROMPT_NORM = "zeebot"
 WAKE_PHRASES     = {"zeebot wake up", "real time talk on", "real-time talk on", "realtimetalk on",
                     "zibob wake up", "zibot wake up", "libot wake up", "ziba wake up"}
 SLEEP_PHRASES    = {"zeebot go to sleep", "real time talk off", "real-time talk off", "realtimetalk off"}
-MONITOR_ON_PHRASES  = {"zeebot start monitoring", "start monitoring", "zeebot monitor on",
-                       "monitor on", "zeebot monitoring on"}
-MONITOR_OFF_PHRASES = {"zeebot stop monitoring", "stop monitoring", "zeebot monitor off",
-                       "monitor off", "zeebot monitoring off"}
+MONITOR_ON_PHRASES  = {
+    "zeebot start monitoring", "start monitoring", "zeebot monitor on",
+    "monitor on", "zeebot monitoring on", "monitoring on",
+    "start monitor", "zeebot start monitor",
+    "begin monitoring", "begin monitor", "zeebot begin monitoring",
+    "turn on monitoring", "turn monitoring on", "enable monitoring",
+    "activate monitoring", "starting monitoring", "monitoring please",
+    "monitor please", "please start monitoring", "please monitor",
+}
+MONITOR_OFF_PHRASES = {
+    "zeebot stop monitoring", "stop monitoring", "zeebot monitor off",
+    "monitor off", "zeebot monitoring off", "monitoring off",
+    "stop monitor", "zeebot stop monitor",
+    "end monitoring", "end monitor", "zeebot end monitoring",
+    "turn off monitoring", "turn monitoring off", "disable monitoring",
+    "deactivate monitoring", "stopping monitoring", "please stop monitoring",
+}
 CONTINUE_PHRASES = {"continue", "zeebot continue", "please continue", "go on", "go ahead",
                     "keep going", "继续", "继续说", "你继续", "请继续"}
 
@@ -557,10 +583,47 @@ def _is_english_or_chinese(text: str) -> bool:
             pass  # inconclusive — let it through
     return True
 
+def _is_in_multilang_whitelist(text: str) -> bool:
+    """True if text is in a MULTILANG_WHITELIST_LANGS language.
+
+    Script ranges checked first (fast); langdetect for Latin-script text.
+    Inconclusive → let through. Extend MULTILANG_WHITELIST_LANGS to add languages.
+    """
+    has_hangul = has_kana = has_arabic = has_cyril = has_deva = has_cjk = False
+    for ch in text:
+        cp = ord(ch)
+        if   0xAC00 <= cp <= 0xD7AF:                             has_hangul = True
+        elif 0x3040 <= cp <= 0x30FF:                             has_kana   = True
+        elif 0x0600 <= cp <= 0x06FF:                             has_arabic = True
+        elif 0x0400 <= cp <= 0x04FF:                             has_cyril  = True
+        elif 0x0900 <= cp <= 0x097F:                             has_deva   = True
+        elif 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:  has_cjk    = True
+
+    if has_hangul: return "ko" in MULTILANG_WHITELIST_LANGS
+    if has_kana:   return "ja" in MULTILANG_WHITELIST_LANGS
+    if has_arabic: return "ar" in MULTILANG_WHITELIST_LANGS
+    if has_cyril:  return any(c in MULTILANG_WHITELIST_LANGS for c in ("ru","uk","bg","sr","mk"))
+    if has_deva:   return any(c in MULTILANG_WHITELIST_LANGS for c in ("hi","mr","ne"))
+    if has_cjk:    return any(c in MULTILANG_WHITELIST_LANGS for c in ("zh","zh-cn","zh-tw"))
+
+    # Pure Latin-script — use langdetect to distinguish EN/ES/MS/FR/etc.
+    if _HAVE_LANGDETECT and len(text.split()) >= 2:
+        try:
+            lang = _langdetect(text)
+            if lang not in MULTILANG_WHITELIST_LANGS:
+                log.debug("whitelist rejected %r as %r", text[:60], lang)
+                return False
+        except _LangDetectException:
+            pass  # inconclusive → let through
+    return True
+
 def _normalize(text: str) -> str:
     import string
     t = text.strip().lower()
     t = t.translate(str.maketrans(string.punctuation, " " * len(string.punctuation)))
+    # Insert space at CJK↔Latin boundaries so "我係wake up" → "我係 wake up"
+    t = re.sub(r'([一-鿿㐀-䶿])([a-zA-Z0-9])', r'\1 \2', t)
+    t = re.sub(r'([a-zA-Z0-9])([一-鿿㐀-䶿])', r'\1 \2', t)
     t = re.sub(r'\b5\b', '5', t)  # no numeric shorthand for Zeebot
     return " ".join(t.split())
 
@@ -879,15 +942,22 @@ def _to_simplified(text: str) -> str:
         return text
 
 def _split_by_script(text: str) -> list[tuple[str, str]]:
-    """Split text into [(segment, 'zh'|'en')] so each segment uses its correct Piper voice."""
+    """Split text into [(segment, 'zh'|'en')] so each segment uses its correct voice.
+
+    Digits and ASCII punctuation are treated as sticky — they follow the current
+    language rather than forcing a break, so "5月24日" stays in one zh segment.
+    """
     segments: list[tuple[str, str]] = []
     current_chars: list[str] = []
     current_lang = None
     for ch in text:
-        lang = 'zh' if _is_cjk(ch) else 'en'
-        # Chinese punctuation stays with Chinese; spaces/ASCII punct follow current lang
-        if ch in ' \t\n\r，。！？；：、""‘’「」《》':
+        if _is_cjk(ch):
+            lang = 'zh'
+        elif ch.isdigit() or ch in ' \t\n\r，。！？；：、""''「」《》':
+            # sticky: follow current language (default 'en' if nothing yet)
             lang = current_lang or 'en'
+        else:
+            lang = 'en'
         if lang != current_lang and current_chars:
             seg = ''.join(current_chars).strip()
             if seg:
@@ -899,16 +969,131 @@ def _split_by_script(text: str) -> list[tuple[str, str]]:
         seg = ''.join(current_chars).strip()
         if seg:
             segments.append((seg, current_lang or 'en'))
-    return segments
-
-    if current_chars:
-        segments.append((''.join(current_chars).strip(), current_lang or 'en'))
-
     return [(s, l) for s, l in segments if s]
 
-# ── TTS (Edge TTS primary, macOS `say` fallback, ffmpeg PCM decode) ──────────
+
+def _num_to_zh(n: int) -> str:
+    """Convert a non-negative integer to Chinese character representation."""
+    if n == 0:
+        return '零'
+    digits = '零一二三四五六七八九'
+    units = ['', '十', '百', '千']
+    groups = ['', '万', '亿']
+    def _group(num: int) -> str:
+        result = ''
+        for i in range(3, -1, -1):
+            d = (num // (10 ** i)) % 10
+            if d:
+                result += digits[d] + units[i]
+            elif result and not result.endswith('零'):
+                result += '零'
+        return result.rstrip('零') or '零'
+    parts = []
+    g = 0
+    while n > 0:
+        chunk = n % 10000
+        if chunk:
+            parts.append(_group(chunk) + groups[g])
+        n //= 10000
+        g += 1
+    result = ''.join(reversed(parts))
+    # normalize leading 一十 → 十
+    if result.startswith('一十'):
+        result = result[1:]
+    return result
+
+
+def _zh_numbers(text: str) -> str:
+    """Replace ASCII digit sequences in a Chinese segment with Chinese numerals."""
+    import re
+    return re.sub(r'\d+', lambda m: _num_to_zh(int(m.group())), text)
+
+
+_ZH_DIGITS = '零一二三四五六七八九'
+
+def _to_zh_num(n: int) -> str:
+    """Convert 0-99 to Chinese numeral string."""
+    if n == 0:
+        return '零'
+    if n < 10:
+        return _ZH_DIGITS[n]
+    tens = ('' if n // 10 == 1 else _ZH_DIGITS[n // 10]) + '十'
+    ones = _ZH_DIGITS[n % 10] if n % 10 else ''
+    return tens + ones
+
+
+def _preprocess_zh_time(text: str) -> str:
+    """Convert H:MM / HH:MM time patterns to Chinese when text contains CJK characters.
+
+    "4:20" → "四点二十分", "12:00" → "十二点整", "10:05" → "十点零五分"
+    Only applied when the text is primarily Chinese to avoid mangling English timestamps.
+    """
+    import re
+    if not any(_is_cjk(c) for c in text):
+        return text
+
+    def _replace(m: "re.Match") -> str:
+        h, mn = int(m.group(1)), int(m.group(2))
+        result = _to_zh_num(h) + '点'
+        if mn == 0:
+            result += '整'
+        elif mn < 10:
+            result += '零' + _ZH_DIGITS[mn] + '分'
+        else:
+            result += _to_zh_num(mn) + '分'
+        return result
+
+    return re.sub(r'(?<!\d)(\d{1,2}):(\d{2})(?!\d)', _replace, text)
+
+
+def _preprocess_acronyms(text: str) -> str:
+    """Space-separate 2-4 letter uppercase codes so TTS reads them letter by letter.
+
+    Matches sequences of uppercase letters not adjacent to other letters,
+    so ICN → I C N, JFK → J F K, KE → K E, but not English words like "The".
+    Applied regardless of language since codes should always be spelled out.
+    """
+    import re
+    return re.sub(r'(?<![a-zA-Z])([A-Z]{2,4})(?![a-zA-Z])',
+                  lambda m: ' '.join(m.group(1)), text)
+
+
+# ── TTS (OpenAI TTS primary, macOS `say` fallback, ffmpeg PCM decode) ────────
 
 TTS_SAMPLE_RATE = 24000  # daemon plays back at 24 kHz mono PCM int16
+
+def _openai_tts_to_mp3(text: str, out_path: str, timeout: float = OPENAI_TTS_TIMEOUT) -> bool:
+    """Render text via OpenAI TTS API → MP3 at out_path. Handles mixed Chinese/English natively."""
+    import json, urllib.request, urllib.error
+    key = _openai_tts_key[0]
+    if not key:
+        log.warning("OpenAI TTS key not set")
+        return False
+    try:
+        payload = json.dumps({
+            "model": OPENAI_TTS_MODEL,
+            "input": text,
+            "voice": OPENAI_TTS_VOICE,
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/audio/speech",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with open(out_path, "wb") as f:
+                f.write(resp.read())
+        return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+    except urllib.error.HTTPError as e:
+        log.warning("OpenAI TTS HTTP error %d: %s", e.code, e.read()[:200])
+        return False
+    except Exception as e:
+        log.warning("OpenAI TTS error: %s", e)
+        return False
+
 
 def _edge_tts_to_mp3(text: str, voice: str, out_path: str, timeout: float = EDGE_TTS_TIMEOUT) -> bool:
     """Render `text` via Edge TTS skill → MP3 at out_path. Returns True on success."""
@@ -974,12 +1159,13 @@ def _decode_to_pcm(audio_path: str) -> "np.ndarray":
 
 def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silence_ms: int = 300,
           resumable: bool = False):
-    """Synthesise text via Edge TTS (with `say` fallback) and play via sounddevice.
+    """Synthesise text via OpenAI TTS (with macOS `say` fallback) and play via sounddevice.
 
-    Splits text by script (en/zh), renders each segment with the appropriate
-    voice, decodes to 24 kHz mono PCM int16, applies software volume, and
-    plays via the selected CoreAudio output. Polls the mic level during
-    playback; if the user starts speaking, calls sd.stop() to interrupt.
+    Sends the full text in one call — OpenAI TTS handles mixed Chinese/English
+    and all number/time formats natively. Decodes to 24 kHz mono PCM int16,
+    applies software volume, and plays via the selected CoreAudio output.
+    Polls the mic level during playback; if the user starts speaking, calls
+    sd.stop() to interrupt.
     """
     import tempfile
     if volume < 0:
@@ -988,11 +1174,12 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
     if not clean:
         log.warning("speak() called with empty text after strip_markdown: %r", text)
         return
+    clean = _preprocess_zh_time(clean)
+    clean = _preprocess_acronyms(clean)
 
     log.info("speak() → %r  vol=%.2f sys_vol=%d out_dev=%s",
              clean[:80], volume, _cal_sys_vol_pct[0], _selected_output_device[0])
 
-    segments = _split_by_script(clean)
     pcm_parts: list[np.ndarray] = []
     temp_files: list[str] = []
     silence_samples = int(TTS_SAMPLE_RATE * silence_ms / 1000)
@@ -1001,29 +1188,30 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         if silence_ms > 0:
             pcm_parts.append(np.zeros(silence_samples, dtype=np.int16))
 
-        for seg_text, lang in segments:
-            if not seg_text.strip():
-                continue
-            edge_voice = EDGE_VOICE_ZH if lang == "zh" else EDGE_VOICE_EN
-            mp3_path = tempfile.mktemp(suffix=".mp3")
-            temp_files.append(mp3_path)
-            pcm = np.zeros(0, dtype=np.int16)
-            ok_edge = _edge_tts_to_mp3(seg_text, edge_voice, mp3_path)
-            log.info("  Edge TTS %s for %r", "OK" if ok_edge else "FAILED", seg_text[:40])
-            if ok_edge:
-                pcm = _decode_to_pcm(mp3_path)
-                log.info("  PCM decode: %d samples (%.1fs)", pcm.size, pcm.size/TTS_SAMPLE_RATE)
-            if pcm.size == 0:
-                # Fall back to macOS `say`
+        mp3_path = tempfile.mktemp(suffix=".mp3")
+        temp_files.append(mp3_path)
+        pcm = np.zeros(0, dtype=np.int16)
+
+        ok_oai = _openai_tts_to_mp3(clean, mp3_path)
+        log.info("  OpenAI TTS %s", "OK" if ok_oai else "FAILED")
+        if ok_oai:
+            pcm = _decode_to_pcm(mp3_path)
+            log.info("  PCM decode: %d samples (%.1fs)", pcm.size, pcm.size / TTS_SAMPLE_RATE)
+
+        if pcm.size == 0:
+            # Fall back to macOS `say` — split by script for correct voice selection
+            for seg_text, lang in _split_by_script(clean):
+                if not seg_text.strip():
+                    continue
                 aiff_path = tempfile.mktemp(suffix=".aiff")
                 temp_files.append(aiff_path)
                 ok_say = _say_fallback_to_aiff(seg_text, lang, aiff_path)
-                log.info("  say fallback %s", "OK" if ok_say else "FAILED")
+                log.info("  say fallback %s for %r", "OK" if ok_say else "FAILED", seg_text[:40])
                 if ok_say:
-                    pcm = _decode_to_pcm(aiff_path)
-            if pcm.size == 0:
-                log.error("Both Edge TTS and say failed for segment: %r", seg_text[:60])
-                continue
+                    seg_pcm = _decode_to_pcm(aiff_path)
+                    if seg_pcm.size:
+                        pcm_parts.append(seg_pcm)
+        else:
             pcm_parts.append(pcm)
 
         if silence_ms > 0 and len(pcm_parts) > 1:
@@ -1115,6 +1303,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                 log.info("HTTP interrupt — stopping TTS")
                 _http_interrupt[0] = False
                 _interrupted[0] = True
+                _clear_audio_buffer[0] = True  # flush OpenAI VAD buffer after interrupt
                 if resumable:
                     _paused_speech[0] = (clean, alsa_output)
                     log.info("  Saved %d chars for resume", len(clean))
@@ -1130,6 +1319,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                     log.info("Speech interrupt — stopping TTS (peak=%d threshold=%d)",
                              p, interrupt_threshold)
                     _interrupted[0] = True
+                    _clear_audio_buffer[0] = True  # flush OpenAI VAD buffer after interrupt
                     if resumable:
                         _paused_speech[0] = (clean, alsa_output)
                         log.info("  Saved %d chars for resume", len(clean))
@@ -1171,6 +1361,7 @@ class GatewayClient:
     def __init__(self, token: str):
         self.token = token
         self._ws = None
+        self._ready: asyncio.Event = asyncio.Event()  # set on connect, cleared on disconnect
         # Maps request-id → Future for chat.send acks
         self._send_acks: dict[str, asyncio.Future] = {}
         # Maps runId → Future[str] for final chat replies
@@ -1202,66 +1393,100 @@ class GatewayClient:
             raise RuntimeError(f"Gateway connect failed: {hello.get('error')}")
         scopes = hello.get("payload", {}).get("auth", {}).get("scopes", [])
         log.info("OpenClaw gateway connected (scopes: %s)", scopes)
+        self._ready.set()
 
     async def listen(self, stop_event: asyncio.Event):
         """Route incoming gateway events to waiting futures. Run as a task."""
-        try:
-            async for raw in self._ws:
+        while not stop_event.is_set():
+            try:
+                async for raw in self._ws:
+                    if stop_event.is_set():
+                        break
+                    msg = json.loads(raw)
+                    mtype = msg.get("type", "")
+                    event = msg.get("event", "")
+                    payload = msg.get("payload") or {}
+                    msg_id = msg.get("id", "")
+
+                    # Resolve chat.send acks
+                    if mtype == "res" and msg_id in self._send_acks:
+                        fut = self._send_acks.pop(msg_id)
+                        if not fut.done():
+                            fut.set_result(msg)
+
+                    # Track assistant-stream text as a reliable reply source
+                    elif event == "agent" and payload.get("stream") == "assistant":
+                        rid = payload.get("runId")
+                        atext = (payload.get("data") or {}).get("text", "")
+                        if rid and atext:
+                            self._assistant_text[rid] = atext
+
+                    # Resolve agent replies on final chat event
+                    elif event == "chat" and payload.get("state") == "final":
+                        run_id = payload.get("runId")
+                        cmsg = payload.get("message", {}) or {}
+                        content = cmsg.get("content", []) or []
+                        # Standard content array (type=text)
+                        text = " ".join(
+                            c.get("text", "") for c in content if c.get("type") == "text"
+                        ).strip()
+                        # Fallback: Responses API output_text items
+                        if not text:
+                            text = " ".join(
+                                c.get("text", "") for c in content
+                                if c.get("type") in ("output_text", "text_delta")
+                            ).strip()
+                        # Fallback: top-level text / deltaText
+                        if not text:
+                            text = (cmsg.get("text") or payload.get("deltaText") or "").strip()
+                        # Fallback: assistant-stream text captured during the run
+                        if not text:
+                            text = self._assistant_text.get(run_id, "").strip()
+                        if not text:
+                            log.warning("chat final empty: payload=%s",
+                                        json.dumps(payload)[:600])
+                        self._assistant_text.pop(run_id, None)
+                        fut = self._reply_futs.pop(run_id, None)
+                        if fut and not fut.done():
+                            fut.set_result(text)
+
+            except websockets.ConnectionClosed:
                 if stop_event.is_set():
                     break
-                msg = json.loads(raw)
-                mtype = msg.get("type", "")
-                event = msg.get("event", "")
-                payload = msg.get("payload") or {}
-                msg_id = msg.get("id", "")
+                log.warning("Gateway WebSocket closed — reconnecting…")
+                _log_entry("system", "Gateway disconnected — reconnecting…")
+            except Exception as e:
+                if stop_event.is_set():
+                    break
+                log.warning("Gateway listen error (%s) — reconnecting…", e)
 
-                # Resolve chat.send acks
-                if mtype == "res" and msg_id in self._send_acks:
-                    fut = self._send_acks.pop(msg_id)
-                    if not fut.done():
-                        fut.set_result(msg)
+            if stop_event.is_set():
+                break
 
-                # Track assistant-stream text as a reliable reply source
-                elif event == "agent" and payload.get("stream") == "assistant":
-                    rid = payload.get("runId")
-                    atext = (payload.get("data") or {}).get("text", "")
-                    if rid and atext:
-                        self._assistant_text[rid] = atext
+            # Fail in-flight futures so ask() doesn't hang during reconnect window
+            self._ready.clear()
+            for fut in list(self._send_acks.values()):
+                if not fut.done():
+                    fut.set_exception(ConnectionError("Gateway reconnecting"))
+            self._send_acks.clear()
+            for fut in list(self._reply_futs.values()):
+                if not fut.done():
+                    fut.set_exception(ConnectionError("Gateway reconnecting"))
+            self._reply_futs.clear()
 
-                # Resolve agent replies on final chat event
-                elif event == "chat" and payload.get("state") == "final":
-                    run_id = payload.get("runId")
-                    cmsg = payload.get("message", {}) or {}
-                    content = cmsg.get("content", []) or []
-                    # Standard content array (type=text)
-                    text = " ".join(
-                        c.get("text", "") for c in content if c.get("type") == "text"
-                    ).strip()
-                    # Fallback: Responses API output_text items
-                    if not text:
-                        text = " ".join(
-                            c.get("text", "") for c in content
-                            if c.get("type") in ("output_text", "text_delta")
-                        ).strip()
-                    # Fallback: top-level text / deltaText
-                    if not text:
-                        text = (cmsg.get("text") or payload.get("deltaText") or "").strip()
-                    # Fallback: assistant-stream text captured during the run
-                    if not text:
-                        text = self._assistant_text.get(run_id, "").strip()
-                    if not text:
-                        log.warning("chat final empty: payload=%s",
-                                    json.dumps(payload)[:600])
-                    self._assistant_text.pop(run_id, None)
-                    fut = self._reply_futs.pop(run_id, None)
-                    if fut and not fut.done():
-                        fut.set_result(text)
-
-        except websockets.ConnectionClosed:
-            pass
+            while not stop_event.is_set():
+                try:
+                    await self.connect()
+                    log.info("Gateway reconnected.")
+                    _log_entry("system", "Gateway reconnected.")
+                    break
+                except Exception as e:
+                    log.warning("Gateway reconnect failed (%s) — retrying in 5s", e)
+                    await asyncio.sleep(5)
 
     async def ask(self, message: str, session_key: str = OPENCLAW_SESSION) -> str:
         """Send a message to the agent and return its complete reply text."""
+        await asyncio.wait_for(self._ready.wait(), timeout=20)
         loop = asyncio.get_running_loop()
         idem = str(uuid.uuid4())
         req_id = f"send:{idem}"
@@ -1380,8 +1605,8 @@ class RealtimeSession:
         self._cal_peaks: list[int] = []       # raw peaks collected during calibration
         self._calibrating = False
         self._active      = False             # start silent; wake phrase enables voice
-        self._monitoring  = False             # passive capture-only mode (no Zeebot, no TTS)
-        self._multilang   = False             # False = only show/process EN/ZH
+        self._monitoring  = _persist_monitoring[0]  # restored across 60-min OpenAI reconnects
+        self._multilang   = _persist_multilang[0]   # "off"|"en-zh"|"whitelist"|"any"
         self._mic_stream_ref: list = [None]   # current sd.InputStream; swapped on hot-plug
 
     def _mic_cb(self, indata, frames, time_info, status):
@@ -1491,6 +1716,33 @@ class RealtimeSession:
             self.alsa_output
         )
 
+    async def _auto_sleep_watchdog(self):
+        """Go silent after AUTO_SLEEP_SECS of no user→LLM interaction."""
+        import time as _as
+        _last_interaction[0] = _as.time()   # seed on session start
+        while not self.stop_event.is_set():
+            await asyncio.sleep(30.0)
+            if not self._active:
+                continue
+            if _as.time() - _last_interaction[0] < AUTO_SLEEP_SECS:
+                continue
+            log.info("Auto-sleep: no interaction for %ds", AUTO_SLEEP_SECS)
+            self._active = False
+            if self._monitoring:
+                self._monitoring = False
+                _persist_monitoring[0] = False
+                log.info("Auto-sleep: monitoring cleared")
+            if self._multilang != "off":
+                self._multilang = "off"
+                _persist_multilang[0] = "off"
+                log.info("Auto-sleep: multilang reset to off")
+            _log_entry("system", "Auto-sleep: going quiet after inactivity.")
+            await asyncio.get_running_loop().run_in_executor(
+                None, speak,
+                "Going quiet — no activity for a while. Say Zeebot wake up to resume.",
+                self.alsa_output,
+            )
+
     async def _watch_mic_stream(self):
         """Detect USB mic hot-unplug and reopen the stream when replugged."""
         import time as _wm
@@ -1524,27 +1776,17 @@ class RealtimeSession:
             except Exception as e:
                 log.warning("PortAudio reinit error: %s", e)
 
-            # Resolve new device index via subprocess (same technique used by
-            # /device-status) so we get a fresh enumeration, not the stale cache.
+            # Resolve new device index from prefs by name using the already-reinited
+            # PortAudio context. Fall back to the last known selected device.
             prefs = _load_device_prefs()
             saved_name = prefs.get("input_device_name") if prefs else None
-            new_idx = self.input_device  # fallback
+            new_idx = _selected_input_device[0]  # fallback to last known good index
             if saved_name:
-                try:
-                    _qr = subprocess.run(
-                        [sys.executable, "-c",
-                         "import sounddevice as sd, json;"
-                         "print(json.dumps([d['name'] for d in sd.query_devices()]))"],
-                        capture_output=True, text=True, timeout=5)
-                    if _qr.returncode == 0:
-                        names = json.loads(_qr.stdout)
-                        for i, n in enumerate(names):
-                            if (saved_name.lower() in n.lower()
-                                    or n.lower() in saved_name.lower()):
-                                new_idx = i
-                                break
-                except Exception as e:
-                    log.warning("Subprocess device query failed: %s", e)
+                resolved = _resolve_device_by_name(saved_name, "input")
+                if resolved is not None:
+                    new_idx = resolved
+                else:
+                    log.warning("Hot-plug: saved device %r not found after reinit", saved_name)
 
             log.info("Hot-plug: attempting to reopen mic on device idx=%s (%s)",
                      new_idx, saved_name or "default")
@@ -1572,6 +1814,11 @@ class RealtimeSession:
                 continue
             if self._busy.is_set():
                 continue
+            # After TTS interrupt, clear OpenAI's audio buffer so stale VAD data
+            # doesn't generate a spurious transcript of the interrupted echo.
+            if _clear_audio_buffer[0]:
+                _clear_audio_buffer[0] = False
+                await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
             await ws.send(json.dumps({
                 "type":  "input_audio_buffer.append",
                 "audio": base64.b64encode(chunk).decode(),
@@ -1593,19 +1840,10 @@ class RealtimeSession:
             log.debug("Dropped prompt echo: %r", transcript)
             return
 
-        # Monitoring-only mode: passively log captured segments (no Zeebot/TTS).
-        # Shows everything verbatim — including noise — so capture quality is visible.
-        if self._monitoring:
-            t = transcript.strip()
-            if t:
-                log.info("Monitor: %s", t)
-                _log_entry("monitor", t)
-            return
-
         # Noise hallucination filter: drop consonant-heavy gibberish from background
         # noise that slipped past the VAD. (Monitoring mode is exempt so you can
         # still diagnose what the transcriber produces.)
-        if _is_likely_noise(transcript):
+        if not self._monitoring and _is_likely_noise(transcript):
             log.debug("Dropped noise hallucination: %r", transcript)
             return
 
@@ -1619,11 +1857,22 @@ class RealtimeSession:
             self._busy.clear()
             _post_busy_until[0] = _ti.time() + 0.5
 
-        # Wake phrase — always checked regardless of active state
+        # Wake phrase — always checked regardless of active/monitoring state.
+        # If monitoring, wake phrase exits monitoring and activates voice.
         if _matches_phrase(normalized, WAKE_PHRASES):
             self._busy.set()
+            _last_interaction[0] = _ti.time()  # reset auto-sleep timer on wake
             try:
-                if not self._active:
+                if self._monitoring:
+                    self._monitoring = False
+                    _persist_monitoring[0] = False
+                    self._active = True
+                    log.info("Wake phrase detected — exiting monitoring, voice active")
+                    _log_entry("system", "Voice activated (monitoring stopped)")
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, speak, "I'm listening.", self.alsa_output
+                    )
+                elif not self._active:
                     self._active = True
                     log.info("Wake phrase detected — voice active")
                     _log_entry("system", "Voice activated")
@@ -1643,6 +1892,8 @@ class RealtimeSession:
         if _matches_phrase(normalized, SLEEP_PHRASES):
             if self._active:
                 self._active = False
+                self._monitoring = False
+                _persist_monitoring[0] = False
                 log.info("Sleep phrase detected — going silent")
                 _log_entry("system", "Voice silenced")
                 self._busy.set()
@@ -1660,19 +1911,39 @@ class RealtimeSession:
             asyncio.create_task(self._run_calibration())
             return
 
-        # Monitoring toggle phrases — work regardless of active state
-        if _matches_phrase(normalized, MONITOR_ON_PHRASES):
+        # Monitoring toggle phrases — work regardless of active state.
+        # Strip non-ASCII before matching: OpenAI Realtime sometimes garbles
+        # "start" as foreign-script characters, e.g. "Tá monitoring." (Irish-
+        # looking) or "Star monitoring།" (Tibetan punctuation attached to the
+        # word, breaking the set lookup).  After stripping, "Star monitoring"
+        # matches via "star" ≈ mishear of "start", and a bare "monitoring"
+        # (≤3 words after strip) is unambiguous enough to treat as ON.
+        import re as _re
+        _ascii_norm = _re.sub(r'[^\x00-\x7F]+', '', normalized).strip()
+        _norm_words = set(_normalize(_ascii_norm if _ascii_norm else normalized).split())
+        _has_monitor = bool(_norm_words & {"monitor", "monitoring"})
+        _start_words = {"start", "starting", "begin", "beginning", "on", "enable",
+                        "activate", "please", "turn", "star"}  # "star" = common mishear of "start"
+        _stop_words  = {"stop", "end", "off", "disable", "deactivate"}
+        _monitor_on  = (_has_monitor
+                        and not bool(_norm_words & _stop_words)
+                        and (bool(_norm_words & _start_words) or len(_norm_words) <= 3))
+        _monitor_off = (_has_monitor and bool(_norm_words & _stop_words))
+
+        if _matches_phrase(normalized, MONITOR_ON_PHRASES) or _monitor_on:
             if not self._monitoring:
                 self._monitoring = True
+                _persist_monitoring[0] = True
                 log.info("Voice command: monitoring ON")
                 _log_entry("system", "Monitoring started.")
                 await asyncio.get_running_loop().run_in_executor(
                     None, speak, "Monitoring started.", self.alsa_output
                 )
             return
-        if _matches_phrase(normalized, MONITOR_OFF_PHRASES):
+        if _matches_phrase(normalized, MONITOR_OFF_PHRASES) or _monitor_off:
             if self._monitoring:
                 self._monitoring = False
+                _persist_monitoring[0] = False
                 log.info("Voice command: monitoring OFF")
                 _log_entry("system", "Monitoring stopped.")
                 await asyncio.get_running_loop().run_in_executor(
@@ -1680,15 +1951,42 @@ class RealtimeSession:
                 )
             return
 
-        # Language gate: drop non-EN/ZH before routing to Zeebot (wake/sleep phrases
-        # are already handled above and are exempt from this check).
-        if not self._multilang and not _is_english_or_chinese(transcript):
-            log.info("Dropped non-EN/ZH: %r", transcript)
+        # Monitoring-only mode: passively log captured segments (no Zeebot/TTS).
+        # NOTE: this block is intentionally AFTER all control phrase checks so
+        # that wake/sleep/monitoring-toggle phrases work even while monitoring.
+        if self._monitoring:
+            t = transcript.strip()
+            if t:
+                log.info("Monitor: %s", t)
+                _log_entry("monitor", t)
+                _last_interaction[0] = _ti.time()  # active capture resets auto-sleep
             return
+
+        # Language gate: drop non-EN/ZH (or off-whitelist) before routing to Zeebot.
+        # Wake/sleep/monitoring phrases are already handled above and are exempt.
+        if self._multilang in ("off", "en-zh"):
+            if not _is_english_or_chinese(transcript):
+                log.debug("Dropped non-EN/ZH (mode=%s): %r", self._multilang, transcript)
+                return
+        elif self._multilang == "whitelist":
+            if not _is_in_multilang_whitelist(transcript):
+                log.debug("Dropped off-whitelist: %r", transcript)
+                return
+        # "any" → all languages pass through
 
         # All other speech: only route to Zeebot when active
         if not self._active:
             log.debug("Silent mode — ignoring: %s", transcript)
+            return
+
+        # Short-word noise guard: single words < 6 chars that aren't known commands
+        # are almost always STT hallucinations from background noise.
+        _SHORT_CMDS = {"ok", "okay", "yes", "no", "sure", "go", "stop", "wait",
+                       "help", "hey", "hi", "bye", "好", "是", "否", "不", "对",
+                       "继续", "再来", "谢谢", "好的"}
+        _nwords = normalized.split()
+        if len(_nwords) == 1 and len(normalized) < 6 and normalized not in _SHORT_CMDS:
+            log.info("Short noise guard — dropped single word: %r", transcript)
             return
 
         # Continue phrase — resume paused TTS without asking Zeebot
@@ -1718,6 +2016,7 @@ class RealtimeSession:
         self._busy.set()
         try:
             log.info("Routing to Zeebot: %s", transcript)
+            _last_interaction[0] = _ti.time()  # reset auto-sleep timer on each query
             _log_entry("you", transcript)
             _log_entry("thinking", "Zeebot is thinking...")  # live counter shown on dashboard
             # Prefix tells Zeebot to ignore cron/heartbeat background context
@@ -1727,7 +2026,14 @@ class RealtimeSession:
             )
             _current_think_task[0] = _think_task
             try:
-                reply = await _think_task
+                reply = await asyncio.wait_for(
+                    asyncio.shield(_think_task), timeout=AGENT_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                _think_task.cancel()
+                log.warning("Agent timed out after %ds — aborting", AGENT_TIMEOUT_S)
+                _log_entry("system", f"Timed out after {AGENT_TIMEOUT_S}s.")
+                return
             except asyncio.CancelledError:
                 log.info("Thinking interrupted via /interrupt")
                 _log_entry("system", "Interrupted.")
@@ -1765,6 +2071,7 @@ class RealtimeSession:
             )
         except Exception as e:
             log.error("Error routing transcript: %s", e)
+            _log_entry("system", "Gateway error — please try again.")
         finally:
             _busy_clear()
 
@@ -1854,6 +2161,7 @@ class RealtimeSession:
                     asyncio.create_task(self._recv_ws(ws)),
                     asyncio.create_task(self.stop_event.wait()),
                     asyncio.create_task(self._watch_mic_stream()),
+                    asyncio.create_task(self._auto_sleep_watchdog()),
                 ]
                 done, pending = await asyncio.wait(
                     tasks, return_when=asyncio.FIRST_COMPLETED
@@ -1868,6 +2176,50 @@ class RealtimeSession:
                 self._mic_stream_ref[0] = None
 
 # ── HTTP toggle server ────────────────────────────────────────────────────────
+
+def _switch_mic_stream(session, new_idx: int) -> None:
+    """Live-switch the mic input stream to new_idx without restarting the daemon.
+
+    Stops the current InputStream and opens a fresh one on new_idx.
+    Resets _last_mic_cb immediately so _watch_mic_stream doesn't race us.
+    No PortAudio reinit needed — only required when a device is physically
+    plugged in after init (hot-plug), not when switching between existing devices.
+    Runs in a background thread — safe to call from the HTTP handler.
+    """
+    import time as _t
+    log.info("Switching mic stream → device %d", new_idx)
+
+    # Reset the watchdog timestamp first so _watch_mic_stream doesn't
+    # trigger its own recovery while we're mid-switch.
+    _last_mic_cb[0] = _t.time()
+
+    old = session._mic_stream_ref[0]
+    session._mic_stream_ref[0] = None
+    try:
+        if old:
+            old.stop()
+            old.close()
+    except Exception:
+        pass
+
+    _t.sleep(0.1)
+
+    try:
+        new_stream = sd.InputStream(
+            samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
+            blocksize=DEVICE_BLOCKSIZE, callback=session._mic_cb,
+            device=new_idx,
+        )
+        new_stream.start()
+        session._mic_stream_ref[0] = new_stream
+        _selected_input_device[0] = new_idx
+        _last_mic_cb[0] = _t.time()
+        log.info("Mic stream switched to device %d OK", new_idx)
+        _log_entry("system", "Mic switched.")
+    except Exception as e:
+        log.warning("Mic stream switch failed: %s", e)
+        _log_entry("system", f"Mic switch failed: {e}")
+
 
 def start_http_server(port: int, on_stop, session_ref: list, loop=None):
     """session_ref is a one-element list holding the current RealtimeSession (or None)."""
@@ -1938,9 +2290,11 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                 self.send_header("Location", "/log")
                 self.end_headers()
             elif self.path == "/sleep":
-                if sess and sess._active:
+                if sess and (sess._active or sess._monitoring):
                     sess._active = False
-                    log.info("HTTP sleep")
+                    sess._monitoring = False
+                    _persist_monitoring[0] = False
+                    log.info("HTTP sleep (active + monitoring cleared)")
                 self.send_response(302)
                 self.send_header("Location", "/log")
                 self.end_headers()
@@ -1956,24 +2310,36 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                         new_state = not sess._monitoring
                     if new_state and not sess._monitoring:
                         sess._monitoring = True
+                        _persist_monitoring[0] = True
                         sess._active = False  # ensure fully silent
                         log.info("HTTP monitor START — capture-only")
                         _log_entry("system", "Monitoring only - capture display, silent")
                     elif not new_state and sess._monitoring:
                         sess._monitoring = False
+                        _persist_monitoring[0] = False
                         log.info("HTTP monitor STOP")
                         _log_entry("system", "Monitoring stopped")
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
             elif self.path == "/multilang":
-                # Toggle multi-language mode. Off (default) = only English/
-                # Chinese shown/processed; other languages dropped.
+                # Cycle: off → en-zh → whitelist → any → off
+                _MULTILANG_CYCLE = ("off", "en-zh", "whitelist", "any")
+                _MULTILANG_LABELS = {
+                    "off":       "OFF (EN/ZH, auto-sleep on)",
+                    "en-zh":     "EN/ZH (auto-sleep suppressed)",
+                    "whitelist": f"Whitelist ({', '.join(MULTILANG_WHITELIST_LANGS[:4])}…)",
+                    "any":       "Any language",
+                }
                 if sess:
-                    sess._multilang = not sess._multilang
-                    state_txt = "ON (all languages)" if sess._multilang else "OFF (EN/ZH only)"
-                    log.info("HTTP multilang %s", state_txt)
-                    _log_entry("system", f"Multi-language mode: {state_txt}")
+                    cur = sess._multilang if sess._multilang in _MULTILANG_CYCLE else "off"
+                    nxt = _MULTILANG_CYCLE[(_MULTILANG_CYCLE.index(cur) + 1) % len(_MULTILANG_CYCLE)]
+                    sess._multilang = nxt
+                    _persist_multilang[0] = nxt
+                    log.info("HTTP multilang: %s → %s", cur, nxt)
+                    _log_entry("system", f"Multi-language: {_MULTILANG_LABELS[nxt]}")
+                    if nxt == "off":
+                        import time as _tms; _last_interaction[0] = _tms.time()
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
@@ -2638,14 +3004,12 @@ setInterval(upd, 2000);
                     # Render the test phrase once at full amplitude (gain applied live).
                     phrase = "This is an audio test. One, two, three, four, five."
                     parts  = []
-                    for seg, lang in _split_by_script(strip_markdown(phrase)):
-                        voice = EDGE_VOICE_ZH if lang == "zh" else EDGE_VOICE_EN
-                        mp3 = _tf.mktemp(suffix=".mp3")
-                        if _edge_tts_to_mp3(seg, voice, mp3):
-                            pcm = _decode_to_pcm(mp3)
-                            if pcm.size: parts.append(pcm)
-                        try: os.unlink(mp3)
-                        except FileNotFoundError: pass
+                    mp3 = _tf.mktemp(suffix=".mp3")
+                    if _openai_tts_to_mp3(strip_markdown(phrase), mp3):
+                        pcm = _decode_to_pcm(mp3)
+                        if pcm.size: parts.append(pcm)
+                    try: os.unlink(mp3)
+                    except FileNotFoundError: pass
                     if not parts:
                         log.warning("loop-start: TTS render failed")
                         return
@@ -2794,8 +3158,12 @@ setInterval(upd, 2000);
                     if dev_type == "sink":
                         if _dev_info["max_output_channels"] < 1:
                             raise ValueError(f"Device {_dev_idx} has no output channels")
+                        # Hot-switch: stop any playing audio, update globals, apply cal.
+                        try:
+                            sd.stop()
+                        except Exception:
+                            pass
                         _selected_output_device[0] = _dev_idx
-                        _update_service_alsa_output(str(_dev_idx))
                         _known = _apply_device_cal(_dev_info["name"])
                         _save_device_prefs(output_name=_dev_info["name"])
                         log.info("HTTP device-set: output → %d %s (%s)",
@@ -2804,30 +3172,26 @@ setInterval(upd, 2000);
                         result["ok"]  = True
                         result["msg"] = (
                             f"Speaker set to {_dev_info['name']}. "
-                            + ("Restored calibrated levels. " if _known
-                               else "New device — starting at minimum. Use Manual adjustment. ")
-                            + "Restarting audio…"
+                            + ("Restored calibrated levels." if _known
+                               else "New device — starting at safe minimum. Use Manual adjustment.")
                         )
                     elif dev_type == "source":
                         if _dev_info["max_input_channels"] < 1:
                             raise ValueError(f"Device {_dev_idx} has no input channels")
                         _selected_input_device[0] = _dev_idx
-                        _update_service_input_source(str(_dev_idx))
                         _save_device_prefs(input_name=_dev_info["name"])
                         log.info("HTTP device-set: input → %d %s", _dev_idx, _dev_info["name"])
+                        sess = session_ref[0]
+                        if sess is not None:
+                            threading.Thread(
+                                target=_switch_mic_stream,
+                                args=(sess, _dev_idx),
+                                daemon=True,
+                            ).start()
                         result["ok"]  = True
-                        result["msg"] = f"Mic set to {_dev_info['name']}. Restarting audio…"
+                        result["msg"] = f"Mic set to {_dev_info['name']}."
                     else:
                         result["msg"] = "Missing type or name"
-                    if result["ok"]:
-                        _uid = os.getuid()
-                        threading.Thread(target=lambda: (
-                            __import__("time").sleep(0.5),
-                            __import__("subprocess").run(
-                                ["launchctl", "kickstart", "-k",
-                                 f"gui/{_uid}/ai.openclaw.realtimetalk"],
-                                capture_output=True)
-                        ), daemon=True).start()
                 except Exception as e:
                     result["msg"] = str(e)
                 resp = _json.dumps(result).encode()
@@ -2928,17 +3292,30 @@ setInterval(upd, 2000);
                     )
                     _device_change_msg[0] = ""
                 else:
-                    device_banner = (
-                        f'<div id="dbanner" style="background:#1a3a1a;border-radius:8px;'
-                        f'padding:8px;margin-bottom:8px;color:#5f5;font-size:13px;">'
-                        f'No device change detected.</div>'
-                        f'<script>setTimeout(()=>{{var b=document.getElementById("dbanner");'
-                        f'if(b)b.remove();}},5000);</script>'
-                    )
+                    device_banner = ""
 
                 active = sess._active if sess else False
                 monitoring = sess._monitoring if sess else False
-                multilang  = sess._multilang if sess else False
+                multilang  = sess._multilang if sess else "off"
+
+                # Per-button hints shown in the hint-zone on hover (state-aware)
+                _ml_desc = {
+                    "off":       f"Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off)",
+                    "en-zh":     f"Now: EN/ZH — auto-sleep off. Click → Whitelist ({', '.join(MULTILANG_WHITELIST_LANGS[:4])}…)",
+                    "whitelist": f"Now: Whitelist — {', '.join(MULTILANG_WHITELIST_LANGS[:4])}… Click → Any language",
+                    "any":       "Now: Any language — auto-sleep off. Click → OFF",
+                }
+                _hints = {
+                    "calibrate": "Open speaker & mic level calibration",
+                    "wake":    "Activate voice — the agent will listen and respond",
+                    "sleep":   "Silence voice and stop monitoring. Say the wake phrase or press Wake to resume" if monitoring else "Silence voice. Say the wake phrase or press Wake to resume",
+                    "monitor": "Now: Monitoring ON. Click → stop monitoring" if monitoring else "Now: OFF. Click → start passive monitoring (transcribes without routing to agent)",
+                    "multilang": _ml_desc.get(multilang, "Toggle multi-language mode"),
+                    "reset":   "Clear the conversation log (does not affect the agent's memory)",
+                    "restart": "Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)",
+                    "gwreset": "Drop and reconnect the gateway WebSocket without restarting",
+                    "refresh": "Reload the dashboard now",
+                }
                 # Pre-compute how long each "thinking" entry waited for a Zeebot reply.
                 # None = still thinking (show live counter); float = seconds taken (show static).
                 thinking_dur: dict = {}
@@ -2990,10 +3367,10 @@ setInterval(upd, 2000);
                 paused   = _paused_speech[0] is not None
                 speaking = _is_speaking[0]
                 thinking = _current_think_task[0] is not None
-                state = ("MONITORING" if monitoring
-                         else "SPEAKING" if speaking
+                state = ("SPEAKING" if speaking
                          else "THINKING" if thinking
-                         else "PAUSED" if (active and paused)
+                         else "PAUSED" if paused
+                         else "MONITORING" if monitoring
                          else "ACTIVE" if active else "SILENT")
                 _sc = {"ACTIVE":("#0d2818","#34d399"),"SILENT":("#141d2b","#64748b"),
                        "THINKING":("#1c1304","#f59e0b"),"SPEAKING":("#031a10","#2dd4bf"),
@@ -3006,11 +3383,11 @@ setInterval(upd, 2000);
                     if speaking else
                     '<div class="speaking">&#9646;&#9646; Paused'
                     ' &nbsp;<a href="/continue" class="cont">&#9654; Continue</a></div>'
-                    if (active and paused) else ""
+                    if paused else ""
                 )
                 body = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta http-equiv="refresh" content="3">
+<script>var _rt;function _sr(){{_rt=setTimeout(()=>location.reload(),3000);}}function _cr(){{clearTimeout(_rt);}}window.onload=_sr;</script>
 <title>RealTimeTalk</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
@@ -3040,7 +3417,7 @@ a.btn.danger:hover{{background:var(--rdb);border-color:var(--rd);}}
 .sys{{color:var(--sy);font-size:.8em;text-align:center;margin:3px 0;font-family:'JetBrains Mono',monospace;}}
 .thinking{{background:var(--bb);border-left:3px solid var(--bot);border-radius:var(--r);padding:8px 10px;margin:3px 0;color:var(--bot);font-style:italic;}}
 .speaking{{background:var(--gnb);border-left:3px solid var(--gn);border-radius:var(--r);padding:8px 10px;margin:3px 0;color:var(--gn);font-style:italic;}}
-.ts{{font-family:'JetBrains Mono',monospace;font-size:.75em;color:var(--di);margin-right:4px;}}
+.ts{{font-family:'JetBrains Mono',monospace;font-size:.75em;color:var(--mu);margin-right:4px;}}
 a.irupt{{color:var(--rd);background:var(--rdb);border:1px solid var(--rd);border-radius:4px;padding:2px 8px;font-size:.82em;font-style:normal;text-decoration:none;margin-left:8px;}}
 a.irupt:hover{{background:var(--rd);color:#fff;}}
 a.cont{{color:var(--gn);background:var(--gnb);border:1px solid var(--gn);border-radius:4px;padding:2px 8px;font-size:.82em;font-style:normal;text-decoration:none;margin-left:8px;}}
@@ -3049,10 +3426,10 @@ a.cont:hover{{background:var(--gn);color:#000;}}
 @media(min-width:900px){{body{{font-size:17px;}}#top{{padding:14px 24px 10px;}}a.btn{{font-size:15px;padding:8px 16px;min-height:38px;}}#dp{{font-size:13px;}}#log{{padding:14px 24px;}}}}
 </style></head><body>
 <div id="top">
-<div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" style="margin-left:10px;">&#127908; Calibrate</a></div>
-<div class="nav"><a href="/wake" class="btn">&#9889; Wake</a><a href="/sleep" class="btn">&#128276; Sleep</a><a href="/monitor/start" class="btn {'on' if monitoring else ''}">&#128065; Monitor On</a><a href="/monitor/stop" class="btn">Monitor Off</a><a href="/multilang" class="btn {'on' if multilang else ''}">&#127760; {'ON' if multilang else 'OFF'} Multi-lang</a><a href="/reset" class="btn danger">&#10006; Clear Log</a><a href="/restart" class="btn">&#8635; Restart</a><a href="/gateway-reset" class="btn danger">&#9888; Gateway Reset</a><a href="/dashboard" class="btn">&#8635;</a></div>
-{device_panel}{device_banner}</div>
-<div id="log">{rows if rows else "<div class='sys'>No conversation yet</div>"}{speaking_banner}</div>
+<div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" style="margin-left:10px;" data-hint="{_hints['calibrate']}">&#9999; Calibrate</a></div>
+<div class="nav" onmouseenter="_cr()" onmouseleave="_sr()"><a href="/wake" class="btn" data-hint="{_hints['wake']}">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="{_hints['sleep']}">&#9790; Sleep</a><a href="/monitor" class="btn {'on' if monitoring else ''}" data-hint="{_hints['monitor']}">&#9678; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{_hints['multilang']}">&#8853; {multilang.upper() if multilang != 'off' else 'Multi-lang'}</a><a href="/reset" class="btn danger" data-hint="{_hints['reset']}">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="{_hints['restart']}">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="{_hints['gwreset']}">&#9888; Gateway Reset</a><a href="/dashboard" class="btn" data-hint="{_hints['refresh']}">&#8635;</a></div>
+{device_panel}{device_banner}<div id="hzone" style="min-height:28px;padding:5px 10px;border-radius:8px;background:var(--sf2);border:1px solid var(--bd);color:var(--mu);font-size:15px;opacity:0;transition:opacity .15s;pointer-events:none;">&nbsp;</div></div>
+<div id="log">{speaking_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
 <script>
 setInterval(function(){{
   var now=Date.now()/1000;
@@ -3060,6 +3437,15 @@ setInterval(function(){{
     el.textContent=Math.max(0,Math.floor(now-parseFloat(el.dataset.start)));
   }});
 }},500);
+(function(){{
+  var hz=document.getElementById('hzone'),ht;
+  function show(txt){{clearTimeout(ht);hz.textContent=txt;hz.style.opacity='1';}}
+  function hide(){{ht=setTimeout(function(){{hz.style.opacity='0';}},60000);}}
+  document.querySelectorAll('a[data-hint]').forEach(function(b){{
+    b.addEventListener('mouseenter',function(){{show(b.dataset.hint);}});
+    b.addEventListener('mouseleave',hide);
+  }});
+}})();
 </script>
 </body></html>"""
                 _html(self, 200, body)
@@ -3103,6 +3489,7 @@ async def main(http_port: int, input_device=None, output_device=None,
     except Exception as e:
         log.error(str(e))
         sys.exit(1)
+    _openai_tts_key[0] = openai_key
 
     gw = GatewayClient(gw_token)
     while not stop_event.is_set():
