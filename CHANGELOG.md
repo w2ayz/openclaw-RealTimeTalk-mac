@@ -1,5 +1,72 @@
 # Changelog
 
+## [2.11.0] — 2026-07-20
+
+Ports the Raspbian build's v2.0.2 → v2.11.0 improvements to the Mac fork,
+skipping Linux/hardware-specific and openWakeWord-dependent items (see
+"Not ported" below). Version number jumps to match the Pi release it was
+ported from, not ten Mac-specific releases.
+
+### Added
+- **ElevenLabs multilingual v2 TTS** (`_elevenlabs_tts_to_mp3`) for Chinese and
+  mixed Chinese/English replies — voice "Rachel", sent as one full-text call so
+  the voice doesn't switch mid-reply. Falls back to OpenAI TTS
+  (`tts-1-hd`/nova), then macOS `say`, on failure or if no key is configured.
+  Key read from `talk.providers.elevenlabs.apiKey` in `openclaw.json` via new
+  `load_elevenlabs_key()` (shares SecretRef resolution with `load_openai_key()`
+  through new `_resolve_provider_api_key()`).
+  **Known issue**: the configured ElevenLabs account is on the Free plan, which
+  returns HTTP 402 for premade/library voices (including "Rachel") via the
+  API — Free-tier API access is limited to voices you've cloned yourself. Until
+  the plan is upgraded (Starter+) or `ELEVENLABS_VOICE_ID` is pointed at an
+  owned voice, every call falls through to OpenAI TTS. The fallback chain
+  handles this correctly (verified — no crash, no silence), it just means the
+  ElevenLabs improvement is not yet actually in effect.
+- **Wake confirmation step**: wake phrase in Silent/Monitoring now prompts
+  "Yes?" instead of activating instantly. Confirmed by an affirmative reply
+  (`yes`, `yeah`, `ok`, `sure`, `wake up`, `yes please`, `好`, `是`, …) or a
+  repeated wake phrase within 15s; anything else is logged as a mis-fire and
+  Zeebot stays silent. The dashboard `/wake` button still bypasses confirmation
+  for immediate activation.
+- **`_persist_active`**: Active (voice-routing) state now survives the 60-min
+  OpenAI session reconnect, matching the existing `_persist_monitoring` /
+  `_persist_multilang` pattern. Previously a session recycle silently dropped
+  the user back to Silent with no indication.
+- **Sleep-state persistence** (`rtt_sleep_state.json`): SLEEPING now survives a
+  daemon/service restart — on restart the daemon waits for `/wake` instead of
+  reconnecting to OpenAI immediately.
+- **Monitor button works from SLEEPING**: previously a no-op when no session
+  was live; now pre-arms Monitoring and wakes, so the new session starts in it.
+- Stale-reply guard: the status-token → `chat.history` fallback now rejects a
+  reply identical to the last one it already delivered (agent hadn't produced
+  a new response yet).
+- Punctuation-only transcripts (e.g. `"..."`) are now dropped explicitly —
+  previously they slipped past the short-word guard (empty string has zero
+  words, not one) and got routed to Zeebot as blank queries.
+
+### Changed
+- `AGENT_TIMEOUT_S` 60 → 90.
+- Short-word noise guard: single non-command words under 9 characters (was 6)
+  are dropped; whitelist extended with `right`, `great`, `thanks`, `please`,
+  `repeat`, `exactly`, `correct`, `alright`.
+- Monitoring mode no longer resets the auto-sleep idle clock — it's passive
+  capture and must not block auto-sleep from firing (previously monitoring
+  activity kept resetting `_last_interaction`, the opposite of the intended
+  behaviour).
+
+### Not ported (Linux/hardware-specific or openWakeWord-dependent)
+AIOC ham radio integration, DTMF wake/sleep state machine, PipeWire AGC
+profile switching — all Pi-hardware-specific. openWakeWord-driven wake
+detection/confirmation, mic-level-during-sleep, and the mic-gate
+auto-calibration reconnect fix — all depend on OWW's always-on local listener
+thread, which the Mac build doesn't run. Bluetooth `paplay` fix — PipeWire-
+specific. Speaker-echo auto-calibration UI fixes — the Mac dashboard's
+calibration flow already updates fields immediately on response, not on a
+polling tick, so the underlying Pi bug doesn't reproduce here. **v3.0.0
+speaker verification (owner-only mode) — excluded, not part of this pass.**
+
+---
+
 ## [2.0.2] — 2026-05-23
 
 ### Fixed

@@ -4,8 +4,10 @@ description: >
   Headless always-on voice conversation daemon for macOS (Mac Mini variant of
   openclaw-RealTimeTalk). Captures mic via CoreAudio (sounddevice), streams to
   OpenAI Realtime API for STT, routes transcripts through the OpenClaw gateway,
-  and synthesises replies with Edge TTS (with macOS `say` fallback).
-  Voice activation: "Zeebot wake up" / "Zeebot go to sleep".
+  and synthesises replies with ElevenLabs multilingual v2 (Chinese/mixed),
+  OpenAI TTS (English/fallback), and macOS `say` (offline last resort).
+  Voice activation: "Zeebot wake up" (asks "Yes?" for confirmation) / "Zeebot
+  go to sleep".
 ---
 
 # RealTimeTalk Mac — Skill Guide
@@ -26,7 +28,7 @@ service manager) is swapped for Mac-native equivalents.
 | Mic device discovery | `pactl list sources` | `sounddevice.query_devices()` |
 | Output device discovery | `pactl list sinks` | `sounddevice.query_devices()` |
 | AGC | PipeWire WebRTC AGC virtual source | None — software gain/gate only |
-| TTS | Piper binary | Edge TTS (primary) + macOS `say` (fallback) |
+| TTS | Piper binary | ElevenLabs (zh/mixed) → OpenAI TTS → macOS `say` |
 | Audio decoding | direct PCM from Piper | ffmpeg → 24 kHz mono int16 |
 | Volume control | `pactl set-sink-volume` | `osascript -e 'set volume output volume'` |
 | Service manager | systemd user service | launchd LaunchAgent |
@@ -47,47 +49,61 @@ websockets + numpy:
 - Voice activation matcher (`_matches_phrase`, normalised exact + fuzzy)
 - Text helpers: `_is_english_or_chinese`, `_to_simplified` (via zhconv),
   `_split_by_script`, `strip_markdown`, `_is_likely_noise`
-- Config loaders: `load_openai_key`, `load_gateway_token`
+- Config loaders: `load_openai_key`, `load_elevenlabs_key`, `load_gateway_token`
 
 ---
 
 ## TTS pipeline
 
 ```python
-# In speak() — for each (segment, lang) in _split_by_script(text):
-1. _edge_tts_to_mp3(text, voice, /tmp/rtt_XXX.mp3, timeout=8s)
-   └─ Edge TTS via node tts-converter.js
-2. on timeout/failure → _say_fallback_to_aiff(text, lang, /tmp/rtt_XXX.aiff)
+# In speak(text):
+1. if any CJK char in text: _elevenlabs_tts_to_mp3(text, /tmp/rtt_XXX.mp3)
+   └─ ElevenLabs multilingual v2, voice "Rachel" — whole text in one call
+2. on failure/no key/pure-English: _openai_tts_to_mp3(text, /tmp/rtt_XXX.mp3)
+   └─ OpenAI TTS tts-1-hd, voice nova — whole text in one call
+3. on failure: per-segment fallback over _split_by_script(text):
+   _say_fallback_to_aiff(seg_text, lang, /tmp/rtt_XXX.aiff)
    └─ macOS `say -v {Samantha|Tingting} -o <out>`
-3. _decode_to_pcm(<file>)
+4. _decode_to_pcm(<file>)
    └─ ffmpeg → 24 kHz mono int16 numpy array
-4. concatenate PCM segments, apply software volume
-5. sd.play(pcm, device=<output_device>, blocking=False)
-6. poll mic level every 50 ms → sd.stop() on speech-interrupt
+5. concatenate PCM segments, apply software volume
+6. sd.play(pcm, device=<output_device>, blocking=False)
+7. poll mic level every 50 ms → sd.stop() on speech-interrupt
 ```
 
 Voice choices:
-- Edge: `en-US-AriaNeural`, `zh-CN-XiaoxiaoNeural`
+- ElevenLabs: voice ID `21m00Tcm4TlvDq8ikWAM` ("Rachel"), model `eleven_multilingual_v2`
+- OpenAI TTS: model `tts-1-hd`, voice `nova`
 - say: `Samantha` (en), `Tingting` (zh)
+
+Edge TTS (`_edge_tts_to_mp3`) is still present in the file for reference but
+unused by default — kept in case ElevenLabs/OpenAI are both unreachable and
+someone wants to re-wire it in.
 
 ---
 
-## OpenAI key requirement
+## API key requirements
 
-The daemon reads `talk.providers.openai.apiKey` from `~/.openclaw/openclaw.json`.
+The daemon reads `talk.providers.openai.apiKey` (required) and
+`talk.providers.elevenlabs.apiKey` (optional) from `~/.openclaw/openclaw.json`.
 The Realtime API requires the regular OpenAI provider (api_key mode), not the
 `openai-codex` OAuth profile. Add this block to openclaw.json:
 
 ```json
 "talk": {
   "providers": {
-    "openai": { "apiKey": "sk-..." }
+    "openai":     { "apiKey": "sk-..." },
+    "elevenlabs": { "apiKey": "..." }
   }
 }
 ```
 
-The installer (`RealTimeTalk-install-mac.sh`) checks this precondition and
-prints instructions if missing.
+`load_openai_key()` raises and exits the daemon if missing.
+`load_elevenlabs_key()` returns `""` if missing — `speak()` just skips straight
+to OpenAI TTS for Chinese/mixed replies.
+
+The installer (`RealTimeTalk-install-mac.sh`) checks the OpenAI precondition
+and prints instructions if missing.
 
 ---
 
@@ -138,4 +154,5 @@ Functions that work natively on Mac:
 | Bluetooth playback sounds compressed | macOS SCO mode (8 kHz) | Expected when BT mic+speaker on same device — use separate output |
 | Daemon won't restart after edit | LaunchAgent throttle (10 s) | `launchctl kickstart -k gui/$UID/ai.openclaw.realtimetalk` |
 | TTS plays silently | Output device volume zero | macOS system volume: F11/F12 or System Settings → Sound |
-| Edge TTS always failing | Network down / Edge endpoint blocked | Daemon falls back to `say` — check `/tmp/openclaw/realtimetalk.log` for timeouts |
+| ElevenLabs/OpenAI TTS always failing | Network down / key invalid | Daemon falls back down the chain to `say` — check `/tmp/openclaw/realtimetalk.log` for HTTP errors |
+| Wake phrase doesn't activate | Confirmation not answered within 15s | Reply "yes" (or repeat the wake phrase) right after Zeebot asks "Yes?"; use the dashboard Wake button to skip confirmation |

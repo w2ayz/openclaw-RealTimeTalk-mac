@@ -26,7 +26,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "2.0.2"
+__version__ = "2.11.0"
 
 import argparse
 import asyncio
@@ -58,11 +58,19 @@ OPENCLAW_CONFIG   = os.path.expanduser("~/.openclaw/openclaw.json")
 OPENCLAW_GW_URL   = "ws://127.0.0.1:18789"
 OPENCLAW_SESSION  = "agent:main:main"
 
-# OpenAI TTS — primary TTS engine (handles mixed Chinese/English natively)
-OPENAI_TTS_MODEL  = "tts-1"
+# OpenAI TTS — fallback TTS engine for Chinese/mixed text, primary for English
+# (handles mixed Chinese/English natively if ElevenLabs is unavailable)
+OPENAI_TTS_MODEL  = "tts-1-hd"
 OPENAI_TTS_VOICE  = "nova"        # nova works well for Chinese and English
 OPENAI_TTS_TIMEOUT = 15.0         # seconds before falling back to say
 _openai_tts_key: list = [""]      # set from openai_key in main()
+
+# ElevenLabs TTS — primary for Chinese/mixed Chinese-English text (consistent
+# voice across languages in one call; OpenAI TTS is the fallback on failure).
+ELEVENLABS_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"   # "Rachel" — multilingual v2
+ELEVENLABS_MODEL    = "eleven_multilingual_v2"
+ELEVENLABS_TIMEOUT  = 15.0
+_elevenlabs_tts_key: list = [""]  # set from load_elevenlabs_key() in main()
 
 # Edge TTS skill — kept for reference but no longer primary
 EDGE_TTS_SCRIPT   = os.path.expanduser(
@@ -86,7 +94,7 @@ BLOCKSIZE         = 2400         # 100 ms at 24 kHz
 DEVICE_BLOCKSIZE  = BLOCKSIZE    # same as BLOCKSIZE when RESAMPLE_RATIO == 1
 DEFAULT_HTTP_PORT = 19000
 RECONNECT_DELAY   = 5
-AGENT_TIMEOUT_S   = 60
+AGENT_TIMEOUT_S   = 90
 AUTO_SLEEP_SECS   = 600          # go silent after 10 min of no interaction
 # Languages accepted in multi-lang WHITELIST mode (langdetect codes + script tokens).
 MULTILANG_WHITELIST_LANGS: list = ["en", "zh-cn", "zh-tw", "zh", "ko", "ja", "es", "ms"]
@@ -103,6 +111,7 @@ CAL_NEW_DEV_VOL   = 0.01         # Vol+SW for first-seen devices — start at mi
 CAL_NEW_DEV_SYS_VOL = 1          # macOS system volume (%) for new/unrecognised devices
 CAL_STORE_FILE    = os.path.expanduser("~/.openclaw/workspace/speaker_cal_store.json")
 DEVICE_PREFS_FILE = os.path.expanduser("~/.openclaw/workspace/device_prefs.json")
+SLEEP_STATE_FILE  = os.path.expanduser("~/.openclaw/workspace/rtt_sleep_state.json")
 # Speech-interrupt: if the mic sees this many consecutive 50ms blocks above
 # the interrupt threshold while Zeebot is speaking, kill TTS immediately.
 SPEAK_INTERRUPT_PEAK   = 150   # min threshold floor
@@ -168,14 +177,18 @@ _post_busy_until:  list = [0.0] # timestamp; mic sends silence until this time a
 _http_interrupt:   list = [False]  # set by /interrupt HTTP route to cut TTS mid-playback
 _is_speaking:      list = [False]  # True while speak() is playing audio
 _current_think_task: list = [None]  # asyncio.Task for current gw.ask(); cancelled by /interrupt
+_last_history_reply: list = [""]    # last text returned by the status-token history fallback
 _last_mic_cb:        list = [0.0]   # epoch of last _mic_cb invocation — used for hot-plug detection
 _last_interaction:   list = [0.0]   # epoch of last user→LLM interaction; drives auto-sleep
 _clear_audio_buffer: list = [False] # set after TTS interrupt; _send_mic sends input_audio_buffer.clear
 _persist_monitoring: list = [False] # monitoring state across 60-min OpenAI session reconnects
 _persist_multilang:  list = ["off"] # multilang state across reconnects: "off"|"en-zh"|"whitelist"|"any"
+_persist_active:     list = [False] # active (voice-routing) state across 60-min OpenAI session reconnects
 _sleep_requested:    list = [False] # watchdog sets this; main() waits for /wake before reconnecting
 _wake_event:         list = [None]  # asyncio.Event created in main(); HTTP /wake sets it to reconnect
 _is_sleeping:        list = [False] # True while OpenAI is intentionally disconnected (auto-sleep)
+_wake_activate:      list = [False] # HTTP /wake while sleeping — next session starts active immediately
+_pending_monitor_wake: list = [False]  # Monitor button pressed while sleeping — pre-arms monitoring on wake
 
 
 def _list_audio_devices() -> dict:
@@ -516,6 +529,15 @@ TRANSCRIPTION_PROMPT_NORM = "zeebot"
 WAKE_PHRASES     = {"zeebot wake up", "real time talk on", "real-time talk on", "realtimetalk on",
                     "zibob wake up", "zibot wake up", "libot wake up", "ziba wake up"}
 SLEEP_PHRASES    = {"zeebot go to sleep", "real time talk off", "real-time talk off", "realtimetalk off"}
+
+# Wake confirmation — affirmative responses accepted after Zeebot asks "Yes?"
+_WAKE_CONFIRM_AFFIRM = {
+    "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "correct", "affirmative",
+    "go ahead", "wake up", "wake", "activate", "please", "do it", "yes please",
+    "好", "是", "对", "好的", "可以", "醒来",
+}
+_WAKE_CONFIRM_TIMEOUT = 15.0  # seconds to wait for confirmation before treating as mis-fire
+
 MONITOR_ON_PHRASES  = {
     "zeebot start monitoring", "start monitoring", "zeebot monitor on",
     "monitor on", "zeebot monitoring on", "monitoring on",
@@ -667,15 +689,15 @@ def _load_json(path: str) -> dict:
     with open(path) as f:
         return json.load(f)
 
-def load_openai_key() -> str:
-    cfg = _load_json(OPENCLAW_CONFIG)
+def _resolve_provider_api_key(cfg: dict, provider: str) -> str:
+    """Read talk.providers.<provider>.apiKey, resolving OpenClaw SecretRefs
+    ({"source":"file","provider":"...","id":"/a/b/c"}) if present."""
     key = (
         cfg.get("talk", {})
            .get("providers", {})
-           .get("openai", {})
+           .get(provider, {})
            .get("apiKey", "")
     )
-    # Resolve OpenClaw SecretRef: {"source":"file","provider":"...","id":"/a/b/c"}
     if isinstance(key, dict) and key.get("source") == "file":
         provider_name = key.get("provider", "")
         secret_path = os.path.expanduser(
@@ -688,11 +710,24 @@ def load_openai_key() -> str:
         for part in [p for p in key.get("id", "").split("/") if p]:
             secrets = secrets[part]
         key = secrets
+    return key or ""
+
+def load_openai_key() -> str:
+    key = _resolve_provider_api_key(_load_json(OPENCLAW_CONFIG), "openai")
     if not key:
         raise RuntimeError(
             "No OpenAI API key at talk.providers.openai.apiKey in openclaw.json"
         )
     return key
+
+def load_elevenlabs_key() -> str:
+    """Returns "" (not an error) if unset — ElevenLabs TTS is optional; speak()
+    falls back to OpenAI TTS / macOS `say` when no key is configured."""
+    try:
+        return _resolve_provider_api_key(_load_json(OPENCLAW_CONFIG), "elevenlabs")
+    except Exception as e:
+        log.warning("Could not load ElevenLabs key: %s", e)
+        return ""
 
 def load_gateway_token() -> str:
     cfg = _load_json(OPENCLAW_CONFIG)
@@ -802,6 +837,23 @@ def _save_device_prefs(output_name: str = None, input_name: str = None) -> None:
             json.dump(prefs, f, indent=2)
     except Exception as e:
         log.warning("Could not save device prefs: %s", e)
+
+def _save_sleep_state(sleeping: bool) -> None:
+    """Persist sleep state to disk so it survives daemon/service restarts."""
+    try:
+        os.makedirs(os.path.dirname(SLEEP_STATE_FILE), exist_ok=True)
+        with open(SLEEP_STATE_FILE, "w") as f:
+            json.dump({"sleeping": sleeping}, f)
+    except Exception as e:
+        log.warning("Could not save sleep state: %s", e)
+
+def _load_sleep_state() -> bool:
+    """Return True if the daemon was sleeping when it last stopped."""
+    try:
+        with open(SLEEP_STATE_FILE) as f:
+            return bool(json.load(f).get("sleeping", False))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
 
 # ── Service file (launchd plist) helpers ─────────────────────────────────────
 
@@ -1098,6 +1150,44 @@ def _openai_tts_to_mp3(text: str, out_path: str, timeout: float = OPENAI_TTS_TIM
         return False
 
 
+def _elevenlabs_tts_to_mp3(text: str, out_path: str, timeout: float = ELEVENLABS_TIMEOUT) -> bool:
+    """Render text via ElevenLabs multilingual v2 → MP3 at out_path.
+
+    Used for Chinese/mixed Chinese-English replies: unlike per-segment Piper/say
+    splitting, ElevenLabs handles the full mixed-language sentence in one call so
+    the voice doesn't switch mid-reply. Falls back to OpenAI TTS on failure.
+    """
+    import json, urllib.request, urllib.error
+    key = _elevenlabs_tts_key[0]
+    if not key:
+        return False
+    try:
+        payload = json.dumps({
+            "text": text,
+            "model_id": ELEVENLABS_MODEL,
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+        }).encode()
+        req = urllib.request.Request(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
+            data=payload,
+            headers={
+                "xi-api-key": key,
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with open(out_path, "wb") as f:
+                f.write(resp.read())
+        return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+    except urllib.error.HTTPError as e:
+        log.warning("ElevenLabs TTS HTTP error %d: %s", e.code, e.read()[:200])
+        return False
+    except Exception as e:
+        log.warning("ElevenLabs TTS error: %s", e)
+        return False
+
+
 def _edge_tts_to_mp3(text: str, voice: str, out_path: str, timeout: float = EDGE_TTS_TIMEOUT) -> bool:
     """Render `text` via Edge TTS skill → MP3 at out_path. Returns True on success."""
     try:
@@ -1195,11 +1285,23 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         temp_files.append(mp3_path)
         pcm = np.zeros(0, dtype=np.int16)
 
-        ok_oai = _openai_tts_to_mp3(clean, mp3_path)
-        log.info("  OpenAI TTS %s", "OK" if ok_oai else "FAILED")
-        if ok_oai:
-            pcm = _decode_to_pcm(mp3_path)
-            log.info("  PCM decode: %d samples (%.1fs)", pcm.size, pcm.size / TTS_SAMPLE_RATE)
+        # Chinese/mixed text: try ElevenLabs multilingual v2 first — one call for
+        # the whole sentence keeps the voice consistent across languages, unlike
+        # per-segment splitting. Falls through to OpenAI TTS on failure/no key.
+        if any(_is_cjk(ch) for ch in clean):
+            if _elevenlabs_tts_to_mp3(clean, mp3_path):
+                pcm = _decode_to_pcm(mp3_path)
+                log.info("  ElevenLabs TTS OK — PCM decode: %d samples (%.1fs)",
+                         pcm.size, pcm.size / TTS_SAMPLE_RATE)
+            else:
+                log.info("  ElevenLabs TTS unavailable/failed — falling back to OpenAI TTS")
+
+        if pcm.size == 0:
+            ok_oai = _openai_tts_to_mp3(clean, mp3_path)
+            log.info("  OpenAI TTS %s", "OK" if ok_oai else "FAILED")
+            if ok_oai:
+                pcm = _decode_to_pcm(mp3_path)
+                log.info("  PCM decode: %d samples (%.1fs)", pcm.size, pcm.size / TTS_SAMPLE_RATE)
 
         if pcm.size == 0:
             # Fall back to macOS `say` — split by script for correct voice selection
@@ -1610,10 +1712,12 @@ class RealtimeSession:
         self._busy        = asyncio.Event()   # set while Zeebot is speaking
         self._cal_peaks: list[int] = []       # raw peaks collected during calibration
         self._calibrating = False
-        self._active      = False             # start silent; wake phrase enables voice
+        self._active      = _persist_active[0]       # restored across 60-min OpenAI reconnects
         self._monitoring  = _persist_monitoring[0]  # restored across 60-min OpenAI reconnects
         self._multilang   = _persist_multilang[0]   # "off"|"en-zh"|"whitelist"|"any"
         self._mic_stream_ref: list = [None]   # current sd.InputStream; swapped on hot-plug
+        self._pending_wake_confirm = False    # True while waiting for voice confirmation to activate
+        self._pending_wake_t       = 0.0      # timestamp when confirmation was requested
 
     def _mic_cb(self, indata, frames, time_info, status):
         import time as _tcb0
@@ -1741,6 +1845,7 @@ class RealtimeSession:
             mins = int(idle / 60)
             log.info("Auto-sleep: idle %d min — disconnecting OpenAI", mins)
             self._active = False
+            _persist_active[0] = False
             if self._monitoring:
                 self._monitoring = False
                 _persist_monitoring[0] = False
@@ -1753,6 +1858,7 @@ class RealtimeSession:
             )
             _sleep_requested[0] = True
             _is_sleeping[0] = True
+            _save_sleep_state(True)
             await ws.close()   # closes OpenAI WS; run()'s async-with exits cleanly
             return
 
@@ -1862,6 +1968,13 @@ class RealtimeSession:
 
         normalized = transcript.strip().rstrip(".!?,").lower()
 
+        # Drop punctuation-only transcripts (e.g. ".", "...") — nothing left after strip.
+        # Without this they fall through every guard below (single-word check requires
+        # len==1, but split() on "" gives zero words) and get routed to Zeebot as blanks.
+        if not normalized:
+            log.debug("Dropped punctuation-only transcript: %r", transcript)
+            return
+
         import time as _ti
         import functools as _ft
 
@@ -1870,33 +1983,57 @@ class RealtimeSession:
             self._busy.clear()
             _post_busy_until[0] = _ti.time() + 0.5
 
+        # Wake confirmation pending — check affirmative response before anything else.
+        if self._pending_wake_confirm:
+            elapsed = _ti.time() - self._pending_wake_t
+            self._pending_wake_confirm = False
+            if elapsed > _WAKE_CONFIRM_TIMEOUT:
+                log.info("Wake confirmation timed out (%.1fs) — mis-fire: %r", elapsed, transcript)
+                _log_entry("system", "Wake mis-fire (timeout) — staying silent")
+            elif normalized in _WAKE_CONFIRM_AFFIRM or _matches_phrase(normalized, WAKE_PHRASES):
+                log.info("Wake confirmed — voice active")
+                _log_entry("system", "Voice activated")
+                self._busy.set()
+                try:
+                    if self._monitoring:
+                        self._monitoring = False
+                        _persist_monitoring[0] = False
+                    self._active = True
+                    _persist_active[0] = True
+                    _last_interaction[0] = _ti.time()
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, speak, "I'm listening.", self.alsa_output
+                    )
+                finally:
+                    _busy_clear()
+            else:
+                log.info("Wake mis-fire — not confirmed: %r", transcript)
+                _log_entry("system", f"Wake mis-fire — ignored ({transcript!r})")
+            return
+
         # Wake phrase — always checked regardless of active/monitoring state.
-        # If monitoring, wake phrase exits monitoring and activates voice.
+        # Already active → simple acknowledgement. Silent or monitoring → ask for
+        # confirmation before activating (avoids self-triggering off Zeebot's own TTS
+        # or background chatter that happens to include the wake phrase).
         if _matches_phrase(normalized, WAKE_PHRASES):
-            self._busy.set()
-            _last_interaction[0] = _ti.time()  # reset auto-sleep timer on wake
-            try:
-                if self._monitoring:
-                    self._monitoring = False
-                    _persist_monitoring[0] = False
-                    self._active = True
-                    log.info("Wake phrase detected — exiting monitoring, voice active")
-                    _log_entry("system", "Voice activated (monitoring stopped)")
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, speak, "I'm listening.", self.alsa_output
-                    )
-                elif not self._active:
-                    self._active = True
-                    log.info("Wake phrase detected — voice active")
-                    _log_entry("system", "Voice activated")
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, speak, "I'm listening.", self.alsa_output
-                    )
-                else:
+            if self._active:
+                self._busy.set()
+                try:
                     log.info("Wake phrase detected — already active")
                     await asyncio.get_running_loop().run_in_executor(
                         None, speak, "Yes, I'm here.", self.alsa_output
                     )
+                finally:
+                    _busy_clear()
+                return
+            self._pending_wake_confirm = True
+            self._pending_wake_t = _ti.time()
+            log.info("Wake phrase detected — requesting confirmation")
+            self._busy.set()
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, speak, "Yes?", self.alsa_output
+                )
             finally:
                 _busy_clear()
             return
@@ -1905,6 +2042,7 @@ class RealtimeSession:
         if _matches_phrase(normalized, SLEEP_PHRASES):
             if self._active:
                 self._active = False
+                _persist_active[0] = False
                 self._monitoring = False
                 _persist_monitoring[0] = False
                 log.info("Sleep phrase detected — going silent")
@@ -1967,12 +2105,13 @@ class RealtimeSession:
         # Monitoring-only mode: passively log captured segments (no Zeebot/TTS).
         # NOTE: this block is intentionally AFTER all control phrase checks so
         # that wake/sleep/monitoring-toggle phrases work even while monitoring.
+        # Intentionally does NOT update _last_interaction — monitoring is passive
+        # and must not prevent auto-sleep from firing.
         if self._monitoring:
             t = transcript.strip()
             if t:
                 log.info("Monitor: %s", t)
                 _log_entry("monitor", t)
-                _last_interaction[0] = _ti.time()  # active capture resets auto-sleep
             return
 
         # Language gate: drop non-EN/ZH (or off-whitelist) before routing to Zeebot.
@@ -1992,13 +2131,17 @@ class RealtimeSession:
             log.debug("Silent mode — ignoring: %s", transcript)
             return
 
-        # Short-word noise guard: single words < 6 chars that aren't known commands
-        # are almost always STT hallucinations from background noise.
+        # Short-word noise guard: single words under 9 characters that aren't
+        # known commands are almost always noise hallucinations or foreign-word
+        # hallucinations (e.g. "Esquece", "Senhores", "Legjeni") that slip past
+        # the character-level language filter. langdetect is unreliable on single
+        # short words so we handle them here instead.
         _SHORT_CMDS = {"ok", "okay", "yes", "no", "sure", "go", "stop", "wait",
-                       "help", "hey", "hi", "bye", "好", "是", "否", "不", "对",
-                       "继续", "再来", "谢谢", "好的"}
+                       "help", "hey", "hi", "bye", "right", "great", "thanks",
+                       "please", "repeat", "exactly", "correct", "alright",
+                       "好", "是", "否", "不", "对", "继续", "再来", "谢谢", "好的"}
         _nwords = normalized.split()
-        if len(_nwords) == 1 and len(normalized) < 6 and normalized not in _SHORT_CMDS:
+        if len(_nwords) == 1 and len(normalized) < 9 and normalized not in _SHORT_CMDS:
             log.info("Short noise guard — dropped single word: %r", transcript)
             return
 
@@ -2063,6 +2206,11 @@ class RealtimeSession:
                 log.info("Status token %r — fetching reply from history", reply)
                 await asyncio.sleep(1.2)  # let message-tool result fully persist
                 reply = await self.gw._reply_from_history(self.session_key)
+                # Reject stale history: if it matches the last reply we already
+                # delivered, the agent hasn't produced a new response yet.
+                if reply and reply == _last_history_reply[0]:
+                    log.warning("History returned same reply as last time — treating as stale")
+                    reply = ""
                 if not reply:
                     log.warning("History fallback also empty")
                     _log_entry("system", "No reply from Zeebot — please try again.")
@@ -2072,6 +2220,7 @@ class RealtimeSession:
                         self.alsa_output,
                     )
                     return
+                _last_history_reply[0] = reply
             log.info("Zeebot: %s", reply)
             _log_entry("zeebot", reply)
             await asyncio.get_running_loop().run_in_executor(
@@ -2298,12 +2447,16 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
             elif self.path == "/wake":
                 import time as _twk
                 if _is_sleeping[0] and _wake_event[0] and loop:
-                    # Waking from auto-sleep: stamp idle clock then signal main() to reconnect
+                    # Waking from auto-sleep: bypass confirmation, activate immediately,
+                    # stamp idle clock, then signal main() to reconnect.
+                    _wake_activate[0] = True
                     _last_interaction[0] = _twk.time()
                     loop.call_soon_threadsafe(_wake_event[0].set)
                     log.info("HTTP wake — reconnecting from auto-sleep")
                 elif sess:
                     sess._active = True
+                    _persist_active[0] = True
+                    sess._pending_wake_confirm = False  # HTTP wake bypasses confirmation
                     if sess._monitoring:
                         sess._monitoring = False
                         _persist_monitoring[0] = False
@@ -2316,6 +2469,7 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
             elif self.path == "/sleep":
                 if sess and (sess._active or sess._monitoring):
                     sess._active = False
+                    _persist_active[0] = False
                     sess._monitoring = False
                     _persist_monitoring[0] = False
                     log.info("HTTP sleep (active + monitoring cleared)")
@@ -2336,6 +2490,7 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                         sess._monitoring = True
                         _persist_monitoring[0] = True
                         sess._active = False  # ensure fully silent
+                        _persist_active[0] = False
                         log.info("HTTP monitor START — capture-only")
                         _log_entry("system", "Monitoring only - capture display, silent")
                     elif not new_state and sess._monitoring:
@@ -2343,6 +2498,11 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                         _persist_monitoring[0] = False
                         log.info("HTTP monitor STOP")
                         _log_entry("system", "Monitoring stopped")
+                elif _is_sleeping[0] and self.path != "/monitor/stop" and _wake_event[0] and loop:
+                    # Sleeping: pre-arm monitoring and wake so the next session starts in it.
+                    _pending_monitor_wake[0] = True
+                    loop.call_soon_threadsafe(_wake_event[0].set)
+                    log.info("HTTP monitor — waking from sleep into Monitoring")
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
@@ -3518,6 +3678,9 @@ async def main(http_port: int, input_device=None, output_device=None,
         log.error(str(e))
         sys.exit(1)
     _openai_tts_key[0] = openai_key
+    _elevenlabs_tts_key[0] = load_elevenlabs_key()
+    if not _elevenlabs_tts_key[0]:
+        log.info("No ElevenLabs key configured — Chinese/mixed TTS will use OpenAI TTS")
 
     gw = GatewayClient(gw_token)
     while not stop_event.is_set():
@@ -3538,13 +3701,46 @@ async def main(http_port: int, input_device=None, output_device=None,
     start_http_server(http_port, lambda: loop.call_soon_threadsafe(stop_event.set), session_ref, loop=loop)
     log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say 'Zeebot wake up' to activate)")
 
+    # Restore sleep state persisted across daemon/service restarts (e.g. mic device change).
+    if _load_sleep_state():
+        _is_sleeping[0] = True
+        _sleep_requested[0] = True
+        log.info("Restored sleep state from disk — waiting for wake signal…")
+
     while not stop_event.is_set():
+        if _sleep_requested[0]:
+            # Sleeping (auto-sleep, or restored from disk): wait for /wake before connecting.
+            _sleep_requested[0] = False
+            log.info("Sleeping. Waiting for /wake to reconnect…")
+            _wake_event[0].clear()
+            wake_task = asyncio.create_task(_wake_event[0].wait())
+            stop_task = asyncio.create_task(stop_event.wait())
+            done, pending = await asyncio.wait([wake_task, stop_task], return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+            _is_sleeping[0] = False
+            _save_sleep_state(False)
+            if stop_event.is_set():
+                break
+            log.info("Wake received — reconnecting to OpenAI…")
+            _log_entry("system", "Reconnecting…")
+
         session = RealtimeSession(
             api_key=openai_key, loop=loop, gw=gw,
             stop_event=stop_event,
             input_device=input_device, alsa_output=alsa_output,
             session_key=session_key,
         )
+        if _wake_activate[0]:
+            session._active = True
+            _persist_active[0] = True
+            _wake_activate[0] = False
+            log.info("Wake-from-sleep: session started active (HTTP wake)")
+        if _pending_monitor_wake[0]:
+            session._monitoring = True
+            _persist_monitoring[0] = True
+            _pending_monitor_wake[0] = False
+            log.info("Wake-from-sleep: session started in Monitoring (HTTP monitor)")
         session_ref[0] = session
         try:
             await session.run()
@@ -3556,22 +3752,7 @@ async def main(http_port: int, input_device=None, output_device=None,
 
         session_ref[0] = None
 
-        if _sleep_requested[0] and not stop_event.is_set():
-            # Auto-sleep: OpenAI WS closed intentionally. Wait for /wake before reconnecting.
-            _sleep_requested[0] = False
-            log.info("Auto-sleep: OpenAI disconnected. Waiting for /wake to reconnect…")
-            _wake_event[0].clear()
-            wake_task = asyncio.create_task(_wake_event[0].wait())
-            stop_task = asyncio.create_task(stop_event.wait())
-            done, pending = await asyncio.wait([wake_task, stop_task], return_when=asyncio.FIRST_COMPLETED)
-            for t in pending:
-                t.cancel()
-            _is_sleeping[0] = False
-            if stop_event.is_set():
-                break
-            log.info("Wake received — reconnecting to OpenAI…")
-            _log_entry("system", "Reconnecting…")
-        elif not stop_event.is_set():
+        if not _sleep_requested[0] and not stop_event.is_set():
             log.info("Reconnecting in %ds…", RECONNECT_DELAY)
             await asyncio.sleep(RECONNECT_DELAY)
 

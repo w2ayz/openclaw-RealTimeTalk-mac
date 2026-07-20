@@ -5,8 +5,12 @@ Real-time voice conversations with the OpenClaw agent (Zeebot), adapted from
 to run on a Mac Mini.
 
 ```
-Mic → OpenAI Realtime API (VAD + STT) → OpenClaw gateway → Zeebot → Edge TTS → Speaker
+Mic → OpenAI Realtime API (VAD + STT) → OpenClaw gateway → Zeebot → TTS → Speaker
 ```
+
+TTS chain: ElevenLabs multilingual v2 for Chinese/mixed replies → OpenAI TTS
+(`tts-1-hd`, all-English replies and ElevenLabs fallback) → macOS `say`
+(offline last resort).
 
 A web dashboard on `http://localhost:19000/dashboard` exposes wake/sleep, a
 live conversation log, mic level meter, and basic device controls.
@@ -18,7 +22,7 @@ live conversation log, mic level meter, and basic device controls.
 | Concern              | Pi (origin)                       | Mac (this repo)                              |
 |----------------------|-----------------------------------|----------------------------------------------|
 | Audio framework      | PipeWire + ALSA                   | CoreAudio (via `sounddevice`)                |
-| TTS                  | Piper (offline binary)            | Edge TTS (primary), macOS `say` (fallback)   |
+| TTS                  | Piper (offline binary)            | ElevenLabs (zh/mixed) → OpenAI TTS → `say`   |
 | Service manager      | systemd user service              | launchd LaunchAgent                          |
 | Audio playback       | `aplay` subprocess                | `sounddevice` (PCM into CoreAudio)           |
 | Volume control       | `pactl set-sink-volume`           | `osascript -e 'set volume output volume N'`  |
@@ -61,6 +65,24 @@ The Realtime API requires the standard OpenAI provider with `api_key` mode.
 The `openai-codex` OAuth profile shipped by OpenClaw will NOT work for this
 endpoint.
 
+### Adding the ElevenLabs API key (optional)
+
+Chinese and mixed Chinese/English replies use ElevenLabs multilingual v2
+(voice "Rachel") for a consistent voice across languages, read from
+`talk.providers.elevenlabs.apiKey`:
+
+```json
+"talk": {
+  "providers": {
+    "openai":     { "apiKey": "sk-..." },
+    "elevenlabs": { "apiKey": "..." }
+  }
+}
+```
+
+Optional — if unset, Chinese/mixed replies fall back to OpenAI TTS
+(same as English replies).
+
 ---
 
 ## Installation
@@ -100,8 +122,11 @@ Or via HTTP:
 - `GET http://localhost:19000/sleep` — deactivate
 - `GET http://localhost:19000/restart` — restart daemon
 
-Or via voice (when active): say "Zeebot wake up", "Zeebot go to sleep",
-"calibrate mic", etc.
+Or via voice: say "Zeebot wake up" while Silent or Monitoring — Zeebot asks
+"Yes?" and activates only on an affirmative reply ("yes", "ok", "wake up", "好",
+etc.) or a repeated wake phrase within 15s, to avoid self-triggering off its
+own TTS or background chatter. The dashboard Wake button skips this and
+activates immediately. Once active: "Zeebot go to sleep", "calibrate mic", etc.
 
 ---
 
@@ -158,13 +183,15 @@ Mic (CoreAudio)
                         └─ GatewayClient.ask()  (OpenClaw chat.send → agent.wait)
                             └─ Zeebot's reply text
                                 └─ speak()
-                                    ├─ _split_by_script()  (en / zh)
-                                    ├─ Edge TTS  (per segment)  ← timeout 8s → say fallback
+                                    ├─ ElevenLabs multilingual v2  (zh/mixed, full text)
+                                    ├─ OpenAI TTS tts-1-hd  (fallback / English)
+                                    ├─ macOS `say`  (per-segment, offline last resort)
                                     ├─ ffmpeg → 24 kHz mono PCM int16
                                     ├─ software volume attenuation
                                     └─ sounddevice.play()  (CoreAudio output)
                                         └─ Speech-interrupt polling:
-                                            mic peak × 15 → sd.stop()
+                                            adaptive threshold from measured
+                                            speaker→mic coupling → sd.stop()
 ```
 
 End-to-end latency: ~4–12 seconds, dominated by VAD silence window (1.1s)
@@ -175,8 +202,8 @@ and Zeebot's reasoning time.
 ## Limitations
 
 - **No built-in Mac Mini mic** — external input required
-- **Edge TTS needs internet** — first-byte ~500 ms; falls back to `say` on
-  failure/timeout
+- **ElevenLabs/OpenAI TTS need internet** — falls back to offline `say` on
+  failure/timeout or if no API key is configured
 - **System-wide volume** — macOS scripting can only set the master output
   volume, not per-device
 - **No WebRTC AGC** — CoreAudio handles input gain at the driver level, but
