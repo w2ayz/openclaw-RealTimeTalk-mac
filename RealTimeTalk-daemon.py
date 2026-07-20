@@ -1393,7 +1393,10 @@ class GatewayClient:
         }))
         hello = json.loads(await self._ws.recv())
         if not hello.get("ok"):
-            raise RuntimeError(f"Gateway connect failed: {hello.get('error')}")
+            err = hello.get("error", {})
+            if isinstance(err, dict) and err.get("retryable"):
+                raise ConnectionError(f"Gateway not ready (retryable): {err.get('message', err)}")
+            raise RuntimeError(f"Gateway connect failed: {err}")
         scopes = hello.get("payload", {}).get("auth", {}).get("scopes", [])
         log.info("OpenClaw gateway connected (scopes: %s)", scopes)
         self._ready.set()
