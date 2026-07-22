@@ -130,6 +130,79 @@ activates immediately. Once active: "Zeebot go to sleep", "calibrate mic", etc.
 
 ---
 
+## Speaker verification (owner-only mode)
+
+When enabled, Zeebot only acts on the enrolled owner's voice — every
+transcript's audio segment is embedded with a bilingual (EN/ZH)
+speaker-recognition model and compared against the enrolled profile by cosine
+similarity. Non-matching speech is silently ignored and logged to the
+dashboard with its similarity score.
+
+### Setup
+
+```bash
+# 1. Install sherpa-onnx into the daemon's venv
+./venv/bin/pip install sherpa-onnx
+
+# 2. Download the 3D-Speaker CAM++ zh-en model (~28 MB)
+mkdir -p ~/.local/share/rtt/speaker
+curl -L -o ~/.local/share/rtt/speaker/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx \
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx
+# (the release tag really is spelled "recongition" upstream)
+
+# 3. Restart, then enroll from the Calibrate page (🎤 Voice ID button)
+bash RealTimeTalk-toggle.sh restart
+```
+
+### Enrollment
+
+Open the dashboard's **Calibrate** page and click **🎤 Voice ID**
+(`/voice-enroll`, next to Headset/Speaker/Auto) and record the three
+5-second samples (English, Chinese, free speech) **on the Mac's own mic** —
+this keeps the audio channel identical to runtime. Save, then use **Test my
+voice** to check your similarity score (expect ≥ ~0.6 for yourself, ≤ ~0.4
+for others). Enable **Owner Only** from the dashboard or by saying "only
+listen to me". (Voice ID lives on Calibrate rather than the main dashboard
+nav since enrollment is a one-time/rare action; Owner Only/Everyone stays on
+the dashboard as the frequently-used toggle.)
+
+### Voice commands
+
+| Say | Effect |
+|-----|--------|
+| "Only listen to me" / "只听我的" | Enable owner-only mode (requires enrolled profile) |
+| "Listen to everyone" / "听大家的" | Disable owner-only mode |
+
+In owner-only mode **everything** — wake phrases, sleep, monitor toggles, and
+the mode toggles themselves — requires the owner's voice.
+
+### Tuning
+
+- Threshold defaults to **0.50** cosine similarity; adjust live with
+  `/ownermode/threshold?value=0.55` or at startup with `--spk-threshold`.
+  Every pass/reject is logged with its score
+  (`bash RealTimeTalk-toggle.sh log | grep "Voice check"`).
+- Segments shorter than ~0.8 s can't be verified and are ignored in
+  owner-only mode — prefer "yes please" over a bare "yes" for wake
+  confirmation.
+
+### Known limitations
+
+- The web dashboard buttons bypass verification by design (local-network
+  fallback) — they never route through the transcript pipeline.
+- Verification resists other *people*, not a **recording** of the owner's
+  voice (replay attack) — this is out of scope.
+- If the profile, model, or library is missing, the daemon accepts all
+  speakers and the dashboard shows an amber warning.
+- Enrollment/test recording opens a second input stream on the same mic
+  device while the live session's stream stays open — this works on
+  PipeWire (Pi) but depends on the specific USB mic's CoreAudio driver on
+  Mac. If enrollment recordings come back silent or the live transcription
+  stream drops afterward, that's this conflict — file it and we'll switch
+  `_record_pcm_blocking` to briefly pause the live stream first.
+
+---
+
 ## Microphone selection
 
 The Mac Mini has no built-in microphone. The daemon enumerates all

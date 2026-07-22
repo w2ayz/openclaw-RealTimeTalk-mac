@@ -1,5 +1,79 @@
 # Changelog
 
+## [3.0.1] — 2026-07-20
+
+### Changed
+- **Moved the `Voice ID` button** from the dashboard nav to the Calibrate
+  page (next to the Headset/Speaker/Auto mode buttons) — enrollment is a
+  one-time/rare action, not something used every day. `/voice-enroll` itself
+  is unchanged; its "back" link now points to `/calibration` instead of
+  `/dashboard`. The `Owner Only`/`Everyone` toggle stays on the dashboard
+  since it's the frequently-used control. Button color reflects owner-only +
+  enrollment state (red = owner-only requested but not enrolled, green =
+  owner-only active, blue = enrolled but everyone-mode, gray = nothing set
+  up yet) — same logic Pi uses.
+
+---
+
+## [3.0.0] — 2026-07-20
+
+Ports the Raspbian build's v3.0.0 speaker verification (owner-only mode) to
+the Mac fork. Behavioral major, matching Pi's own version bump: enabling
+owner-only mode intentionally rejects voice input previously accepted.
+
+### Added
+- **Speaker verification (owner-only mode)**: when enabled, every voice
+  transcript's matching audio segment is embedded with a bilingual (EN/ZH)
+  speaker-recognition model (3D-Speaker CAM++ zh-en, via `sherpa-onnx`) and
+  compared against an enrolled profile by cosine similarity. Non-matching
+  speech is silently ignored and logged with its similarity score. Gates
+  *everything* downstream in `_handle_transcript` — wake-confirmation
+  replies, wake/sleep phrases, monitor toggles, the owner-mode toggles
+  themselves — not just the final agent routing.
+- **Voice enrollment** at `/voice-enroll`: records three 5s samples (English,
+  Chinese, free speech) via `sd.rec()`, embeds each, saves the mean +
+  per-sample embeddings to `rtt_voice_profile.json`. **Test my voice** button
+  reports a live similarity score against the enrolled profile.
+- **Dashboard**: Owner Only/Everyone toggle button, Voice ID enrollment link,
+  `👤` label in the device panel, amber banner when owner-only is requested
+  but no profile/model is available (fails open — accepts all speakers rather
+  than going silent).
+- **Voice commands**: "only listen to me" / "只听我的" (enable), "listen to
+  everyone" / "听大家的" (disable) — both already owner-gated, so once
+  owner-only is on, only the owner can turn it off by voice (dashboard button
+  is the fallback).
+- New HTTP endpoints: `/ownermode`, `/ownermode/on`, `/ownermode/off`,
+  `/ownermode/threshold?value=N`, `/voice-enroll`, `/voice-enroll/record`,
+  `/voice-enroll/save`, `/voice-enroll/test`, `/voice-enroll/clear`.
+  `/status` now reports `owner_mode`, `enrolled`, `spk_threshold`.
+- New CLI flag `--spk-threshold` (cosine pass mark override, default 0.50).
+- Threshold, mode, and enrolled profile all persist across restarts
+  (`rtt_voice_mode.json`, `rtt_voice_profile.json` in `~/.openclaw/workspace/`).
+
+### Setup
+Requires `./venv/bin/pip install sherpa-onnx` and the ~28 MB 3D-Speaker model
+downloaded to `~/.local/share/rtt/speaker/` — see README for the exact
+command. Missing library or model degrades to accept-all-speakers with a
+dashboard warning, not a crash or a silent lockout.
+
+### Known risk — not yet resolved by live testing
+`_record_pcm_blocking()` (enrollment/test recording) opens a **second**
+`sd.rec()` input stream on the same device while `RealtimeSession` already
+holds a persistent `sd.InputStream` open for live transcription. Verified in
+isolation (model load, embedding computation, profile save/load round-trip,
+mode persistence — all pass against synthetic audio outside the live daemon).
+**Not yet verified**: whether the USB mic in use allows two simultaneous
+open streams, and real voice-vs-voice discrimination (synthetic noise can't
+validate that only real speech comparison can). Needs an interactive pass
+through `/voice-enroll` on the running daemon.
+
+### Not ported (Pi/PipeWire-specific)
+DTMF-bypasses-verification note from Pi's README doesn't apply — Mac has no
+DTMF. `journalctl`-based score log-tailing replaced with
+`RealTimeTalk-toggle.sh log` in the docs.
+
+---
+
 ## [2.11.0] — 2026-07-20
 
 Ports the Raspbian build's v2.0.2 → v2.11.0 improvements to the Mac fork,

@@ -26,11 +26,12 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "2.11.0"
+__version__ = "3.0.1"
 
 import argparse
 import asyncio
 import base64
+import collections
 import datetime
 import json
 import logging
@@ -51,6 +52,12 @@ try:
     from zhconv import convert as _zh_convert   # traditional → simplified
 except Exception:                                # pragma: no cover
     _zh_convert = None
+
+try:
+    import sherpa_onnx
+    _HAVE_SHERPA = True
+except ImportError:
+    _HAVE_SHERPA = False
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -112,6 +119,20 @@ CAL_NEW_DEV_SYS_VOL = 1          # macOS system volume (%) for new/unrecognised 
 CAL_STORE_FILE    = os.path.expanduser("~/.openclaw/workspace/speaker_cal_store.json")
 DEVICE_PREFS_FILE = os.path.expanduser("~/.openclaw/workspace/device_prefs.json")
 SLEEP_STATE_FILE  = os.path.expanduser("~/.openclaw/workspace/rtt_sleep_state.json")
+# Speaker verification (owner-only mode) — 3D-Speaker CAM++ zh-en model via
+# sherpa-onnx. Embeddings gate transcripts so only the enrolled owner's voice
+# is acted on. Missing lib/model/profile degrades to accept-all + banner.
+SPK_MODEL_PATH    = os.path.expanduser(
+    "~/.local/share/rtt/speaker/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+)
+SPK_SAMPLE_RATE   = 16000        # model input rate
+SPK_THRESHOLD_DEFAULT = 0.50     # cosine similarity pass mark (tunable via /ownermode/threshold)
+SPK_MIN_SECS      = 0.8          # segments shorter than this can't be verified → rejected
+SPK_PREROLL_MS    = 500          # matches server VAD prefix_padding_ms so onsets aren't lost
+SPK_MAX_SEGMENT_SECS   = 25      # cap capture buffer growth on runaway VAD segments
+SPK_SEGMENT_STALE_SECS = 60      # drop unmatched segments older than this
+VOICE_PROFILE_FILE = os.path.expanduser("~/.openclaw/workspace/rtt_voice_profile.json")
+VOICE_MODE_FILE    = os.path.expanduser("~/.openclaw/workspace/rtt_voice_mode.json")
 # Speech-interrupt: if the mic sees this many consecutive 50ms blocks above
 # the interrupt threshold while Zeebot is speaking, kill TTS immediately.
 SPEAK_INTERRUPT_PEAK   = 150   # min threshold floor
@@ -189,6 +210,13 @@ _wake_event:         list = [None]  # asyncio.Event created in main(); HTTP /wak
 _is_sleeping:        list = [False] # True while OpenAI is intentionally disconnected (auto-sleep)
 _wake_activate:      list = [False] # HTTP /wake while sleeping — next session starts active immediately
 _pending_monitor_wake: list = [False]  # Monitor button pressed while sleeping — pre-arms monitoring on wake
+_owner_only:          list = [False]  # owner-only mode: gate all voice on the enrolled profile
+_spk_threshold:       list = [SPK_THRESHOLD_DEFAULT]  # cosine pass mark
+_spk_extractor:       list = [None]   # lazy sherpa_onnx.SpeakerEmbeddingExtractor singleton
+_owner_profile:       list = [None]   # {"mean": ndarray, "samples": [ndarray,...]} or None
+_enroll_active:       list = [False]  # True while enrollment records; _mic_cb discards audio
+_enroll_staging:      dict = {}       # slot -> {"embedding": list, "secs": float, "lang": str}
+_spk_threshold_cli:   list = [None]   # --spk-threshold override; wins over the mode file
 
 
 def _list_audio_devices() -> dict:
@@ -557,6 +585,14 @@ MONITOR_OFF_PHRASES = {
 }
 CONTINUE_PHRASES = {"continue", "zeebot continue", "please continue", "go on", "go ahead",
                     "keep going", "继续", "继续说", "你继续", "请继续"}
+# Owner-only mode toggles. Keep phrases ≥3 words — _matches_phrase's 60%
+# word-overlap fuzzy pass makes short phrases trigger-happy.
+OWNER_ONLY_ON_PHRASES  = {"only listen to me", "zeebot only listen to me",
+                          "owner only mode", "owner mode on",
+                          "只听我的", "只听我说话", "只听我的话"}
+OWNER_ONLY_OFF_PHRASES = {"listen to everyone", "zeebot listen to everyone",
+                          "everyone mode", "owner mode off",
+                          "听大家的", "听所有人的", "听大家说话"}
 
 try:
     from langdetect import detect as _langdetect, LangDetectException as _LangDetectException
@@ -854,6 +890,126 @@ def _load_sleep_state() -> bool:
             return bool(json.load(f).get("sleeping", False))
     except (FileNotFoundError, json.JSONDecodeError):
         return False
+
+# ── Speaker verification (owner-only mode) ───────────────────────────────────
+
+_spk_extractor_lock = threading.Lock()
+_spk_warned: list = [False]   # log the missing-lib/model warning only once
+
+def _get_spk_extractor():
+    """Lazy singleton for the sherpa-onnx speaker-embedding extractor.
+    Returns None (and warns once) when the lib or model is unavailable."""
+    with _spk_extractor_lock:
+        if _spk_extractor[0] is not None:
+            return _spk_extractor[0]
+        if not _HAVE_SHERPA or not os.path.exists(SPK_MODEL_PATH):
+            if not _spk_warned[0]:
+                _spk_warned[0] = True
+                log.warning("Speaker verification unavailable: %s",
+                            "sherpa-onnx not installed" if not _HAVE_SHERPA
+                            else f"model missing at {SPK_MODEL_PATH}")
+            return None
+        cfg = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+            model=SPK_MODEL_PATH, num_threads=2, provider="cpu")
+        _spk_extractor[0] = sherpa_onnx.SpeakerEmbeddingExtractor(cfg)
+        log.info("Speaker-embedding extractor loaded (dim=%d)", _spk_extractor[0].dim)
+        return _spk_extractor[0]
+
+def _resample_to_16k(pcm_int16: np.ndarray, src_rate: int) -> np.ndarray:
+    """int16 PCM at src_rate → float32 [-1,1] at 16 kHz (FFT resample, scipy-free)."""
+    x = pcm_int16.astype(np.float64) / 32768.0
+    if src_rate == SPK_SAMPLE_RATE:
+        return x.astype(np.float32)
+    n_out = int(len(x) * SPK_SAMPLE_RATE / src_rate)
+    y = np.fft.irfft(np.fft.rfft(x), n_out) * (n_out / len(x))
+    return y.astype(np.float32)
+
+def _compute_embedding(pcm_int16: np.ndarray, rate: int) -> "np.ndarray | None":
+    """Blocking — call from an executor or HTTP handler thread."""
+    ex = _get_spk_extractor()
+    if ex is None:
+        return None
+    try:
+        s = ex.create_stream()
+        s.accept_waveform(SPK_SAMPLE_RATE, _resample_to_16k(pcm_int16, rate))
+        s.input_finished()
+        emb = np.asarray(ex.compute(s), dtype=np.float32)
+        norm = np.linalg.norm(emb)
+        return emb / norm if norm > 0 else None
+    except Exception as e:
+        log.warning("Speaker embedding failed: %s", e)
+        return None
+
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b))   # inputs are L2-normalized
+
+def _owner_score(emb: np.ndarray) -> float:
+    """Max cosine over the profile mean + per-sample embeddings — max keeps
+    cross-language scoring robust since enrollment mixes EN and ZH samples."""
+    prof = _owner_profile[0]
+    refs = [prof["mean"]] + prof["samples"]
+    return max(_cosine(emb, r) for r in refs)
+
+def _load_voice_profile() -> bool:
+    try:
+        with open(VOICE_PROFILE_FILE) as f:
+            data = json.load(f)
+        samples = [np.asarray(s["embedding"], dtype=np.float32) for s in data["samples"]]
+        _owner_profile[0] = {"mean": np.asarray(data["mean"], dtype=np.float32),
+                             "samples": samples, "created": data.get("created", 0)}
+        log.info("Loaded voice profile: %d sample(s)", len(samples))
+        return True
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        _owner_profile[0] = None
+        return False
+
+def _save_voice_profile(samples: list) -> None:
+    """samples: [{"lang","prompt","secs","embedding":[...]}]. Computes the mean."""
+    import time as _tvp
+    embs = np.stack([np.asarray(s["embedding"], dtype=np.float32) for s in samples])
+    mean = embs.mean(axis=0)
+    mean = mean / np.linalg.norm(mean)
+    data = {"version": 1, "model": "campplus_zh_en_advanced", "dim": int(embs.shape[1]),
+            "created": _tvp.time(), "samples": samples, "mean": mean.tolist()}
+    os.makedirs(os.path.dirname(VOICE_PROFILE_FILE), exist_ok=True)
+    with open(VOICE_PROFILE_FILE, "w") as f:
+        json.dump(data, f)
+    _load_voice_profile()
+
+def _save_voice_mode() -> None:
+    try:
+        os.makedirs(os.path.dirname(VOICE_MODE_FILE), exist_ok=True)
+        with open(VOICE_MODE_FILE, "w") as f:
+            json.dump({"owner_only": _owner_only[0],
+                       "threshold": _spk_threshold[0]}, f)
+    except Exception as e:
+        log.warning("Could not save voice mode: %s", e)
+
+def _load_voice_mode() -> None:
+    try:
+        with open(VOICE_MODE_FILE) as f:
+            data = json.load(f)
+        _owner_only[0] = bool(data.get("owner_only", False))
+        _spk_threshold[0] = float(data.get("threshold", SPK_THRESHOLD_DEFAULT))
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        pass
+
+def _verification_available() -> bool:
+    return _owner_profile[0] is not None and _get_spk_extractor() is not None
+
+def _record_pcm_blocking(secs: float) -> np.ndarray:
+    """Record from the default mic for enrollment/testing. Sets _enroll_active
+    so _mic_cb discards audio (the utterance must not reach transcription).
+    Applies MIC_GAIN (no gate) for channel consistency with runtime audio."""
+    _enroll_active[0] = True
+    try:
+        rec = sd.rec(int(secs * DEVICE_RATE), samplerate=DEVICE_RATE,
+                     channels=CHANNELS, dtype="int16")
+        sd.wait()
+        pcm = rec.reshape(-1).astype(np.float32) * MIC_GAIN
+        return np.clip(pcm, -32768, 32767).astype(np.int16)
+    finally:
+        _enroll_active[0] = False
 
 # ── Service file (launchd plist) helpers ─────────────────────────────────────
 
@@ -1718,6 +1874,12 @@ class RealtimeSession:
         self._mic_stream_ref: list = [None]   # current sd.InputStream; swapped on hot-plug
         self._pending_wake_confirm = False    # True while waiting for voice confirmation to activate
         self._pending_wake_t       = 0.0      # timestamp when confirmation was requested
+        # Speaker verification: mirror the PCM we stream to OpenAI so each
+        # VAD segment can be embedded and matched against the owner profile.
+        self._preroll = collections.deque(maxlen=SPK_PREROLL_MS // 100)  # 100 ms blocks
+        self._capture_buf = None   # open segment (speech_started..stopped)
+        self._capture_consumed = False   # transcript already took the open segment
+        self._pending_segments: collections.deque = collections.deque(maxlen=4)  # (epoch, bytes)
 
     def _mic_cb(self, indata, frames, time_info, status):
         import time as _tcb0
@@ -1737,6 +1899,8 @@ class RealtimeSession:
             silence = np.zeros_like(raw)
             self.loop.call_soon_threadsafe(self._enqueue_mic, silence.tobytes())
             return
+        if _enroll_active[0]:
+            return  # enrollment recording in progress — keep it out of transcription
         if raw_peak < MIC_GATE_PEAK:
             out_arr = np.zeros_like(raw)
             # Gain frozen during silence — WebRTC AGC won't pump up on noise
@@ -1783,6 +1947,28 @@ class RealtimeSession:
             self._mic_q.put_nowait(data)
         except asyncio.QueueFull:
             pass
+        # Runs on the event loop (call_soon_threadsafe) — same thread as
+        # _recv_ws, so the capture structures need no locking.
+        self._preroll.append(data)
+        if (self._capture_buf is not None
+                and len(self._capture_buf) < SPK_MAX_SEGMENT_SECS * 10):
+            self._capture_buf.append(data)
+
+    def _pop_segment(self):
+        """Return the PCM segment matching the transcript that just arrived.
+        Server VAD emits segments and transcripts in the same order → FIFO."""
+        import time as _tps
+        now = _tps.time()
+        while self._pending_segments and now - self._pending_segments[0][0] > SPK_SEGMENT_STALE_SECS:
+            self._pending_segments.popleft()
+        if self._pending_segments:
+            return self._pending_segments.popleft()[1]
+        if self._capture_buf is not None and not self._capture_consumed:
+            # Transcript beat speech_stopped — snapshot the open buffer and
+            # mark it consumed so the late stop event doesn't push an orphan.
+            self._capture_consumed = True
+            return b"".join(self._capture_buf)
+        return None
 
     async def _resume_from_http(self, text: str, alsa_output):
         """Resume paused TTS playback triggered by the /continue HTTP button."""
@@ -1938,10 +2124,44 @@ class RealtimeSession:
             if _clear_audio_buffer[0]:
                 _clear_audio_buffer[0] = False
                 await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                # Mirror the server-side discard in the verification capture,
+                # or the segment FIFO desyncs from the transcript stream.
+                self._pending_segments.clear()
+                self._capture_buf = None
             await ws.send(json.dumps({
                 "type":  "input_audio_buffer.append",
                 "audio": base64.b64encode(chunk).decode(),
             }))
+
+    async def _verify_speaker(self, transcript: str) -> bool:
+        """Owner-only gate. Pops the matching audio segment (always — mode
+        toggles mid-stream must not desync the FIFO), embeds it, and compares
+        against the enrolled profile. Silence is the fail-safe: missing or
+        too-short segments are rejected in owner-only mode."""
+        segment = self._pop_segment()
+        if not _owner_only[0]:
+            return True
+        if not _verification_available():
+            return True   # not enrolled / model missing — dashboard banner covers this
+        if segment is None:
+            _log_entry("system", f"Voice check: no audio segment — ignored ({transcript[:40]!r})")
+            return False
+        secs = len(segment) / 2 / SAMPLE_RATE
+        if secs < SPK_MIN_SECS:
+            _log_entry("system", f"Voice check: too short to verify ({secs:.1f}s) — ignored ({transcript[:40]!r})")
+            return False
+        emb = await asyncio.get_running_loop().run_in_executor(
+            None, _compute_embedding, np.frombuffer(segment, np.int16), SAMPLE_RATE)
+        if emb is None:
+            log.warning("Voice check: embedding failed — accepting (fail-open)")
+            return True
+        score = _owner_score(emb)
+        if score >= _spk_threshold[0]:
+            log.info("Voice check PASS %.3f (%.1fs): %r", score, secs, transcript[:60])
+            return True
+        _log_entry("system", f"Voice check: rejected non-owner (sim {score:.2f}) — {transcript[:40]!r}")
+        log.info("Voice check REJECT %.3f (%.1fs): %r", score, secs, transcript[:60])
+        return False
 
     async def _handle_transcript(self, transcript: str):
         # Discard transcripts that arrive while Zeebot is speaking — they are
@@ -1973,6 +2193,13 @@ class RealtimeSession:
         # len==1, but split() on "" gives zero words) and get routed to Zeebot as blanks.
         if not normalized:
             log.debug("Dropped punctuation-only transcript: %r", transcript)
+            return
+
+        # Owner-only gate — BEFORE wake/sleep/control phrases so that in
+        # owner-only mode EVERYTHING requires the enrolled voice. Dashboard
+        # HTTP buttons remain ungated fallbacks by design (they never reach
+        # this method).
+        if not await self._verify_speaker(transcript):
             return
 
         import time as _ti
@@ -2100,6 +2327,34 @@ class RealtimeSession:
                 await asyncio.get_running_loop().run_in_executor(
                     None, speak, "Monitoring stopped.", self.alsa_output
                 )
+            return
+
+        # Owner-only mode toggles — already owner-gated by _verify_speaker above
+        if _matches_phrase(normalized, OWNER_ONLY_ON_PHRASES):
+            if not _verification_available():
+                await asyncio.get_running_loop().run_in_executor(
+                    None, speak,
+                    "No voice profile enrolled yet. Use the web dashboard to enroll first.",
+                    self.alsa_output)
+                return
+            if not _owner_only[0]:
+                _owner_only[0] = True
+                _save_voice_mode()
+                log.info("Voice command: owner-only mode ON")
+                _log_entry("system", "Owner-only mode on.")
+                await asyncio.get_running_loop().run_in_executor(
+                    None, speak, "Owner only mode on. I'll only listen to you.",
+                    self.alsa_output)
+            return
+        if _matches_phrase(normalized, OWNER_ONLY_OFF_PHRASES):
+            if _owner_only[0]:
+                _owner_only[0] = False
+                _save_voice_mode()
+                log.info("Voice command: owner-only mode OFF")
+                _log_entry("system", "Everyone mode — listening to all voices.")
+                await asyncio.get_running_loop().run_in_executor(
+                    None, speak, "Everyone mode. Listening to all voices.",
+                    self.alsa_output)
             return
 
         # Monitoring-only mode: passively log captured segments (no Zeebot/TTS).
@@ -2261,9 +2516,18 @@ class RealtimeSession:
             elif t == "error":
                 log.error("OpenAI error: %s", msg.get("error", msg))
 
+            elif t == "input_audio_buffer.speech_started":
+                self._capture_buf = list(self._preroll)
+                self._capture_consumed = False
+
+            elif t == "input_audio_buffer.speech_stopped":
+                if self._capture_buf is not None and not self._capture_consumed:
+                    import time as _tss
+                    self._pending_segments.append(
+                        (_tss.time(), b"".join(self._capture_buf)))
+                self._capture_buf = None
+
             elif t not in (
-                "input_audio_buffer.speech_started",
-                "input_audio_buffer.speech_stopped",
                 "input_audio_buffer.committed",
                 "conversation.item.created",
                 "conversation.item.added",
@@ -2527,6 +2791,214 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
+
+            elif self.path in ("/ownermode", "/ownermode/on", "/ownermode/off"):
+                want = (not _owner_only[0]) if self.path == "/ownermode" \
+                       else self.path.endswith("/on")
+                if want and not _verification_available():
+                    _log_entry("system", "Cannot enable owner-only mode — no voice profile enrolled.")
+                    log.info("HTTP ownermode: refused — not enrolled")
+                elif want != _owner_only[0]:
+                    _owner_only[0] = want
+                    _save_voice_mode()
+                    label = "Owner-only mode on." if want else "Everyone mode — listening to all voices."
+                    log.info("HTTP ownermode: %s", "ON" if want else "OFF")
+                    _log_entry("system", label)
+                self.send_response(302)
+                self.send_header("Location", "/dashboard")
+                self.end_headers()
+
+            elif self.path.startswith("/ownermode/threshold"):
+                import json as _json, urllib.parse as _up
+                qs  = _up.parse_qs(_up.urlparse(self.path).query)
+                try:
+                    val = float(qs.get("value", [_spk_threshold[0]])[0])
+                except ValueError:
+                    val = _spk_threshold[0]
+                val = max(0.2, min(0.9, val))
+                _spk_threshold[0] = val
+                _save_voice_mode()
+                log.info("Speaker threshold set to %.2f", val)
+                resp = _json.dumps({"threshold": val}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path.startswith("/voice-enroll/record"):
+                import json as _json, urllib.parse as _up
+                qs   = _up.parse_qs(_up.urlparse(self.path).query)
+                slot = qs.get("slot", ["0"])[0]
+                secs = max(2.0, min(10.0, float(qs.get("secs", ["5"])[0])))
+                lang = qs.get("lang", ["en"])[0]
+                if _get_spk_extractor() is None:
+                    out = {"ok": False, "error": "sherpa-onnx or model unavailable"}
+                elif _is_speaking[0]:
+                    out = {"ok": False, "error": "Zeebot is speaking — try again"}
+                else:
+                    pcm  = _record_pcm_blocking(secs)
+                    peak = int(np.max(np.abs(pcm))) if len(pcm) else 0
+                    emb  = _compute_embedding(pcm, DEVICE_RATE)
+                    if emb is None:
+                        out = {"ok": False, "error": "embedding failed"}
+                    elif peak < 500:
+                        out = {"ok": False, "error": f"too quiet (peak {peak}) — speak closer to the mic"}
+                    else:
+                        _enroll_staging[slot] = {"embedding": emb.tolist(),
+                                                 "secs": secs, "lang": lang}
+                        out = {"ok": True, "slot": slot, "secs": secs, "peak": peak,
+                               "staged": len(_enroll_staging)}
+                resp = _json.dumps(out).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path == "/voice-enroll/save":
+                import json as _json
+                if len(_enroll_staging) < 3:
+                    out = {"ok": False, "error": f"need 3 samples, have {len(_enroll_staging)}"}
+                else:
+                    samples = [{"lang": v["lang"], "prompt": k, "secs": v["secs"],
+                                "embedding": v["embedding"]}
+                               for k, v in sorted(_enroll_staging.items())]
+                    _save_voice_profile(samples)
+                    _enroll_staging.clear()
+                    _log_entry("system", "Voice profile enrolled (3 samples).")
+                    log.info("Voice profile saved: %d samples", len(samples))
+                    out = {"ok": True, "samples": len(samples)}
+                resp = _json.dumps(out).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path == "/voice-enroll/test":
+                import json as _json
+                if not _verification_available():
+                    out = {"ok": False, "error": "no profile enrolled or model unavailable"}
+                elif _is_speaking[0]:
+                    out = {"ok": False, "error": "Zeebot is speaking — try again"}
+                else:
+                    pcm = _record_pcm_blocking(4.0)
+                    emb = _compute_embedding(pcm, DEVICE_RATE)
+                    if emb is None:
+                        out = {"ok": False, "error": "embedding failed"}
+                    else:
+                        score = _owner_score(emb)
+                        out = {"ok": True, "score": round(score, 3),
+                               "threshold": _spk_threshold[0],
+                               "pass": score >= _spk_threshold[0]}
+                resp = _json.dumps(out).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path == "/voice-enroll/clear":
+                import json as _json
+                try:
+                    os.remove(VOICE_PROFILE_FILE)
+                except FileNotFoundError:
+                    pass
+                _owner_profile[0] = None
+                _enroll_staging.clear()
+                if _owner_only[0]:
+                    _owner_only[0] = False
+                    _save_voice_mode()
+                _log_entry("system", "Voice profile cleared — everyone mode.")
+                log.info("Voice profile cleared")
+                resp = _json.dumps({"ok": True}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path == "/voice-enroll":
+                enrolled = _owner_profile[0] is not None
+                model_ok = _get_spk_extractor() is not None
+                enrolled_since = ""
+                if enrolled and _owner_profile[0].get("created"):
+                    enrolled_since = datetime.datetime.fromtimestamp(
+                        _owner_profile[0]["created"]).strftime("%Y-%m-%d %H:%M")
+                status_line = (
+                    f"Profile enrolled {enrolled_since}" if enrolled
+                    else "No profile enrolled" if model_ok
+                    else "Speaker model unavailable — install sherpa-onnx + model first")
+                body = f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Voice ID — RealTimeTalk</title>
+<style>
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+:root{{--bg:#07090f;--sf:#0d1119;--bd:#1a2535;--tx:#dde4ef;--mu:#5a7088;--you:#38bdf8;--gn:#34d399;--rd:#ef4444;--r:8px;}}
+body{{font-family:system-ui,sans-serif;font-size:15px;background:var(--bg);color:var(--tx);padding:12px 16px;max-width:680px;}}
+h3{{margin:8px 0}} .info{{color:var(--mu);font-size:13px;margin:4px 0}}
+.card{{background:var(--sf);border:1px solid var(--bd);border-radius:var(--r);padding:12px;margin:10px 0}}
+button{{padding:8px 14px;border:1px solid var(--bd);border-radius:var(--r);background:#121925;color:var(--tx);font-size:14px;cursor:pointer}}
+button:disabled{{opacity:.4}} .ok{{color:var(--gn)}} .bad{{color:var(--rd)}}
+a{{color:var(--you)}} .meter{{height:8px;background:#121925;border-radius:4px;overflow:hidden;margin:8px 0}}
+.meter>div{{height:100%;width:0;background:var(--gn)}}
+</style></head><body>
+<h3>&#127908; Voice ID enrollment</h3>
+<p class="info">{status_line} &middot; threshold {_spk_threshold[0]:.2f} &middot; <a href="/calibration">&larr; calibration</a></p>
+<div class="meter"><div id="meter"></div></div>
+<div class="card"><b>Sample 1 — English</b>
+<p class="info">Read aloud: &ldquo;Zeebot wake up. Please check my calendar and read me the news for today.&rdquo;</p>
+<button onclick="rec(this,'1','en')">&#9210; Record 5s</button> <span id="s1"></span></div>
+<div class="card"><b>Sample 2 — Chinese</b>
+<p class="info">Read aloud: &ldquo;Zeebot 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
+<button onclick="rec(this,'2','zh')">&#9210; Record 5s</button> <span id="s2"></span></div>
+<div class="card"><b>Sample 3 — free speech</b>
+<p class="info">Speak naturally for 5 seconds — mix English and Chinese if you like.</p>
+<button onclick="rec(this,'3','mixed')">&#9210; Record 5s</button> <span id="s3"></span></div>
+<div class="card">
+<button id="save" onclick="save()">&#128190; Save profile</button>
+<button onclick="test(this)">&#127897; Test my voice</button>
+<button onclick="clearProfile()" style="border-color:var(--rd)">&#10006; Clear profile</button>
+<div id="result" class="info"></div></div>
+<script>
+const es = new EventSource('/levels');
+es.onmessage = e => {{ const p = parseInt(e.data.split(',')[0]);
+  document.getElementById('meter').style.width = Math.min(100, p/150) + '%'; }};
+async function rec(btn, slot, lang) {{
+  btn.disabled = true; const lbl = document.getElementById('s'+slot);
+  let n = 5; lbl.textContent = 'Recording… speak now';
+  const timer = setInterval(()=>{{ n--; if(n>0) lbl.textContent = 'Recording… '+n; }}, 1000);
+  try {{
+    const r = await fetch(`/voice-enroll/record?slot=${{slot}}&secs=5&lang=${{lang}}`);
+    const j = await r.json();
+    lbl.innerHTML = j.ok ? `<span class="ok">&#10004; captured (peak ${{j.peak}})</span>`
+                         : `<span class="bad">&#10006; ${{j.error}}</span>`;
+  }} finally {{ clearInterval(timer); btn.disabled = false; }}
+}}
+async function save() {{
+  const r = await fetch('/voice-enroll/save'); const j = await r.json();
+  document.getElementById('result').innerHTML = j.ok
+    ? '<span class="ok">Profile saved. You can enable Owner Only on the dashboard.</span>'
+    : `<span class="bad">${{j.error}}</span>`;
+}}
+async function test(btn) {{
+  btn.disabled = true;
+  document.getElementById('result').textContent = 'Recording 4s — speak now…';
+  try {{
+    const r = await fetch('/voice-enroll/test'); const j = await r.json();
+    document.getElementById('result').innerHTML = j.ok
+      ? `Similarity <b class="${{j.pass?'ok':'bad'}}">${{j.score}}</b> vs threshold ${{j.threshold}} — ${{j.pass?'PASS':'FAIL'}}`
+      : `<span class="bad">${{j.error}}</span>`;
+  }} finally {{ btn.disabled = false; }}
+}}
+async function clearProfile() {{
+  if (!confirm('Delete the enrolled voice profile?')) return;
+  await fetch('/voice-enroll/clear'); location.reload();
+}}
+</script></body></html>"""
+                _html(self, 200, body)
+
             elif self.path == "/reset":
                 CONVERSATION_LOG.clear()
                 log.info("HTTP reset — conversation log cleared")
@@ -2627,6 +3099,25 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
 {prev_html}
 <div class="row"><button id="acbtn" onclick="runCal()">Run auto calibration</button></div>
 </div>""")
+                _voice_enrolled = _owner_profile[0] is not None
+                _voice_owner_only = _owner_only[0]
+                _voice_id_btn = (
+                    '<a href="/voice-enroll" style="padding:4px 11px;font-size:13px;'
+                    'text-decoration:none;border:1px solid {c};border-radius:8px;'
+                    'color:{c};background:{bg};" title="{title}">'
+                    '&#127908; Voice ID{chk}</a>'
+                ).format(
+                    c="#dc2626" if _voice_owner_only and not _voice_enrolled
+                      else "#34d399" if _voice_owner_only
+                      else "#38bdf8" if _voice_enrolled
+                      else "#334155",
+                    bg="#3b0000" if _voice_owner_only and not _voice_enrolled
+                       else "#021a0e" if _voice_owner_only
+                       else "#051928" if _voice_enrolled
+                       else "transparent",
+                    title="Enroll or test the owner voice profile",
+                    chk="&nbsp;&#10003;" if _voice_owner_only else "",
+                )
                 body = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Calibration — RealTimeTalk</title>
@@ -2694,6 +3185,7 @@ a:hover{{text-decoration:underline;}}
   <button onclick="setCalMode('headset')" style="padding:4px 11px;font-size:13px;{'color:#f59e0b;border-color:#f59e0b;background:#130e02;' if is_headset and _override else ''}">Headset</button>
   <button onclick="setCalMode('speaker')" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if not is_headset and _override else ''}">Speaker</button>
   <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
+  {_voice_id_btn}
 </div>
 {spk_adj_section}
 <div style="margin:14px 0 6px;display:flex;align-items:center;gap:10px;">
@@ -3475,12 +3967,21 @@ setInterval(upd, 2000);
                         f'if(b)b.remove();}},5000);</script>'
                     )
                     _device_change_msg[0] = ""
+                elif _owner_only[0] and not _verification_available():
+                    device_banner = (
+                        '<div id="dbanner" style="background:#3a1500;border:1px solid #7a3000;'
+                        'color:#f59e0b;padding:3px 8px;border-radius:8px;">'
+                        '&#9888; Owner-only requested but no voice profile/model &mdash; '
+                        'accepting ALL speakers. <a href="/voice-enroll" style="color:#f59e0b">Enroll</a></div>'
+                    )
                 else:
                     device_banner = ""
 
                 active = sess._active if sess else False
                 monitoring = sess._monitoring if sess else False
                 multilang  = sess._multilang if sess else "off"
+                owner_only = _owner_only[0]
+                enrolled   = _owner_profile[0] is not None
 
                 # Per-button hints shown in the hint-zone on hover (state-aware)
                 _ml_desc = {
@@ -3495,6 +3996,9 @@ setInterval(upd, 2000);
                     "sleep":   "Silence voice and stop monitoring. Say the wake phrase or press Wake to resume" if monitoring else "Silence voice. Say the wake phrase or press Wake to resume",
                     "monitor": "Now: Monitoring ON. Click → stop monitoring" if monitoring else "Now: OFF. Click → start passive monitoring (transcribes without routing to agent)",
                     "multilang": _ml_desc.get(multilang, "Toggle multi-language mode"),
+                    "ownermode": ("Now: Owner-only — only the enrolled voice is obeyed. Click → listen to everyone" if owner_only
+                                  else "Now: Everyone. Click → owner-only (only your enrolled voice is obeyed)" if enrolled
+                                  else "Enroll a voice profile first (Calibrate → Voice ID)"),
                     "reset":   "Clear the conversation log (does not affect the agent's memory)",
                     "restart": "Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)",
                     "gwreset": "Drop and reconnect the gateway WebSocket without restarting",
@@ -3540,11 +4044,14 @@ setInterval(upd, 2000);
                         rows += f'<div class="sys">{ts_span}{e["text"]}</div>'
                 # All device info gathered outside do_GET to avoid UnboundLocalError scoping
                 _ds = _get_device_status()
+                _voice_lbl = ("Owner-only" if owner_only else "Everyone") + \
+                             ("" if enrolled else " (not enrolled)")
                 device_panel = (
                     f'<div id="dp">'
                     f'&#127908; {_ds["mic"]} &ensp;'
                     f'&#128266; {_ds["speaker_name"]} &middot; Vol {_ds["spk_vol"]} &middot; SW {_ds["sw_pct"]}% &ensp;'
                     f'Gate {_ds["gate"]} &middot; Gain {_ds["gain"]}x'
+                    f' &ensp;&#128100; {_voice_lbl}'
                     f'</div>'
                 )
 
@@ -3615,7 +4122,7 @@ a.cont:hover{{background:var(--gn);color:#000;}}
 </style></head><body>
 <div id="top">
 <div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" style="margin-left:10px;" data-hint="{_hints['calibrate']}">&#9999; Calibrate</a></div>
-<div class="nav" onmouseenter="_cr()" onmouseleave="_sr()"><a href="/wake" class="btn" data-hint="{_hints['wake']}">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="{_hints['sleep']}">&#9790; Sleep</a><a href="/monitor" class="btn {'on' if monitoring else ''}" data-hint="{_hints['monitor']}">&#9678; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{_hints['multilang']}">&#8853; {multilang.upper() if multilang != 'off' else 'Multi-lang'}</a><a href="/reset" class="btn danger" data-hint="{_hints['reset']}">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="{_hints['restart']}">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="{_hints['gwreset']}">&#9888; Gateway Reset</a><a href="/dashboard" class="btn" data-hint="{_hints['refresh']}">&#8635;</a></div>
+<div class="nav" onmouseenter="_cr()" onmouseleave="_sr()"><a href="/wake" class="btn" data-hint="{_hints['wake']}">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="{_hints['sleep']}">&#9790; Sleep</a><a href="/monitor" class="btn {'on' if monitoring else ''}" data-hint="{_hints['monitor']}">&#9678; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{_hints['multilang']}">&#8853; {multilang.upper() if multilang != 'off' else 'Multi-lang'}</a><a href="/ownermode" class="btn {'on' if owner_only else ''}" data-hint="{_hints['ownermode']}">&#128100; {'Owner Only' if owner_only else 'Everyone'}</a><a href="/reset" class="btn danger" data-hint="{_hints['reset']}">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="{_hints['restart']}">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="{_hints['gwreset']}">&#9888; Gateway Reset</a><a href="/dashboard" class="btn" data-hint="{_hints['refresh']}">&#8635;</a></div>
 {device_panel}{device_banner}<div id="hzone" style="min-height:28px;padding:5px 10px;border-radius:8px;background:var(--sf2);border:1px solid var(--bd);color:var(--mu);font-size:15px;opacity:0;transition:opacity .15s;pointer-events:none;">&nbsp;</div></div>
 <div id="log">{speaking_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
 <script>
@@ -3640,7 +4147,10 @@ setInterval(function(){{
             elif self.path == "/status":
                 sess = session_ref[0]
                 active = sess._active if sess else False
-                body = json.dumps({"status": "running", "voice": "active" if active else "silent"}).encode()
+                body = json.dumps({"status": "running", "voice": "active" if active else "silent",
+                                   "owner_mode": "owner-only" if _owner_only[0] else "everyone",
+                                   "enrolled": _owner_profile[0] is not None,
+                                   "spk_threshold": _spk_threshold[0]}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type",   "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -3706,6 +4216,22 @@ async def main(http_port: int, input_device=None, output_device=None,
         _is_sleeping[0] = True
         _sleep_requested[0] = True
         log.info("Restored sleep state from disk — waiting for wake signal…")
+
+    # Speaker verification: restore mode/threshold and the enrolled profile.
+    _load_voice_mode()
+    if _spk_threshold_cli[0] is not None:
+        _spk_threshold[0] = _spk_threshold_cli[0]
+    enrolled = _load_voice_profile()
+    if not _HAVE_SHERPA or not os.path.exists(SPK_MODEL_PATH):
+        log.info("Speaker verification: disabled — %s",
+                 "sherpa-onnx not installed" if not _HAVE_SHERPA else "model file missing")
+    else:
+        log.info("Speaker verification: %s, %s, threshold %.2f",
+                 "owner-only" if _owner_only[0] else "everyone mode",
+                 f"enrolled {len(_owner_profile[0]['samples'])} sample(s)" if enrolled else "no profile",
+                 _spk_threshold[0])
+        # Pre-warm the extractor so the first utterance isn't slow.
+        _threading.Thread(target=_get_spk_extractor, daemon=True, name="spk-prewarm").start()
 
     while not stop_event.is_set():
         if _sleep_requested[0]:
@@ -3798,6 +4324,8 @@ if __name__ == "__main__":
                    help=f"Software mic gain multiplier (default: {MIC_GAIN})")
     p.add_argument("--mic-gate",        type=int, default=MIC_GATE_PEAK,
                    help=f"Noise gate threshold — pre-gain peak below this → silence (default: {MIC_GATE_PEAK})")
+    p.add_argument("--spk-threshold",   type=float, default=None,
+                   help=f"Speaker-verification cosine threshold override (default: {SPK_THRESHOLD_DEFAULT})")
     p.add_argument("--list-devices",    action="store_true",
                    help="Print available CoreAudio devices and exit")
     p.add_argument("--calibrate",       action="store_true",
@@ -3822,6 +4350,8 @@ if __name__ == "__main__":
 
     MIC_GAIN      = args.mic_gain
     MIC_GATE_PEAK = args.mic_gate
+    if args.spk_threshold is not None:
+        _spk_threshold_cli[0] = max(0.2, min(0.9, args.spk_threshold))
     _agc_gain[0]  = MIC_GAIN   # seed numpy AGC fallback
 
     # Initialise WebRTC processor (aggressiveness 2 = moderate NS + AGC2).

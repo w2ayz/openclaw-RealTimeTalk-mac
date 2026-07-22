@@ -7,7 +7,8 @@ description: >
   and synthesises replies with ElevenLabs multilingual v2 (Chinese/mixed),
   OpenAI TTS (English/fallback), and macOS `say` (offline last resort).
   Voice activation: "Zeebot wake up" (asks "Yes?" for confirmation) / "Zeebot
-  go to sleep".
+  go to sleep". Optional owner-only mode gates all voice on an enrolled
+  speaker profile (sherpa-onnx + 3D-Speaker CAM++ zh-en).
 ---
 
 # RealTimeTalk Mac — Skill Guide
@@ -33,6 +34,7 @@ service manager) is swapped for Mac-native equivalents.
 | Volume control | `pactl set-sink-volume` | `osascript -e 'set volume output volume'` |
 | Service manager | systemd user service | launchd LaunchAgent |
 | Logs | `journalctl --user-unit ...` | `/tmp/openclaw/realtimetalk.log` |
+| Speaker verification | sherpa-onnx + CAM++ zh-en, same model | identical — pure Python/numpy, no platform dependency |
 
 ---
 
@@ -79,6 +81,41 @@ Voice choices:
 Edge TTS (`_edge_tts_to_mp3`) is still present in the file for reference but
 unused by default — kept in case ElevenLabs/OpenAI are both unreachable and
 someone wants to re-wire it in.
+
+---
+
+## Speaker verification pipeline (owner-only mode)
+
+```python
+# RealtimeSession, per mic block:
+_enqueue_mic(data)               # every _mic_cb path funnels here
+  └─ self._preroll.append(data)  # 500ms rolling buffer (SPK_PREROLL_MS)
+  └─ if self._capture_buf is not None: self._capture_buf.append(data)
+
+# _recv_ws:
+"input_audio_buffer.speech_started"  → self._capture_buf = list(self._preroll)
+"input_audio_buffer.speech_stopped"  → self._pending_segments.append((now, buf))
+
+# _handle_transcript(transcript), right after punctuation-only drop:
+_verify_speaker(transcript)
+  └─ segment = self._pop_segment()        # FIFO pop, matches transcript order
+  └─ if not _owner_only[0]: return True   # gate is a no-op unless enabled
+  └─ emb = _compute_embedding(segment, SAMPLE_RATE)   # 24k→16k resample, sherpa-onnx
+  └─ score = _owner_score(emb)            # max cosine vs profile mean + samples
+  └─ score >= _spk_threshold[0]           # pass/reject, always logged
+```
+
+Module-level functions (pure Python/numpy, no platform dependency —
+`RealTimeTalk-daemon.py:899` area): `_get_spk_extractor` (lazy singleton),
+`_resample_to_16k`, `_compute_embedding`, `_cosine`, `_owner_score`,
+`_load_voice_profile`/`_save_voice_profile`, `_load_voice_mode`/`_save_voice_mode`,
+`_verification_available`, `_record_pcm_blocking` (enrollment/test recording
+via a second `sd.rec()` stream — see README's "Known limitations" for the
+concurrent-stream caveat on some USB mics).
+
+New HTTP endpoints: `/ownermode[/on|/off]`, `/ownermode/threshold?value=N`,
+`/voice-enroll[/record|/save|/test|/clear]`. State persists to
+`rtt_voice_mode.json` / `rtt_voice_profile.json` in `~/.openclaw/workspace/`.
 
 ---
 
@@ -156,3 +193,6 @@ Functions that work natively on Mac:
 | TTS plays silently | Output device volume zero | macOS system volume: F11/F12 or System Settings → Sound |
 | ElevenLabs/OpenAI TTS always failing | Network down / key invalid | Daemon falls back down the chain to `say` — check `/tmp/openclaw/realtimetalk.log` for HTTP errors |
 | Wake phrase doesn't activate | Confirmation not answered within 15s | Reply "yes" (or repeat the wake phrase) right after Zeebot asks "Yes?"; use the dashboard Wake button to skip confirmation |
+| Owner-only accepts everyone | Model/profile missing (fail-open by design) | Amber dashboard banner shows this — check `sherpa-onnx` is installed and the model file exists at `SPK_MODEL_PATH` |
+| Voice enrollment records silence, or live transcription drops after enrolling | USB mic doesn't support two simultaneous input streams | Known CoreAudio limitation on some devices — see README's speaker-verification "Known limitations" |
+| Owner-only rejects the owner | Enrollment done in a different acoustic setup, or threshold too high | Re-enroll on the actual runtime mic/room; lower via `/ownermode/threshold?value=0.4` |

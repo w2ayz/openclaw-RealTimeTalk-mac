@@ -3,3 +3,4 @@ websockets>=12.0
 numpy>=1.20.0
 zhconv>=1.4.0
 langdetect>=1.0.9
+sherpa-onnx>=1.10   # speaker verification (owner-only mode); model downloaded separately, see README
