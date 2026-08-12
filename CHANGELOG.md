@@ -62,12 +62,21 @@ this port doesn't attempt (see `radio_interfaces.py`'s module docstring).
 ### Known limitations
 - The AIOC HID config protocol (`detect_hw_variant`, hardware-revision
   labeling) needs `DYLD_LIBRARY_PATH` set at process launch for the `hid`
-  package's native loader — included in the LaunchAgent plist template,
-  but `DYLD_LIBRARY_PATH` set via `os.environ` *after* process start does
-  not retroactively affect ctypes' library search, so a wrapper binary
-  that execs the daemon with its own stripped environment (rather than
-  the plist's `ProgramArguments` launching the daemon directly) will not
-  pick this up. Cosmetic only — PTT/audio routing/DTMF do not depend on it.
+  package's native loader — now included in the LaunchAgent plist
+  template's `EnvironmentVariables`. Setting it via `os.environ` *after*
+  process start does not retroactively affect ctypes' library search, so
+  it has to be set at exec time; a launcher that execs the daemon as a
+  child process (see `RealTimeTalk-build-wrapper-mac.sh`) still passes
+  this through correctly as long as it forwards its own inherited
+  environment rather than constructing a stripped one from scratch.
+  Cosmetic only either way — PTT/audio routing/DTMF do not depend on it.
+- **If you edit the LaunchAgent plist directly**, `launchctl kickstart -k`
+  restarts the process but does not reload a changed plist file from
+  disk — use `launchctl bootout gui/$(id -u)/ai.openclaw.realtimetalk`
+  followed by `launchctl bootstrap gui/$(id -u) <plist path>` to pick up
+  edits (confirmed live: a `kickstart -k` after adding
+  `DYLD_LIBRARY_PATH` to the plist kept running the old environment
+  definition for over an hour of otherwise-successful restarts).
 
 ## [3.8.0] — 2026-07-29
 

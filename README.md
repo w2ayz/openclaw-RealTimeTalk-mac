@@ -118,6 +118,36 @@ The installer:
 
 Then open `http://localhost:19000/dashboard`.
 
+### Microphone permission reliability (recommended)
+
+A bare `python3` process launched by a LaunchAgent has no stable app
+identity for macOS's TCC (privacy) subsystem, so microphone access can be
+flaky — it may not prompt reliably, or the grant may not persist across
+restarts. `RealTimeTalk-build-wrapper-mac.sh` builds a tiny signed wrapper
+app (`~/Applications/ZeebotTalk.app`) that requests mic access via
+AVFoundation under its own stable bundle identity before launching the
+daemon as its child process:
+
+```bash
+bash ~/openclaw-RealTimeTalk-mac/RealTimeTalk-build-wrapper-mac.sh
+```
+
+Then point the LaunchAgent plist's `ProgramArguments` at the built app
+(`~/Applications/ZeebotTalk.app/Contents/MacOS/ZeebotTalk`) instead of the
+venv's `python3` directly — any extra args (`--mic-gate 64`, etc.) pass
+straight through. Reload with a full unload/reload, not just a restart:
+`launchctl kickstart -k` does **not** pick up a changed plist file —
+
+```bash
+launchctl bootout gui/$(id -u)/ai.openclaw.realtimetalk
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.realtimetalk.plist
+```
+
+First launch prompts for microphone access. If the dialog doesn't appear
+(background/agent launches sometimes suppress it), run the app once via
+Finder (double-click) to trigger it, then grant it in System Settings →
+Privacy & Security → Microphone if needed.
+
 ---
 
 ## Control
