@@ -4,3 +4,5 @@ numpy>=1.20.0
 zhconv>=1.4.0
 langdetect>=1.0.9
 sherpa-onnx>=1.10   # speaker verification (owner-only mode); model downloaded separately, see README
+pyserial>=3.5       # radio mode: AIOC PTT (DTR line)
+hid>=1.0.9           # radio mode: AIOC HID config protocol (hw variant detect, TX boost); needs `brew install hidapi` + DYLD_LIBRARY_PATH, see README

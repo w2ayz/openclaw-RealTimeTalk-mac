@@ -29,6 +29,21 @@ live conversation log, mic level meter, and basic device controls.
 | Device discovery     | `pactl list`, `pw-cli`            | `sounddevice.query_devices()`                |
 | AGC                  | PipeWire WebRTC AGC virtual src   | Removed (CoreAudio handles input gain)       |
 | Microphone           | USB mic typical                   | **External required** — Mac Mini has no mic  |
+| Radio Mode audio     | PipeWire loopback module          | Shared `sounddevice.InputStream` tap (see "Radio Mode" below) |
+
+### Radio Mode
+
+Optional — requires an [AIOC](https://github.com/skuep/AIOC) (All-In-One-Cable)
+USB ham-radio dongle. Digirig Mobile is not supported on Mac: its CM108
+codec reports a generic product string that collides with unrelated USB
+mics, and disambiguating it needs USB topology correlation this port
+doesn't implement (Pi's fix is ALSA/Linux-only).
+
+Toggle it from the Calibrate page — auto-enables when the AIOC is plugged
+in, auto-disables on unplug, and a manual toggle sticks until the next
+unplug/replug cycle. Monitor (live RX passthrough), EchoTest, and DTMF
+Mon/Train/Retrain all appear on the Calibrate page once Radio Mode is on
+(EchoTest/DTMF) or the AIOC is detected (Monitor).
 
 The async architecture (GatewayClient, RealtimeSession, AudioOutputBuffer,
 HTTP server, voice-command matcher, EN/ZH language splitter) is reused
@@ -44,6 +59,7 @@ verbatim from the Pi version.
 | `openai.apiKey` in `~/.openclaw/openclaw.json` | regular OpenAI API key, **not** the openai-codex OAuth profile |
 | [Edge TTS skill](https://github.com/w2ayz/openclaw-edge-tts) | `~/.openclaw/workspace/skills/edge-tts/` |
 | Homebrew + portaudio + ffmpeg + node | `brew install portaudio ffmpeg node`     |
+| `hidapi` (only for Radio Mode's AIOC hardware-revision detection — cosmetic, everything else works without it) | `brew install hidapi` |
 | Python 3.9+                 | system Python or `brew install python`     |
 | A microphone                | USB mic, Bluetooth headset, or iPhone via Continuity Camera |
 
@@ -154,16 +170,29 @@ curl -L -o ~/.local/share/rtt/speaker/3dspeaker_speech_campplus_sv_zh_en_16k-com
 bash RealTimeTalk-toggle.sh restart
 ```
 
-### Enrollment
+### Enrollment — per input device
+
+Voice profiles are enrolled **per input device**, not just once. A profile
+trained on your USB mic won't reliably match the same voice heard through a
+Bluetooth headset or an iPhone Continuity mic — different frequency
+response and compression — so `/voice-enroll` always targets whichever
+input device is currently active, and `_verify_speaker` automatically picks
+the right profile for whatever device you're using at the moment, with no
+manual mode switch.
 
 Open the dashboard's **Calibrate** page and click **🎤 Voice ID**
 (`/voice-enroll`, next to Headset/Speaker/Auto) and record the three
-5-second samples (English, Chinese, free speech) **on the Mac's own mic** —
-this keeps the audio channel identical to runtime. Save, then use **Test my
-voice** to check your similarity score (expect ≥ ~0.6 for yourself, ≤ ~0.4
-for others). Enable **Owner Only** from the dashboard or by saying "only
-listen to me". (Voice ID lives on Calibrate rather than the main dashboard
-nav since enrollment is a one-time/rare action; Owner Only/Everyone stays on
+5-second samples (English, Chinese, free speech) on the mic you want to
+enroll — this keeps the audio channel identical to runtime. Save, then use
+**Test my voice** to check your similarity score (expect ≥ ~0.6 for
+yourself, ≤ ~0.4 for others). To enroll a second device, switch to it on
+the Calibrate page first, then repeat. The enrollment page lists every
+other already-enrolled device with a Clear button. Enable **Owner Only**
+from the dashboard or by saying "only listen to me" — if the device you're
+currently on has no profile yet, Zeebot warns you and accepts all speakers
+on that device until you add one, rather than blocking Owner Only
+entirely. (Voice ID lives on Calibrate rather than the main dashboard nav
+since enrollment is a one-time/rare action; Owner Only/Everyone stays on
 the dashboard as the frequently-used toggle.)
 
 ### Voice commands

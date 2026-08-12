@@ -17,6 +17,8 @@
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/local/bin</string>
+        <key>DYLD_LIBRARY_PATH</key>
+        <string>/opt/homebrew/lib:/usr/local/lib</string>
     </dict>
 
     <key>RunAtLoad</key>

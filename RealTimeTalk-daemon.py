@@ -26,7 +26,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.0.1"
+__version__ = "3.9.1"
 
 import argparse
 import asyncio
@@ -36,6 +36,7 @@ import datetime
 import json
 import logging
 import os
+import queue
 import re
 import signal
 import subprocess
@@ -58,6 +59,14 @@ try:
     _HAVE_SHERPA = True
 except ImportError:
     _HAVE_SHERPA = False
+
+try:
+    import serial as _pyserial
+    _HAVE_PYSERIAL = True
+except ImportError:
+    _HAVE_PYSERIAL = False
+
+import radio_interfaces as _radio
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -131,12 +140,26 @@ SPK_MIN_SECS      = 0.8          # segments shorter than this can't be verified 
 SPK_PREROLL_MS    = 500          # matches server VAD prefix_padding_ms so onsets aren't lost
 SPK_MAX_SEGMENT_SECS   = 25      # cap capture buffer growth on runaway VAD segments
 SPK_SEGMENT_STALE_SECS = 60      # drop unmatched segments older than this
-VOICE_PROFILE_FILE = os.path.expanduser("~/.openclaw/workspace/rtt_voice_profile.json")
-VOICE_MODE_FILE    = os.path.expanduser("~/.openclaw/workspace/rtt_voice_mode.json")
+VOICE_PROFILES_FILE = os.path.expanduser("~/.openclaw/workspace/rtt_voice_profiles.json")
+VOICE_MODE_FILE     = os.path.expanduser("~/.openclaw/workspace/rtt_voice_mode.json")
 # Speech-interrupt: if the mic sees this many consecutive 50ms blocks above
 # the interrupt threshold while Zeebot is speaking, kill TTS immediately.
 SPEAK_INTERRUPT_PEAK   = 150   # min threshold floor
 SPEAK_INTERRUPT_BLOCKS = 3     # × 50 ms = 150 ms sustained speech → interrupt
+SPEAK_COUPLING_EMA     = 0.15  # how fast the post-guard echo/coupling estimate tracks change
+
+# Radio mode (AIOC): RX audio measures very quiet on real hardware
+# (~-48dBFS idle, confirmed) — Monitor passthrough needs software gain to
+# be audible at normal system volume. Tune live if too quiet/loud.
+RADIO_MONITOR_GAIN = 8.0
+
+# EchoTest: detect an incoming transmission, record it, replay it back on-air.
+# Ported from Pi's "Playback" feature (renamed EchoTest on the UI there too).
+ECHOTEST_MIN_SECS    = 0.6   # shorter captures are noise/squelch-flap, not a real transmission — discard
+ECHOTEST_MAX_SECS    = 30.0  # cap a single capture so a stuck-open squelch can't grow memory unbounded
+ECHOTEST_COOLDOWN_S  = 2.0   # after transmitting a replay on-air, ignore new segments for this long —
+                              # own TX bleeding into RX would otherwise re-trigger capture immediately
+ECHOTEST_COS_TAIL_S  = 0.5   # squelch/COS hold-open seconds
 
 # Compat alias — many places still reference ALSA_OUTPUT; on Mac it's a no-op label
 ALSA_OUTPUT       = "coreaudio:default"
@@ -189,10 +212,55 @@ _mic_gate_ref     = [500]  # mutable wrapper for MIC_GATE_PEAK, readable across 
 # ── Mac audio device helpers (CoreAudio via sounddevice + osascript) ─────────
 
 _headset_cal_loop = [False]
+_radio_monitor_active: list = [False]  # Radio Monitor (RX loopback) run flag — same pattern as _headset_cal_loop
+_radio_monitor_out_dev: list = [None]  # output device index the monitor is currently routed to
+_radio_monitor_out_stream: list = [None]  # dedicated sd.OutputStream for the monitor's target device
+_radio_monitor_out_last_cb: list = [0.0]  # epoch of last _out_cb invocation — staleness/watchdog check
+
+# Shared radio RX tap. Originally built on the theory that CoreAudio only
+# reliably sustains ~2 concurrent InputStreams on the same physical USB
+# device (confirmed once: a 3rd stream on the AIOC input froze the other
+# two, no exception, "PaMacCore (AUHAL) Error -50" logged once). Consolidating
+# Monitor + EchoTest onto one shared tap reduces concurrent AIOC input
+# streams from 3 to 2 — but a repeat test at exactly 2 streams (STT capture
+# + this tap) froze again the moment a THIRD unrelated stream opened
+# elsewhere (Monitor's own OutputStream, on a completely different
+# device). So the real trigger is broader: opening *any* new CoreAudio
+# stream on this system can transiently freeze other already-open streams,
+# not a strict per-device count. The tap watchdog below (_radio_rx_tap_watchdog)
+# is the actual fix — self-heals via a heartbeat/reopen cycle, the same
+# pattern _watch_mic_stream already uses for the main mic capture,
+# regardless of what triggers the freeze.
+_radio_rx_tap_stream:     list = [None]
+_radio_rx_tap_users:      list = [0]
+_radio_rx_tap_samplerate: list = [48000]
+_radio_rx_tap_last_cb:    list = [0.0]   # epoch of last _radio_rx_tap_cb invocation
+
+# Single global lock around every native PortAudio stream lifecycle
+# operation in the process: constructing/starting/stopping/closing any
+# sd.InputStream/OutputStream/Stream, and any sd._terminate()/_initialize()
+# reinit. Reentrant because _start/_stop_radio_monitor hold it for their
+# whole body while also calling into _radio_rx_tap_acquire/release, which
+# take the same lock.
+#
+# Consolidated from two separate locks (one for reinit, one for the radio
+# tap/monitor pair) after repeated live crashes and stream-open failures
+# made clear the actual constraint is broader than either scope alone:
+# CoreAudio's AUHAL layer does not reliably tolerate two threads touching
+# stream lifecycle at the same time, for ANY pair of streams, not just the
+# ones involved in whichever crash was being chased at the time (confirmed:
+# segfaults from concurrent reinit calls, from concurrent Monitor
+# start/stop, and separately a Play Test loop stream-open failure with the
+# exact same PaErrorCode -9986/-10851 signature while unrelated to Monitor
+# or reinit at all — same root cause, different call sites, one lock).
+_audio_open_lock = _threading.RLock()
+_radio_rx_tap_lock = _audio_open_lock       # alias — see _audio_open_lock docstring
+_portaudio_reinit_lock = _audio_open_lock   # alias — see _audio_open_lock docstring
 _speaker_cal_result: dict = {}
 _cal_mode_override = [None]
 _device_change_msg = [""]
 _audio_fingerprint = [""]
+_query_devices_fresh_cache: list = [None, 0.0]   # [cached device list, epoch cached] — see _query_devices_fresh
 _paused_speech: list = [None]   # (clean_text, alsa_output) saved on TTS interrupt; None otherwise
 _post_busy_until:  list = [0.0] # timestamp; mic sends silence until this time after busy clears
 _http_interrupt:   list = [False]  # set by /interrupt HTTP route to cut TTS mid-playback
@@ -213,10 +281,654 @@ _pending_monitor_wake: list = [False]  # Monitor button pressed while sleeping �
 _owner_only:          list = [False]  # owner-only mode: gate all voice on the enrolled profile
 _spk_threshold:       list = [SPK_THRESHOLD_DEFAULT]  # cosine pass mark
 _spk_extractor:       list = [None]   # lazy sherpa_onnx.SpeakerEmbeddingExtractor singleton
-_owner_profile:       list = [None]   # {"mean": ndarray, "samples": [ndarray,...]} or None
+_owner_profiles:      dict = {}       # {device_name: {"mean": ndarray, "samples": [ndarray,...], "created": float}}
 _enroll_active:       list = [False]  # True while enrollment records; _mic_cb discards audio
-_enroll_staging:      dict = {}       # slot -> {"embedding": list, "secs": float, "lang": str}
+_enroll_staging:      dict = {}       # slot -> {"embedding": list, "secs": float, "lang": str} — staged for whatever device is currently active
+_enroll_staging_radio: dict = {}      # same shape, independent staging area for the dedicated Radio Voice Profile section
 _spk_threshold_cli:   list = [None]   # --spk-threshold override; wins over the mode file
+
+# Radio mode (AIOC) — see radio_interfaces.py for the interface registry.
+_radio_profile_active: list = [False]  # Radio Mode toggle — gates PTT/TX routing, radio AGC path
+_radio_prev_input_device: list = [None]  # mic device index to restore when Radio Mode turns off
+
+# Auto-enable Radio Mode on AIOC plug-in. _radio_auto_enable_suppressed is
+# set whenever the user manually turns Radio Mode off while the AIOC is
+# still connected, so the hotplug watcher doesn't fight a deliberate
+# disable — it's cleared again the next time the AIOC transitions from
+# unplugged to plugged in, so a fresh plug-in always gets one auto-enable
+# attempt regardless of what happened on the previous connection.
+_radio_auto_enable_suppressed: list = [False]
+_radio_last_seen_connected:    list = [False]
+
+_echotest_active:          list = [False]  # True while the EchoTest listener is attached to the RX tap
+_echotest_stop_flag:       list = [False]  # set True to stop the EchoTest listener thread
+_echotest_cooldown_until:  list = [0.0]    # ignore captures until this time.time() (post-TX bleed guard)
+_echotest_queue = queue.Queue(maxsize=3)   # captured (secs, int16 ndarray) segments awaiting replay
+_echotest_squelch: list = [None]   # active radio_interfaces.SquelchTracker, or None when EchoTest is off
+_echotest_state: dict = {"was_open": False, "seg": bytearray(),
+                          "prev_tx": False, "ext_tx_grace_until": 0.0}
+
+_radio_monitor_buf:      list = [np.zeros(0, dtype=np.float32)]  # ring buffer feeding the monitor's OutputStream
+_radio_monitor_buf_lock = _threading.Lock()
+_active_radio_iface:   list = [None]   # radio_interfaces.RadioInterface currently connected, or None
+_ptt_serial:          list = [None]   # open pyserial.Serial on the radio's PTT port, or None
+_is_tx:               list = [False]  # True while PTT is asserted — mutes mic capture (_mic_cb)
+
+
+def _ptt_prekey_s() -> float:
+    iface = _active_radio_iface[0]
+    return (iface.ptt_prekey_ms if iface else 250) / 1000
+
+
+def _ptt_tail_s() -> float:
+    iface = _active_radio_iface[0]
+    return (iface.ptt_tail_ms if iface else 400) / 1000
+
+
+def _ptt_open() -> None:
+    """Open the connected radio interface's serial port for PTT. Non-fatal —
+    logs a warning if no registered interface (AIOC, ...) is found."""
+    if not _HAVE_PYSERIAL:
+        log.warning("Radio PTT unavailable (pyserial not installed) — PTT disabled")
+        _ptt_serial[0] = None
+        _active_radio_iface[0] = None
+        return
+    found = _radio.find_radio_port()
+    if not found:
+        log.warning("Radio PTT unavailable (no known radio interface found) — PTT disabled")
+        _ptt_serial[0] = None
+        _active_radio_iface[0] = None
+        return
+    iface, port = found
+    try:
+        s = _pyserial.Serial(port, timeout=0)
+        s.dtr = False   # PTT released at open
+        s.rts = False
+        _ptt_serial[0] = s
+        _active_radio_iface[0] = iface
+        log.info("%s PTT ready on %s (%s line) — audio output will transmit over the air",
+                 _radio.detect_hw_variant(iface), port, iface.ptt_line.upper())
+    except Exception as exc:
+        log.warning("%s PTT unavailable (%s) — PTT disabled", iface.name, exc)
+        _ptt_serial[0] = None
+        _active_radio_iface[0] = None
+
+
+def _ptt_alive() -> bool:
+    """True if the PTT serial port is open and its radio interface is still
+    the one physically connected (VID:PID still present)."""
+    if _ptt_serial[0] is None or _active_radio_iface[0] is None:
+        return False
+    found = _radio.find_radio_port()
+    return bool(found and found[0].name == _active_radio_iface[0].name)
+
+
+def _radio_hotplug_watcher(session_ref: list) -> None:
+    """Background thread: periodically (re)opens the PTT serial port so
+    plugging in a radio interface is picked up without anyone needing to
+    trigger a speak() first. Without this, _ptt_serial[0] stays None from
+    daemon startup until the first _ptt_key() call, and that first call is a
+    silent no-op (its reopen-on-failure path only fires on an assert
+    *exception*, which can't happen when there was never a port open to
+    assert against) — so the very first TX after startup would key nothing.
+
+    Also auto-enables Radio Mode itself on a fresh plug-in (audio device
+    newly visible, not just the serial/PTT port) — mirrors the /radio-mode
+    HTTP handler's "turn on" logic. Skips this if the user manually turned
+    Radio Mode off during the current connection (_radio_auto_enable_suppressed),
+    so a deliberate disable sticks until the next unplug/replug cycle.
+
+    The serial/PTT port is always detected live (pyserial re-lists comports
+    fresh every call, no caching) — but sounddevice/PortAudio's device list
+    is cached per-process and does NOT pick up a hot-plugged USB audio
+    device on its own (confirmed live: a fresh subprocess sees the AIOC's
+    audio device immediately after plug-in, but this same long-running
+    process's sd.query_devices() kept reporting it absent until something
+    reinitializes PortAudio — the exact reason /device-status re-enumerates
+    via a subprocess instead of calling sd.query_devices() directly here).
+    So on a fresh serial detection, this also checks whether the cached
+    audio device list already agrees; if not, it forces one reinit to
+    resync it. Skipped when the device was already visible before this
+    process started (no staleness to fix), and skipped after that one-time
+    resync per plug-in — not a fixed interval — to minimize disruption
+    to already-open streams (the mic stream / RX tap watchdogs self-heal
+    from the resulting brief drop either way)."""
+    import time as _hpw_time
+    # Give the main RealtimeSession time to finish opening its own initial
+    # mic stream before this thread's auto-enable logic can touch input
+    # device switching at all. Confirmed live: a crash at startup with the
+    # AIOC already connected landed right as "Session active" appeared —
+    # this thread's auto-enable-triggered _switch_mic_stream call was racing
+    # the session's own first-time mic stream setup, a narrower and
+    # different race than the Monitor/tap ones already fixed, specific to
+    # the first few seconds after the daemon (re)starts.
+    _hpw_time.sleep(8.0)
+    while True:
+        try:
+            was_alive = _ptt_alive()
+            if not was_alive:
+                _ptt_open()
+            now_alive = _ptt_alive()
+
+            if now_alive and not _radio_last_seen_connected[0]:
+                _audio_found = _radio.find_radio_audio_devices()
+                if not _audio_found or _audio_found[1] is None:
+                    log.info("Radio hotplug: AIOC serial detected but cached audio "
+                             "device list is stale — reinitializing PortAudio")
+                    try:
+                        with _portaudio_reinit_lock:
+                            sd._terminate()
+                            sd._initialize()
+                            _resync_output_device_after_reinit()
+                    except Exception as exc:
+                        log.warning("Radio hotplug: PortAudio reinit failed: %s", exc)
+                # Let CoreAudio settle before anything else opens a stream on
+                # the AIOC, reinit or not — a plug/unplug/replug cycle itself
+                # triggers a HAL reconfiguration independent of whether
+                # PortAudio's own device cache needed refreshing. Confirmed
+                # live this race (-9986/-10851) is somewhat non-deterministic
+                # in timing — even 4s didn't guarantee a clean first try on
+                # every cycle. This delay is a best-effort reduction, not the
+                # actual safety net: _switch_mic_stream's own one retry, and
+                # _watch_mic_stream's fallback recovery a few seconds later,
+                # reliably converge on the right device either way.
+                _hpw_time.sleep(2.0)
+                _radio_auto_enable_suppressed[0] = False
+
+            if now_alive:
+                _found = _radio.find_radio_audio_devices()
+                if (_found and _found[1] is not None
+                        and not _radio_profile_active[0]
+                        and not _radio_auto_enable_suppressed[0]):
+                    _radio_prev_input_device[0] = _selected_input_device[0]
+                    _radio_profile_active[0] = True
+                    sess = session_ref[0]
+                    if sess is not None:
+                        _threading.Thread(target=_switch_mic_stream, args=(sess, _found[1]),
+                                           daemon=True).start()
+                    log.info("Radio Mode auto-enabled on AIOC plug-in — switching input to AIOC audio-in (#%d)",
+                             _found[1])
+
+            if not now_alive and _radio_last_seen_connected[0]:
+                # Unplugged. Stop Monitor/EchoTest unconditionally (both can
+                # be running independent of Radio Mode's own flag — Monitor's
+                # button isn't gated on it at all) before anything else has a
+                # chance to touch their now-invalid streams. Confirmed live:
+                # leaving them attached to a vanished device segfaulted the
+                # process a couple minutes later ("Python exited 11") with no
+                # reinit-race context this time — _radio_rx_tap_watchdog's own
+                # stop()/close() on the dead stream is the leading suspect,
+                # since PortAudio/CoreAudio native calls aren't guaranteed
+                # safe against hardware that's already gone, and a segfault
+                # bypasses Python's try/except entirely.
+                if _echotest_active[0]:
+                    _echotest_stop_flag[0] = True
+                    _echotest_active[0] = False
+                    log.info("EchoTest stopped — AIOC unplugged")
+                if _radio_monitor_active[0]:
+                    _stop_radio_monitor()
+                    log.info("Radio monitor stopped — AIOC unplugged")
+
+                if _radio_profile_active[0]:
+                    # Turn Radio Mode off automatically rather than leaving it
+                    # pointed at a device that's gone (mirrors the /radio-mode
+                    # HTTP handler's manual "turn off" logic). Does NOT set
+                    # _radio_auto_enable_suppressed — an unplug isn't a
+                    # deliberate user disable, so the next plug-in should
+                    # still auto-enable freely.
+                    _radio_profile_active[0] = False
+                    prev = _radio_prev_input_device[0]
+                    _radio_prev_input_device[0] = None
+                    sess = session_ref[0]
+                    if sess is not None and prev is not None:
+                        _threading.Thread(target=_switch_mic_stream, args=(sess, prev),
+                                           daemon=True).start()
+                    log.info("Radio Mode auto-disabled on AIOC unplug — restoring input device %s", prev)
+
+            _radio_last_seen_connected[0] = now_alive
+        except Exception as exc:
+            log.warning("Radio hotplug watcher error: %s", exc)
+        _hpw_time.sleep(3)
+
+
+def _ptt_key() -> None:
+    """Assert PTT via the active radio interface's serial line (DTR or RTS,
+    per its RadioInterface.ptt_line). Sets _is_tx so mic capture (_mic_cb)
+    and transcription are suppressed while transmitting."""
+    s = _ptt_serial[0]
+    iface = _active_radio_iface[0]
+    line = iface.ptt_line if iface else "dtr"
+    def _assert(sr):
+        if line == "rts":
+            sr.rts = True; sr.dtr = False
+        else:
+            sr.dtr = True; sr.rts = False
+    if s:
+        try:
+            _assert(s)
+        except Exception as exc:
+            log.warning("PTT key failed: %s — reopening port", exc)
+            try: s.close()
+            except Exception: pass
+            _ptt_serial[0] = None
+            _ptt_open()   # reopen on new port path (macOS reassigns /dev/cu.usbmodem* on reconnect)
+            s2 = _ptt_serial[0]
+            if s2:
+                try: _assert(s2)
+                except Exception as exc2: log.warning("PTT key retry failed: %s", exc2)
+    _is_tx[0] = True
+
+
+def _ptt_release() -> None:
+    """Release PTT via the active radio interface's serial line."""
+    s = _ptt_serial[0]
+    iface = _active_radio_iface[0]
+    line = iface.ptt_line if iface else "dtr"
+    if s:
+        try:
+            if line == "rts":
+                s.rts = False
+            else:
+                s.dtr = False
+        except Exception as exc:
+            log.warning("PTT release failed: %s", exc)
+    _is_tx[0] = False
+
+
+def _radio_rx_tap_cb(indata, frames, time_info, status) -> None:
+    """Shared AIOC RX callback — see _radio_rx_tap_stream's docstring at its
+    declaration for why Monitor and EchoTest both run out of this single
+    stream instead of each opening their own."""
+    import time as _rxtap_time
+    raw = indata[:, 0]
+    now = _rxtap_time.time()
+    _radio_rx_tap_last_cb[0] = now
+    if _radio_monitor_active[0]:
+        chunk = np.clip(raw.astype(np.float32) / 32768.0 * RADIO_MONITOR_GAIN, -1.0, 1.0)
+        with _radio_monitor_buf_lock:
+            buf = np.concatenate([_radio_monitor_buf[0], chunk])
+            cap = _radio_rx_tap_samplerate[0] * 2   # 2s cap — output side should keep this near-empty
+            if len(buf) > cap:
+                buf = buf[-_radio_rx_tap_samplerate[0]:]
+            _radio_monitor_buf[0] = buf
+    if _echotest_active[0] and _echotest_squelch[0] is not None:
+        _echotest_process_chunk(raw, now)
+
+
+def _radio_rx_tap_acquire() -> bool:
+    """Start the shared AIOC RX tap stream if not already running; increment
+    its refcount either way. Returns False if no AIOC input is found."""
+    import time as _rxtap_time0
+    with _radio_rx_tap_lock:
+        if _radio_rx_tap_stream[0] is not None:
+            _radio_rx_tap_users[0] += 1
+            return True
+        found = _radio.find_radio_audio_devices()
+        if not found or found[1] is None:
+            return False
+        _, in_idx, _ = found
+        # One reinit-and-retry on failure — observed live that stream opens
+        # can start failing (PaErrorCode -9986) after many hours of daemon
+        # uptime even with no other thread touching PortAudio at that
+        # moment (a fresh external process opens the same device fine),
+        # consistent with some native-side resource gradually exhausting
+        # over a long run of repeated open/close cycles rather than a live
+        # concurrency race. A full terminate/initialize is the same
+        # recovery _watch_mic_stream's hot-plug path already uses; trying
+        # it here means Monitor can self-heal instead of needing a manual
+        # daemon restart every time this shows up.
+        for _attempt in (1, 2):
+            try:
+                samplerate = int(sd.query_devices(in_idx)["default_samplerate"])
+                stream = sd.InputStream(device=in_idx, channels=1, samplerate=samplerate,
+                                         dtype="int16", blocksize=samplerate * 50 // 1000,
+                                         callback=_radio_rx_tap_cb)
+                stream.start()
+                _radio_rx_tap_stream[0] = stream
+                _radio_rx_tap_users[0] = 1
+                _radio_rx_tap_samplerate[0] = samplerate
+                _radio_rx_tap_last_cb[0] = _rxtap_time0.time()
+                log.info("Radio RX tap opened: AIOC in (#%d)%s", in_idx,
+                         " (after reinit)" if _attempt == 2 else "")
+                return True
+            except Exception as exc:
+                if _attempt == 1:
+                    log.warning("Radio RX tap failed to open (%s) — reinitializing PortAudio and retrying", exc)
+                    try:
+                        sd._terminate()
+                        sd._initialize()
+                    except Exception as reinit_exc:
+                        log.warning("Radio RX tap reinit failed: %s", reinit_exc)
+                    _refound = _radio.find_radio_audio_devices()
+                    if not _refound or _refound[1] is None:
+                        log.warning("Radio RX tap: AIOC no longer found after reinit")
+                        return False
+                    in_idx = _refound[1]
+                    continue
+                log.warning("Radio RX tap failed to open: %s", exc)
+                return False
+        return False
+
+
+def _radio_rx_tap_release() -> None:
+    """Decrement the refcount; close the shared tap stream once nobody's using it."""
+    with _radio_rx_tap_lock:
+        _radio_rx_tap_users[0] = max(0, _radio_rx_tap_users[0] - 1)
+        if _radio_rx_tap_users[0] == 0 and _radio_rx_tap_stream[0] is not None:
+            s = _radio_rx_tap_stream[0]
+            _radio_rx_tap_stream[0] = None
+            try:
+                s.stop(); s.close()
+            except Exception:
+                pass
+            log.info("Radio RX tap closed (no more users)")
+
+
+def _start_radio_monitor(out_dev=None) -> bool:
+    """Start a live RX passthrough (radio audio in -> speaker out): attaches
+    to the shared AIOC RX tap for input and opens a dedicated OutputStream
+    for whichever device was picked. Returns False if no radio audio input
+    is found or the output stream fails to open.
+
+    Holds _radio_rx_tap_lock for its whole body (reentrant — it also calls
+    into _radio_rx_tap_acquire, which takes the same lock) so this can never
+    interleave with the RX tap watchdog's own stream manipulation. Confirmed
+    live: an HTTP-triggered stop racing the watchdog's periodic staleness
+    check on the *same* Monitor output stream — both unguarded — segfaulted
+    the process with no missing-device involved at all."""
+    with _radio_rx_tap_lock:
+        target_out = out_dev if out_dev is not None else _selected_output_device[0]
+        if target_out is None:
+            try:
+                target_out = sd.query_devices(kind="output")["index"]
+            except Exception:
+                pass
+
+        if not _radio_rx_tap_acquire():
+            log.warning("Radio monitor: no radio audio input found")
+            return False
+
+        with _radio_monitor_buf_lock:
+            _radio_monitor_buf[0] = np.zeros(0, dtype=np.float32)
+
+        def _out_cb(outdata, frames, time_info, status):
+            import time as _outcb_time
+            _radio_monitor_out_last_cb[0] = _outcb_time.time()
+            with _radio_monitor_buf_lock:
+                buf = _radio_monitor_buf[0]
+                n = len(buf)
+                if n >= frames:
+                    outdata[:, 0] = buf[:frames]
+                    _radio_monitor_buf[0] = buf[frames:]
+                else:
+                    outdata[:n, 0] = buf
+                    outdata[n:, 0] = 0.0
+                    _radio_monitor_buf[0] = np.zeros(0, dtype=np.float32)
+
+        try:
+            out_stream = sd.OutputStream(device=target_out, samplerate=_radio_rx_tap_samplerate[0],
+                                          channels=1, dtype="float32", blocksize=480, callback=_out_cb)
+            out_stream.start()
+        except Exception as exc:
+            log.warning("Radio monitor output stream error: %s", exc)
+            _radio_rx_tap_release()
+            return False
+
+        import time as _srm_time
+        _radio_monitor_out_stream[0] = out_stream
+        _radio_monitor_out_last_cb[0] = _srm_time.time()
+        _radio_monitor_active[0] = True
+        _radio_monitor_out_dev[0] = target_out
+        log.info("Radio monitor started: AIOC in -> %s", _device_label(target_out))
+        return True
+
+
+def _stop_radio_monitor() -> None:
+    with _radio_rx_tap_lock:
+        _radio_monitor_active[0] = False
+        s = _radio_monitor_out_stream[0]
+        _radio_monitor_out_stream[0] = None
+        if s is not None:
+            try:
+                s.stop(); s.close()
+            except Exception:
+                pass
+        _radio_monitor_out_dev[0] = None
+        _radio_rx_tap_release()
+
+
+def _radio_rx_tap_watchdog() -> None:
+    """Background thread: detects a stalled shared RX tap or Monitor output
+    stream (no callbacks for several seconds while it should be running)
+    and reopens it. Confirmed live that opening any new CoreAudio stream on
+    this system can transiently freeze other already-open streams with no
+    exception raised — same class of problem _watch_mic_stream already
+    handles for the main mic capture, applied here to the tap/Monitor pair
+    since they're independent streams that watchdog doesn't know about."""
+    import time as _wd_time
+    while True:
+        _wd_time.sleep(2.0)
+
+        with _radio_rx_tap_lock:
+            tap_stream = _radio_rx_tap_stream[0]
+            tap_users  = _radio_rx_tap_users[0]
+        if tap_stream is not None and tap_users > 0:
+            stale = _wd_time.time() - _radio_rx_tap_last_cb[0]
+            if stale > 3.0:
+                # Tried skipping .stop()/.close() entirely once the device
+                # looked gone, on the theory that calling them on a stream
+                # whose USB device physically disappeared risked a segfault
+                # (one was observed once, in this exact vicinity). That
+                # traded a rare, self-recovering crash for a guaranteed,
+                # non-recovering resource leak instead — confirmed live:
+                # skipping close() left the native stream handle open,
+                # permanently blocking every later attempt to open a new
+                # stream on the same device with the same PaErrorCode -9986
+                # this was meant to avoid, but with no restart to clear it.
+                # Always attempt the close; try/except covers the ordinary
+                # failure modes, and an occasional crash that launchd
+                # restarts is the better failure mode of the two.
+                found = _radio.find_radio_audio_devices()
+                if not found or found[1] is None:
+                    log.warning("Radio RX tap stalled (%.1fs, device gone) — stopping Monitor/EchoTest",
+                                stale)
+                    with _radio_rx_tap_lock:
+                        old = _radio_rx_tap_stream[0]
+                        _radio_rx_tap_stream[0] = None
+                        _radio_rx_tap_users[0] = 0
+                        if old is not None:
+                            try: old.stop(); old.close()
+                            except Exception: pass
+                    if _echotest_active[0]:
+                        _echotest_stop_flag[0] = True
+                        _echotest_active[0] = False
+                    if _radio_monitor_active[0]:
+                        _radio_monitor_active[0] = False
+                        _radio_monitor_out_stream[0] = None
+                        _radio_monitor_out_dev[0] = None
+                else:
+                    log.warning("Radio RX tap stalled (%.1fs no callbacks) — reopening", stale)
+                    with _radio_rx_tap_lock:
+                        old = _radio_rx_tap_stream[0]
+                        _radio_rx_tap_stream[0] = None
+                        if old is not None:
+                            try: old.stop(); old.close()
+                            except Exception: pass
+                        _, in_idx, _ = found
+                        try:
+                            samplerate = int(sd.query_devices(in_idx)["default_samplerate"])
+                            new_stream = sd.InputStream(
+                                device=in_idx, channels=1, samplerate=samplerate, dtype="int16",
+                                blocksize=samplerate * 50 // 1000, callback=_radio_rx_tap_cb)
+                            new_stream.start()
+                            _radio_rx_tap_stream[0] = new_stream
+                            _radio_rx_tap_samplerate[0] = samplerate
+                            _radio_rx_tap_last_cb[0] = _wd_time.time()
+                            log.info("Radio RX tap reopened successfully")
+                        except Exception as exc:
+                            log.warning("Radio RX tap reopen failed: %s", exc)
+
+        if _radio_monitor_active[0]:
+            stale = _wd_time.time() - _radio_monitor_out_last_cb[0]
+            if stale > 3.0:
+                target = _radio_monitor_out_dev[0]
+                # Same reasoning as the tap check above: confirm the target
+                # output device is still actually present before touching
+                # its stream's native stop()/close() — a vanished device
+                # (this output disconnected too, e.g. Bluetooth) makes that
+                # call a plausible crash rather than just a no-op.
+                _target_present = False
+                try:
+                    _target_present = any(
+                        (d.get("name") == target or i == target) and d.get("max_output_channels", 0) > 0
+                        for i, d in enumerate(sd.query_devices()))
+                except Exception:
+                    pass
+                if not _target_present:
+                    # Same reasoning as the tap branch above: always attempt
+                    # the close rather than leaking the stream handle — a
+                    # leaked handle permanently blocks reopening even after
+                    # the device comes back, which is worse than an
+                    # occasional crash that launchd auto-restarts. Locked so
+                    # this can't interleave with an HTTP-triggered start/stop
+                    # touching the same stream object concurrently.
+                    log.warning("Radio monitor output stalled (%.1fs, device gone) — stopping", stale)
+                    with _radio_rx_tap_lock:
+                        _radio_monitor_active[0] = False
+                        _mon_old = _radio_monitor_out_stream[0]
+                        _radio_monitor_out_stream[0] = None
+                        _radio_monitor_out_dev[0] = None
+                        if _mon_old is not None:
+                            try: _mon_old.stop(); _mon_old.close()
+                            except Exception: pass
+                        _radio_rx_tap_release()
+                else:
+                    log.warning("Radio monitor output stalled (%.1fs no callbacks) — reopening on %s",
+                                stale, _device_label(target))
+                    with _radio_rx_tap_lock:
+                        _stop_radio_monitor()
+                        _start_radio_monitor(out_dev=target)
+
+
+def _echotest_process_chunk(raw: np.ndarray, now: float) -> None:
+    """Called from the shared RX tap's callback (_radio_rx_tap_cb) once per
+    ~50ms chunk while EchoTest is active. Same squelch/capture state machine
+    Pi's _playback_listener used, just driven inline from the shared tap
+    instead of from its own InputStream — see _radio_rx_tap_stream's
+    docstring for why. Ignores audio both during any active PTT-keyed
+    transmission (_is_tx) and for a cooldown window after one ends: without
+    that grace window, TX-into-RX crosstalk on this hardware makes the
+    listener capture its own transmission's bleed/tail as a "new" segment
+    the instant PTT releases — a self-sustaining echo chamber."""
+    st = _echotest_state
+    squelch = _echotest_squelch[0]
+    if _is_tx[0]:
+        st["prev_tx"] = True
+    elif st["prev_tx"]:
+        st["prev_tx"] = False
+        st["ext_tx_grace_until"] = now + ECHOTEST_COOLDOWN_S
+    if _is_tx[0] or now < _echotest_cooldown_until[0] or now < st["ext_tx_grace_until"]:
+        st["was_open"] = False
+        st["seg"] = bytearray()
+        return
+    peak = int(np.max(np.abs(raw))) if len(raw) else 0
+    cos_open = squelch.update(peak, now)
+    chunk_bytes = raw.tobytes()
+
+    if cos_open and not st["was_open"]:
+        st["seg"] = bytearray(chunk_bytes)
+    elif cos_open and st["was_open"]:
+        max_bytes = int(ECHOTEST_MAX_SECS * _radio_rx_tap_samplerate[0] * 2)
+        if len(st["seg"]) < max_bytes:
+            st["seg"].extend(chunk_bytes)
+    elif not cos_open and st["was_open"]:
+        secs = len(st["seg"]) / 2 / _radio_rx_tap_samplerate[0]
+        if secs >= ECHOTEST_MIN_SECS:
+            try:
+                _echotest_queue.put_nowait(
+                    (secs, np.frombuffer(bytes(st["seg"]), dtype=np.int16)))
+            except queue.Full:
+                log.warning("EchoTest: queue full — dropping %.1fs capture", secs)
+        st["seg"] = bytearray()
+    st["was_open"] = cos_open
+
+
+def _echotest_worker() -> None:
+    """Single always-on daemon thread: serially transmits captured segments
+    from _echotest_queue back out over the radio — keys PTT, plays the clip
+    to the AIOC's audio-out, releases PTT once playback finishes. If PTT or
+    Radio Mode isn't available, the segment is just dropped (never falls
+    back to local playback). Sets a cooldown after each transmission so
+    _echotest_listener doesn't immediately re-capture our own tail/echo as a
+    new transmission. Runs for the life of the process; harmless and idle
+    when the queue is empty. Ported from Pi's _playback_worker — sd.play()
+    replaces the paplay subprocess."""
+    import time as _et_time
+    while True:
+        secs, pcm_i16 = _echotest_queue.get()
+        if not (_ptt_alive() and _radio_profile_active[0]):
+            log.warning("EchoTest: captured %.1fs but Radio Mode is off — dropped "
+                        "(listener runs regardless of profile, but transmitting "
+                        "requires Radio Mode to be explicitly on)", secs)
+            continue
+        _found = _radio.find_radio_audio_devices()
+        if not _found or _found[2] is None:
+            log.warning("EchoTest: captured %.1fs but no radio audio-out found — dropped", secs)
+            continue
+        out_dev = _found[2]
+        try:
+            _ptt_key()
+            _et_time.sleep(_ptt_prekey_s())
+            log.info("EchoTest: PTT keyed — transmitting %.1fs on-air", secs)
+            pcm_f32 = pcm_i16.astype(np.float32) / 32768.0
+            sd.play(pcm_f32, samplerate=48000, device=out_dev, blocking=True)
+            _et_time.sleep(_ptt_tail_s())
+            _ptt_release()
+            log.info("EchoTest: PTT released")
+            _log_entry("system", f"EchoTest: transmitted {secs:.1f}s radio recording on-air")
+        except Exception as exc:
+            log.warning("EchoTest: on-air transmit failed: %s", exc)
+            try: _ptt_release()
+            except Exception: pass
+        finally:
+            _echotest_cooldown_until[0] = _et_time.time() + ECHOTEST_COOLDOWN_S
+
+
+def _echotest_listener(stop_flag: list) -> None:
+    """Controller thread: sets up the squelch tracker/state and attaches to
+    the shared AIOC RX tap (see _radio_rx_tap_stream's docstring). The
+    actual per-chunk squelch/capture logic runs inline inside the tap's
+    callback (_echotest_process_chunk) — this thread just manages lifecycle
+    and re-resolves/reattaches if the radio interface drops and comes back."""
+    import time as _el_time
+
+    while not stop_flag[0]:
+        found = _radio.find_radio_audio_devices()
+        if not found or found[1] is None:
+            _el_time.sleep(3); continue
+        iface = found[0]
+        _echotest_squelch[0] = _radio.SquelchTracker(iface.cos_threshold, ECHOTEST_COS_TAIL_S)
+        _echotest_state["was_open"] = False
+        _echotest_state["seg"] = bytearray()
+        _echotest_state["prev_tx"] = False
+        _echotest_state["ext_tx_grace_until"] = 0.0
+
+        if not _radio_rx_tap_acquire():
+            log.warning("EchoTest: could not attach to radio RX tap")
+            _echotest_squelch[0] = None
+            _el_time.sleep(3); continue
+
+        log.info("EchoTest listener ready via %s (COS>=%d, tail=%.1fs, min=%.1fs)",
+                 iface.name, _echotest_squelch[0].base_threshold,
+                 ECHOTEST_COS_TAIL_S, ECHOTEST_MIN_SECS)
+        try:
+            while not stop_flag[0] and _radio.find_radio_audio_devices():
+                _el_time.sleep(0.5)
+        finally:
+            _radio_rx_tap_release()
+            _echotest_squelch[0] = None
+        if not stop_flag[0]:
+            _el_time.sleep(3)
 
 
 def _list_audio_devices() -> dict:
@@ -248,18 +960,105 @@ def _list_audio_devices() -> dict:
 
 
 def _device_label(idx) -> str:
-    """Friendly label for a sounddevice device index (or None for default)."""
+    """Friendly label for a sounddevice device index or name (or None for default)."""
     if idx is None:
         try:
             d = sd.query_devices(kind="input")
             return f"default ({d['name']})"
         except Exception:
             return "default"
+    if isinstance(idx, str):
+        return idx   # already a device name — nothing to look up
     try:
         d = sd.query_devices(idx)
         return f"{d['name']} (#{idx})"
     except Exception:
         return f"device #{idx}"
+
+
+def _query_devices_fresh() -> list | None:
+    """Enumerate audio devices in a fresh subprocess, bypassing this
+    process's own PortAudio device-list cache — sd.query_devices() in a
+    long-running process does not reliably pick up devices that were
+    unplugged since it last initialized (confirmed live: a device that had
+    fully disconnected still resolved a name via a direct in-process
+    sd.query_devices(idx) call, hours after it was gone). Returns None on
+    any failure — callers should fall back to the in-process (possibly
+    stale) view rather than break."""
+    import time as _qdf_time
+    now = _qdf_time.time()
+    cached = _query_devices_fresh_cache[0]
+    if cached is not None and now - _query_devices_fresh_cache[1] < 5.0:
+        return cached
+    try:
+        _qr = subprocess.run(
+            [sys.executable, "-c",
+             "import sounddevice as sd, json;"
+             "print(json.dumps([{'name':d['name'],"
+             "'max_input_channels':d['max_input_channels'],"
+             "'max_output_channels':d['max_output_channels']}"
+             " for d in sd.query_devices()]))"],
+            capture_output=True, text=True, timeout=5)
+        if _qr.returncode != 0:
+            return None
+        result = json.loads(_qr.stdout)
+        _query_devices_fresh_cache[0] = result
+        _query_devices_fresh_cache[1] = now
+        return result
+    except Exception:
+        return None
+
+
+def _fresh_device_label_and_resync(dev_ref: list, kind: str) -> str:
+    """Resolve a friendly label for whatever's in dev_ref[0] (an index),
+    verified against a fresh device list rather than this process's own
+    possibly-stale cache — and self-heal dev_ref[0] in place if the device
+    it names has actually disconnected, so later code (speak(), etc.)
+    doesn't keep trying to use hardware that's gone. kind is "input" or
+    "output". Falls back to the plain (possibly stale) _device_label() if
+    the fresh subprocess query itself fails, rather than showing nothing."""
+    idx = dev_ref[0]
+    stale_label = _device_label(idx)
+    if idx is None:
+        return stale_label
+    # Extract the bare name this process currently believes idx maps to.
+    try:
+        stale_name = sd.query_devices(idx)["name"]
+    except Exception:
+        return stale_label
+
+    fresh = _query_devices_fresh()
+    if fresh is None:
+        return stale_label   # couldn't verify — better a possibly-stale label than none
+
+    ch_key = "max_output_channels" if kind == "output" else "max_input_channels"
+    for i, d in enumerate(fresh):
+        if d.get("name") == stale_name and d.get(ch_key, 0) > 0:
+            if i != idx:
+                dev_ref[0] = i   # index shifted (other devices connected/disconnected) — resync
+            return f"{stale_name} (#{i})"
+
+    # Named device isn't in the fresh list at all — it's genuinely gone.
+    # Fall back to whatever fresh device is capable in the requested
+    # direction and resync to that, so the daemon stops pointing at
+    # vanished hardware instead of just mislabeling it.
+    for i, d in enumerate(fresh):
+        if d.get(ch_key, 0) > 0:
+            dev_ref[0] = i
+            return f"{d['name']} (#{i}) — replaced {stale_name!r}, disconnected"
+    return f"{stale_name} (disconnected, no replacement found)"
+
+
+def _current_input_device_name() -> str:
+    """Bare device name (no index suffix) of the currently selected input
+    device, or the system default input if none is explicitly selected —
+    the stable key used for per-device voice profiles and calibration."""
+    try:
+        idx = _selected_input_device[0]
+        d = sd.query_devices(idx if idx is not None else None, kind="input")
+        return d["name"]
+    except Exception:
+        return "default"
 
 
 def _get_system_volume() -> int:
@@ -334,13 +1133,23 @@ def _get_device_status() -> dict:
         "gate": 500,
         "gain": 3.0,
         "bt_warning": "",
+        "radio_active":    _radio_profile_active[0],
+        "monitor_active":  _radio_monitor_active[0],
+        "echotest_active": _echotest_active[0],
     }
     try:
         in_dev  = _selected_input_device[0]
         out_dev = _selected_output_device[0]
-        result["mic"] = _device_label(in_dev)
+        # Verified against a fresh (subprocess) device list rather than this
+        # process's own cache, which doesn't reliably notice a device has
+        # actually disconnected — confirmed live: this panel kept showing a
+        # Bluetooth speaker hours after it was gone, while the Audio
+        # Devices table below (already subprocess-based) correctly no
+        # longer listed it at all.
+        result["mic"] = _fresh_device_label_and_resync(_selected_input_device, "input")
+        in_dev = _selected_input_device[0]   # may have been resynced above
         if out_dev is not None:
-            result["speaker_name"] = _device_label(out_dev)
+            result["speaker_name"] = _fresh_device_label_and_resync(_selected_output_device, "output")
         else:
             try:
                 d = sd.query_devices(kind="output")
@@ -854,6 +1663,29 @@ def _resolve_device_by_name(name: str, kind: str) -> int | None:
         pass
     return None
 
+
+def _resync_output_device_after_reinit() -> None:
+    """Re-resolve _selected_output_device[0] by name after a PortAudio
+    reinit (sd._terminate()/_initialize()) — device indices are not stable
+    across a reinit cycle. Confirmed live: after enough reinit churn from
+    repeated AIOC plug/unplug testing, a previously-correct stored index
+    for "AIOC Audio" (output, 1 channel) ended up pointing at "AIOC Audio"
+    (input, 0 output channels) instead — same name, different physical
+    port, silently broken speak()/TTS output. _switch_mic_stream's own
+    hot-plug recovery already re-resolves the INPUT device by name for
+    exactly this reason; nothing did the equivalent for output until now."""
+    try:
+        prefs = _load_device_prefs()
+        name = prefs.get("output_device_name") if prefs else None
+        if not name:
+            return
+        idx = _resolve_device_by_name(name, "output")
+        if idx is not None and idx != _selected_output_device[0]:
+            log.info("Resyncing output device after PortAudio reinit: %r -> #%d", name, idx)
+            _selected_output_device[0] = idx
+    except Exception as exc:
+        log.warning("Output device resync failed: %s", exc)
+
 def _load_device_prefs() -> dict:
     try:
         with open(DEVICE_PREFS_FILE) as f:
@@ -943,38 +1775,80 @@ def _compute_embedding(pcm_int16: np.ndarray, rate: int) -> "np.ndarray | None":
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b))   # inputs are L2-normalized
 
-def _owner_score(emb: np.ndarray) -> float:
-    """Max cosine over the profile mean + per-sample embeddings — max keeps
-    cross-language scoring robust since enrollment mixes EN and ZH samples."""
-    prof = _owner_profile[0]
+def _owner_score(emb: np.ndarray, device_key: str) -> float:
+    """Max cosine over the profile mean + per-sample embeddings for the given
+    device's profile — max keeps cross-language scoring robust since
+    enrollment mixes EN and ZH samples. Caller must check
+    _verification_available(device_key) first."""
+    prof = _owner_profiles[device_key]
     refs = [prof["mean"]] + prof["samples"]
     return max(_cosine(emb, r) for r in refs)
 
-def _load_voice_profile() -> bool:
+def _read_voice_profiles_raw() -> dict:
+    """Read the on-disk multi-device store as-is (full per-sample metadata:
+    lang/prompt/secs/embedding — richer than the in-memory scoring shape)."""
     try:
-        with open(VOICE_PROFILE_FILE) as f:
-            data = json.load(f)
-        samples = [np.asarray(s["embedding"], dtype=np.float32) for s in data["samples"]]
-        _owner_profile[0] = {"mean": np.asarray(data["mean"], dtype=np.float32),
-                             "samples": samples, "created": data.get("created", 0)}
-        log.info("Loaded voice profile: %d sample(s)", len(samples))
-        return True
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        _owner_profile[0] = None
-        return False
+        with open(VOICE_PROFILES_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
-def _save_voice_profile(samples: list) -> None:
-    """samples: [{"lang","prompt","secs","embedding":[...]}]. Computes the mean."""
+def _load_voice_profiles() -> None:
+    """Load all per-device voice profiles from disk into _owner_profiles
+    (bare-ndarray scoring shape; on-disk keeps richer per-sample metadata).
+
+    One-time migration: if the old single-profile file from before per-device
+    profiles existed exists and the new store doesn't, adopt it under the
+    name of the currently selected/default input device (it was almost
+    certainly enrolled on whatever mic was in use at the time) and archive
+    the old file rather than deleting it.
+    """
+    global _owner_profiles
+    _owner_profiles = {}
+    raw = _read_voice_profiles_raw()
+    if not raw:
+        _OLD_VOICE_PROFILE_FILE = os.path.expanduser("~/.openclaw/workspace/rtt_voice_profile.json")
+        try:
+            with open(_OLD_VOICE_PROFILE_FILE) as f:
+                old_data = json.load(f)
+            migrate_key = _current_input_device_name()
+            raw = {migrate_key: old_data}
+            os.makedirs(os.path.dirname(VOICE_PROFILES_FILE), exist_ok=True)
+            with open(VOICE_PROFILES_FILE, "w") as f:
+                json.dump(raw, f)
+            os.rename(_OLD_VOICE_PROFILE_FILE, _OLD_VOICE_PROFILE_FILE + ".migrated")
+            log.info("Migrated single voice profile -> per-device profile for %r", migrate_key)
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            raw = {}
+
+    for device_name, data in raw.items():
+        try:
+            samples = [np.asarray(s["embedding"], dtype=np.float32) for s in data["samples"]]
+            _owner_profiles[device_name] = {
+                "mean": np.asarray(data["mean"], dtype=np.float32),
+                "samples": samples, "created": data.get("created", 0),
+            }
+        except (KeyError, ValueError):
+            log.warning("Skipping malformed voice profile for %r", device_name)
+    log.info("Loaded voice profiles for %d device(s): %s",
+             len(_owner_profiles), ", ".join(_owner_profiles) or "none")
+
+def _save_voice_profile(samples: list, device_key: str) -> None:
+    """samples: [{"lang","prompt","secs","embedding":[...]}]. Computes the mean,
+    read-modify-writes the on-disk multi-device store (preserving other
+    devices' entries and full per-sample metadata), then reloads
+    _owner_profiles from disk so the in-memory scoring shape matches."""
     import time as _tvp
     embs = np.stack([np.asarray(s["embedding"], dtype=np.float32) for s in samples])
     mean = embs.mean(axis=0)
     mean = mean / np.linalg.norm(mean)
-    data = {"version": 1, "model": "campplus_zh_en_advanced", "dim": int(embs.shape[1]),
-            "created": _tvp.time(), "samples": samples, "mean": mean.tolist()}
-    os.makedirs(os.path.dirname(VOICE_PROFILE_FILE), exist_ok=True)
-    with open(VOICE_PROFILE_FILE, "w") as f:
-        json.dump(data, f)
-    _load_voice_profile()
+    raw = _read_voice_profiles_raw()
+    raw[device_key] = {"version": 1, "model": "campplus_zh_en_advanced", "dim": int(embs.shape[1]),
+                        "created": _tvp.time(), "samples": samples, "mean": mean.tolist()}
+    os.makedirs(os.path.dirname(VOICE_PROFILES_FILE), exist_ok=True)
+    with open(VOICE_PROFILES_FILE, "w") as f:
+        json.dump(raw, f)
+    _load_voice_profiles()
 
 def _save_voice_mode() -> None:
     try:
@@ -994,17 +1868,24 @@ def _load_voice_mode() -> None:
     except (FileNotFoundError, json.JSONDecodeError, ValueError):
         pass
 
-def _verification_available() -> bool:
-    return _owner_profile[0] is not None and _get_spk_extractor() is not None
+def _verification_available(device_key: str) -> bool:
+    return device_key in _owner_profiles and _get_spk_extractor() is not None
 
-def _record_pcm_blocking(secs: float) -> np.ndarray:
-    """Record from the default mic for enrollment/testing. Sets _enroll_active
-    so _mic_cb discards audio (the utterance must not reach transcription).
-    Applies MIC_GAIN (no gate) for channel consistency with runtime audio."""
+def _record_pcm_blocking(secs: float, device=None) -> np.ndarray:
+    """Record for enrollment/testing. Sets _enroll_active so _mic_cb discards
+    audio (the utterance must not reach transcription). Applies MIC_GAIN (no
+    gate) for channel consistency with runtime audio.
+
+    device: explicit sounddevice index/name to record from, or None to use
+    whatever's currently selected (_selected_input_device[0]) — NOT sd.rec's
+    own default, which is the OS-wide system default input and silently
+    ignores Radio Mode's input switch entirely (sd.default.device is never
+    set anywhere in this file)."""
     _enroll_active[0] = True
     try:
+        rec_device = device if device is not None else _selected_input_device[0]
         rec = sd.rec(int(secs * DEVICE_RATE), samplerate=DEVICE_RATE,
-                     channels=CHANNELS, dtype="int16")
+                     channels=CHANNELS, dtype="int16", device=rec_device)
         sd.wait()
         pcm = rec.reshape(-1).astype(np.float32) * MIC_GAIN
         return np.clip(pcm, -32768, 32767).astype(np.int16)
@@ -1432,6 +2313,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
     pcm_parts: list[np.ndarray] = []
     temp_files: list[str] = []
     silence_samples = int(TTS_SAMPLE_RATE * silence_ms / 1000)
+    _tx_radio = False   # set True below once TTS is ready, if Radio Mode is transmitting this reply
 
     try:
         if silence_ms > 0:
@@ -1489,96 +2371,121 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
 
         _interrupted = [False]
         out_dev = _selected_output_device[0]
-        log.info("  sd.play() %d samples peak=%d gain=%.3f dev=%s",
-                 final.size, int(np.max(np.abs(final))), total_gain, out_dev)
+        # Radio Mode: route TTS out over the air instead of the local speaker,
+        # keyed by PTT for the duration of playback. _ptt_alive() confirms the
+        # radio interface is actually connected right now, not just that the
+        # Radio Mode toggle is on.
+        _tx_radio = bool(_radio_profile_active[0] and _ptt_alive())
+        if _tx_radio:
+            _radio_out = _radio.find_radio_audio_devices()
+            if _radio_out and _radio_out[2] is not None:
+                out_dev = _radio_out[2]
+            else:
+                _tx_radio = False   # no radio output resolved — fall back to local speaker
+        log.info("  sd.play() %d samples peak=%d gain=%.3f dev=%s%s",
+                 final.size, int(np.max(np.abs(final))), total_gain, out_dev,
+                 " (radio TX)" if _tx_radio else "")
+        import time as _t
         try:
             _is_speaking[0] = True
+            if _tx_radio:
+                _ptt_key()
+                _t.sleep(_ptt_prekey_s())
             sd.play(final, samplerate=TTS_SAMPLE_RATE, device=out_dev, blocking=False)
         except Exception as e:
             _is_speaking[0] = False
+            if _tx_radio:
+                try: _ptt_release()
+                except Exception: pass
             log.error("sd.play() failed: %s", e)
             return
 
-        # Auto-calibrating interrupt threshold.
-        #
-        # During the 500 ms guard period we compare what the output PCM is playing
-        # at each 50 ms tick against what the mic picks up.  The ratio (mic/output)
-        # is the acoustic coupling for this room/device combination.  After the guard
-        # we set threshold = max_coupling × safety_factor × output_peak so the
-        # threshold automatically scales to any speaker+mic setup and volume level.
-        #
-        # If the guard produces no usable coupling data (e.g. the audio starts with
-        # a long silence) we fall back to SPEAK_INTERRUPT_PEAK as the floor.
-        import time as _t
-        output_peak = int(np.max(np.abs(final)))
-        INTERRUPT_GUARD_TICKS  = 20    # 1 s guard — 300 ms silence + 700 ms speech to measure
-        INTERRUPT_SAFETY       = 1.8   # threshold = measured_echo × 1.8 (user must be clearly louder)
-        TICK_SAMPLES = TTS_SAMPLE_RATE * 50 // 1000   # samples per 50 ms tick
+        if _tx_radio:
+            # Radio TX: skip the self-interrupt monitor entirely. Mic capture
+            # is already forced to silence while _is_tx is set (see _mic_cb),
+            # so there is no real mic signal to measure coupling against, and
+            # known TX->RX crosstalk on this hardware would make any barge-in
+            # detection built from it unreliable anyway — same reasoning as
+            # Pi's v3.8.0 change.
+            pass
+        else:
+            # Auto-calibrating interrupt threshold.
+            #
+            # During the 500 ms guard period we compare what the output PCM is playing
+            # at each 50 ms tick against what the mic picks up.  The ratio (mic/output)
+            # is the acoustic coupling for this room/device combination.  After the guard
+            # we set threshold = max_coupling × safety_factor × output_peak so the
+            # threshold automatically scales to any speaker+mic setup and volume level.
+            #
+            # If the guard produces no usable coupling data (e.g. the audio starts with
+            # a long silence) we fall back to SPEAK_INTERRUPT_PEAK as the floor.
+            output_peak = int(np.max(np.abs(final)))
+            INTERRUPT_GUARD_TICKS  = 20    # 1 s guard — 300 ms silence + 700 ms speech to measure
+            INTERRUPT_SAFETY       = 1.8   # threshold = measured_echo × 1.8 (user must be clearly louder)
+            TICK_SAMPLES = TTS_SAMPLE_RATE * 50 // 1000   # samples per 50 ms tick
 
-        interrupt_threshold = SPEAK_INTERRUPT_PEAK    # updated after guard
-        guard_max_out = 0   # peak output PCM seen during guard
-        guard_max_mic = 0   # peak mic level seen during guard (echo baseline)
-        consec = 0
-        guard  = INTERRUPT_GUARD_TICKS
+            interrupt_threshold = SPEAK_INTERRUPT_PEAK    # updated after guard, then tracked continuously
+            guard_max_out = 0   # peak output PCM seen during guard
+            guard_max_mic = 0   # peak mic level seen during guard (echo baseline)
+            coupling: float | None = None   # continuously-tracked echo/coupling ratio, past the guard window
+            consec = 0
+            guard  = INTERRUPT_GUARD_TICKS
+            tick_idx = 0
 
-        while True:
-            try:
-                stream = sd.get_stream()
-                active = stream is not None and stream.active
-            except Exception:
-                active = False
-            if not active:
-                break
-            _t.sleep(0.05)
-            with _mic_level_lock:
-                p = _mic_level_current[0]
+            while True:
+                try:
+                    stream = sd.get_stream()
+                    active = stream is not None and stream.active
+                except Exception:
+                    active = False
+                if not active:
+                    break
+                _t.sleep(0.05)
+                with _mic_level_lock:
+                    p = _mic_level_current[0]
 
-            if guard > 0:
-                # Accumulate peak output and peak mic separately — dividing per-tick
-                # ratios inflates the coupling when a quiet output tick is divided
-                # against any mic background noise.
-                tick_idx = (INTERRUPT_GUARD_TICKS - guard)
                 s0 = tick_idx * TICK_SAMPLES
                 s1 = s0 + TICK_SAMPLES
                 tick_out = int(np.max(np.abs(final[s0:s1]))) if s1 <= len(final) else 0
-                if tick_out > guard_max_out:
-                    guard_max_out = tick_out
-                if p > guard_max_mic:
-                    guard_max_mic = p
-                guard -= 1
-                if guard == 0:
-                    if guard_max_out > 200:
-                        coupling = guard_max_mic / guard_max_out
-                        interrupt_threshold = max(
-                            int(output_peak * coupling * INTERRUPT_SAFETY),
-                            SPEAK_INTERRUPT_PEAK,
-                        )
-                        log.info("  coupling=%.3f (echo=%d/out=%d) interrupt_threshold=%d",
-                                 coupling, guard_max_mic, guard_max_out, interrupt_threshold)
-                    else:
-                        log.info("  no coupling data — using floor threshold=%d",
-                                 interrupt_threshold)
-                continue
+                tick_idx += 1
 
-            if _http_interrupt[0]:
-                log.info("HTTP interrupt — stopping TTS")
-                _http_interrupt[0] = False
-                _interrupted[0] = True
-                _clear_audio_buffer[0] = True  # flush OpenAI VAD buffer after interrupt
-                if resumable:
-                    _paused_speech[0] = (clean, alsa_output)
-                    log.info("  Saved %d chars for resume", len(clean))
-                try:
-                    sd.stop()
-                except Exception:
-                    pass
-                break
+                if guard > 0:
+                    # Accumulate peak output and peak mic separately — dividing per-tick
+                    # ratios inflates the coupling when a quiet output tick is divided
+                    # against any mic background noise.
+                    if tick_out > guard_max_out:
+                        guard_max_out = tick_out
+                    if p > guard_max_mic:
+                        guard_max_mic = p
+                    guard -= 1
+                    if guard == 0:
+                        if guard_max_out > 200:
+                            coupling = guard_max_mic / guard_max_out
+                            interrupt_threshold = max(
+                                int(output_peak * coupling * INTERRUPT_SAFETY),
+                                SPEAK_INTERRUPT_PEAK,
+                            )
+                            log.info("  coupling=%.3f (echo=%d/out=%d) interrupt_threshold=%d",
+                                     coupling, guard_max_mic, guard_max_out, interrupt_threshold)
+                        else:
+                            log.info("  no coupling data — using floor threshold=%d",
+                                     interrupt_threshold)
+                    continue
 
-            if p > interrupt_threshold:
-                consec += 1
-                if consec >= SPEAK_INTERRUPT_BLOCKS:
-                    log.info("Speech interrupt — stopping TTS (peak=%d threshold=%d)",
-                             p, interrupt_threshold)
+                # Keep tracking coupling past the initial guard so a long or unevenly-
+                # loud reply doesn't outrun a threshold frozen from the first second —
+                # but never learn from a tick that already looks like a real barge-in,
+                # or a genuine interruption would just get EMA'd away.
+                if tick_out > 200 and p <= interrupt_threshold:
+                    local = p / tick_out
+                    coupling = local if coupling is None else (
+                        coupling * (1 - SPEAK_COUPLING_EMA) + local * SPEAK_COUPLING_EMA)
+                    interrupt_threshold = max(
+                        int(output_peak * coupling * INTERRUPT_SAFETY), SPEAK_INTERRUPT_PEAK)
+
+                if _http_interrupt[0]:
+                    log.info("HTTP interrupt — stopping TTS")
+                    _http_interrupt[0] = False
                     _interrupted[0] = True
                     _clear_audio_buffer[0] = True  # flush OpenAI VAD buffer after interrupt
                     if resumable:
@@ -1589,13 +2496,32 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                     except Exception:
                         pass
                     break
-            else:
-                consec = 0
+
+                if p > interrupt_threshold:
+                    consec += 1
+                    if consec >= SPEAK_INTERRUPT_BLOCKS:
+                        log.info("Speech interrupt — stopping TTS (peak=%d threshold=%d)",
+                                 p, interrupt_threshold)
+                        _interrupted[0] = True
+                        _clear_audio_buffer[0] = True  # flush OpenAI VAD buffer after interrupt
+                        if resumable:
+                            _paused_speech[0] = (clean, alsa_output)
+                            log.info("  Saved %d chars for resume", len(clean))
+                        try:
+                            sd.stop()
+                        except Exception:
+                            pass
+                        break
+                else:
+                    consec = 0
 
         try:
             sd.wait()
         except Exception:
             pass
+        if _tx_radio:
+            _t.sleep(_ptt_tail_s())
+            _ptt_release()
 
         if not _interrupted[0] and resumable:
             _paused_speech[0] = None   # finished normally — nothing to resume
@@ -1604,6 +2530,12 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         log.error("speak() error: %s", e)
     finally:
         _is_speaking[0] = False
+        if _tx_radio and _is_tx[0]:
+            # Belt-and-suspenders: an exception between _ptt_key() and the
+            # normal release point above would otherwise leave PTT stuck
+            # asserted — a stuck radio transmission, not just a silent bug.
+            try: _ptt_release()
+            except Exception: pass
         for p in temp_files:
             try: os.unlink(p)
             except FileNotFoundError: pass
@@ -1894,8 +2826,12 @@ class RealtimeSession:
             return
         # While Zeebot is speaking (or for 500 ms after it stops), send silence
         # so Zeebot's own TTS echo can't leak into the transcription stream.
+        # Same treatment while PTT is asserted (_is_tx) — known TX->RX
+        # crosstalk on this radio hardware means the mic can pick up our own
+        # transmitted audio; keep sending silence rather than a stream gap so
+        # the OpenAI Realtime session's VAD stays continuous.
         import time as _tcb
-        if self._busy.is_set() or _tcb.time() < _post_busy_until[0]:
+        if self._busy.is_set() or _tcb.time() < _post_busy_until[0] or _is_tx[0]:
             silence = np.zeros_like(raw)
             self.loop.call_soon_threadsafe(self._enqueue_mic, silence.tobytes())
             return
@@ -1904,7 +2840,7 @@ class RealtimeSession:
         if raw_peak < MIC_GATE_PEAK:
             out_arr = np.zeros_like(raw)
             # Gain frozen during silence — WebRTC AGC won't pump up on noise
-        elif _webrtc_proc is not None:
+        elif _webrtc_proc is not None and not _radio_profile_active[0]:
             # Resample 24 kHz → 16 kHz (linear interp — fine for speech)
             n_16k = len(raw) * 2 // 3
             idx_src = np.linspace(0, len(raw) - 1, n_16k)
@@ -1924,7 +2860,17 @@ class RealtimeSession:
             out_arr = np.interp(idx_dst, np.arange(len(proc_16k)),
                                 proc_16k.astype(np.float32)).astype(np.int16)
         else:
-            # Numpy fallback: RMS leveler + tanh soft limiter
+            # Numpy fallback: RMS leveler + tanh soft limiter. Also the
+            # forced path for Radio Mode (see the elif above) — Pi's AGC
+            # profile for radio audio individually disables WebRTC's voice
+            # detection, transient suppression, and echo cancellation
+            # (radio audio's frequency response/compression confuses VAD,
+            # transient suppression clips consonants, and AEC has nothing
+            # real to cancel), but webrtc_noise_gain's Mac binding only
+            # exposes __init__(rate, aggressiveness) + Process10ms() with
+            # no per-effect toggles, so that fine-grained config can't be
+            # replicated here. This RMS+tanh leveler has none of those
+            # WebRTC effects to begin with, which sidesteps the problem.
             _AGC_TARGET = 4000.0
             _AGC_MAX    = 8.0
             _STEP_UP    = 10 ** (1 / 20)
@@ -2075,33 +3021,63 @@ class RealtimeSession:
             # Wait briefly first so the OS has time to enumerate the new device.
             await asyncio.sleep(1.5)
             try:
-                sd._terminate()
-                sd._initialize()
+                with _portaudio_reinit_lock:
+                    sd._terminate()
+                    sd._initialize()
                 log.info("PortAudio reinitialized for hot-plug")
+                _resync_output_device_after_reinit()
             except Exception as e:
                 log.warning("PortAudio reinit error: %s", e)
 
             # Resolve new device index from prefs by name using the already-reinited
             # PortAudio context. Fall back to the last known selected device.
-            prefs = _load_device_prefs()
-            saved_name = prefs.get("input_device_name") if prefs else None
+            #
+            # If Radio Mode is active, prefer reopening on the AIOC's audio-in
+            # over the saved mic preference — otherwise a mid-session AIOC
+            # glitch (e.g. contention from another stream opening on the same
+            # USB device around the same time) silently falls back to the
+            # normal mic without anyone telling _radio_profile_active[0],
+            # leaving the Radio button showing "on" while nothing is actually
+            # listening to the radio anymore.
+            saved_name = None
             new_idx = _selected_input_device[0]  # fallback to last known good index
-            if saved_name:
-                resolved = _resolve_device_by_name(saved_name, "input")
-                if resolved is not None:
-                    new_idx = resolved
+            if _radio_profile_active[0]:
+                _rf = _radio.find_radio_audio_devices()
+                if _rf and _rf[1] is not None:
+                    new_idx = _rf[1]
+                    saved_name = "AIOC (Radio Mode)"
                 else:
-                    log.warning("Hot-plug: saved device %r not found after reinit", saved_name)
+                    log.warning("Hot-plug: Radio Mode active but AIOC not found — "
+                                "falling back to saved mic preference, turning Radio Mode off")
+                    _radio_profile_active[0] = False
+                    _radio_prev_input_device[0] = None
+            if saved_name is None:
+                prefs = _load_device_prefs()
+                pref_name = prefs.get("input_device_name") if prefs else None
+                if pref_name:
+                    resolved = _resolve_device_by_name(pref_name, "input")
+                    if resolved is not None:
+                        new_idx = resolved
+                        saved_name = pref_name
+                    else:
+                        log.warning("Hot-plug: saved device %r not found after reinit", pref_name)
+                if _radio_profile_active[0]:
+                    # Reopening on the normal mic while Radio Mode still claims
+                    # to be on would be the same inconsistency — turn it off.
+                    log.warning("Hot-plug: reopening on non-radio device — turning Radio Mode off")
+                    _radio_profile_active[0] = False
+                    _radio_prev_input_device[0] = None
 
             log.info("Hot-plug: attempting to reopen mic on device idx=%s (%s)",
                      new_idx, saved_name or "default")
             try:
-                new_stream = sd.InputStream(
-                    samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
-                    blocksize=DEVICE_BLOCKSIZE, callback=self._mic_cb,
-                    device=new_idx,
-                )
-                new_stream.start()
+                with _audio_open_lock:
+                    new_stream = sd.InputStream(
+                        samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
+                        blocksize=DEVICE_BLOCKSIZE, callback=self._mic_cb,
+                        device=new_idx,
+                    )
+                    new_stream.start()
                 self._mic_stream_ref[0] = new_stream
                 _selected_input_device[0] = new_idx
                 _last_mic_cb[0] = _wm.time()   # reset to avoid immediate re-trigger
@@ -2136,13 +3112,15 @@ class RealtimeSession:
     async def _verify_speaker(self, transcript: str) -> bool:
         """Owner-only gate. Pops the matching audio segment (always — mode
         toggles mid-stream must not desync the FIFO), embeds it, and compares
-        against the enrolled profile. Silence is the fail-safe: missing or
-        too-short segments are rejected in owner-only mode."""
+        against the profile enrolled for whichever input device is currently
+        active. Silence is the fail-safe: missing or too-short segments are
+        rejected in owner-only mode."""
         segment = self._pop_segment()
         if not _owner_only[0]:
             return True
-        if not _verification_available():
-            return True   # not enrolled / model missing — dashboard banner covers this
+        device_key = _current_input_device_name()
+        if not _verification_available(device_key):
+            return True   # not enrolled for this device / model missing — dashboard banner covers this
         if segment is None:
             _log_entry("system", f"Voice check: no audio segment — ignored ({transcript[:40]!r})")
             return False
@@ -2155,12 +3133,12 @@ class RealtimeSession:
         if emb is None:
             log.warning("Voice check: embedding failed — accepting (fail-open)")
             return True
-        score = _owner_score(emb)
+        score = _owner_score(emb, device_key)
         if score >= _spk_threshold[0]:
-            log.info("Voice check PASS %.3f (%.1fs): %r", score, secs, transcript[:60])
+            log.info("Voice check PASS %.3f (%.1fs) [%s]: %r", score, secs, device_key, transcript[:60])
             return True
         _log_entry("system", f"Voice check: rejected non-owner (sim {score:.2f}) — {transcript[:40]!r}")
-        log.info("Voice check REJECT %.3f (%.1fs): %r", score, secs, transcript[:60])
+        log.info("Voice check REJECT %.3f (%.1fs) [%s]: %r", score, secs, device_key, transcript[:60])
         return False
 
     async def _handle_transcript(self, transcript: str):
@@ -2331,7 +3309,7 @@ class RealtimeSession:
 
         # Owner-only mode toggles — already owner-gated by _verify_speaker above
         if _matches_phrase(normalized, OWNER_ONLY_ON_PHRASES):
-            if not _verification_available():
+            if not _owner_profiles:
                 await asyncio.get_running_loop().run_in_executor(
                     None, speak,
                     "No voice profile enrolled yet. Use the web dashboard to enroll first.",
@@ -2345,6 +3323,15 @@ class RealtimeSession:
                 await asyncio.get_running_loop().run_in_executor(
                     None, speak, "Owner only mode on. I'll only listen to you.",
                     self.alsa_output)
+                current_device = _current_input_device_name()
+                if current_device not in _owner_profiles:
+                    _log_entry("system", f"Note: no voice profile enrolled for {current_device!r} — "
+                                          "accepting all speakers on it until you add one.")
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, speak,
+                        "Note: this microphone doesn't have a voice profile yet, so I'll accept "
+                        "anyone on it until you add one.",
+                        self.alsa_output)
             return
         if _matches_phrase(normalized, OWNER_ONLY_OFF_PHRASES):
             if _owner_only[0]:
@@ -2572,12 +3559,13 @@ class RealtimeSession:
             log.info("Session active — speak now (routed through Zeebot / OpenClaw)")
 
             import time as _rt
-            in_stream = sd.InputStream(
-                samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
-                blocksize=DEVICE_BLOCKSIZE, callback=self._mic_cb,
-                device=self.input_device,
-            )
-            in_stream.start()
+            with _audio_open_lock:
+                in_stream = sd.InputStream(
+                    samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
+                    blocksize=DEVICE_BLOCKSIZE, callback=self._mic_cb,
+                    device=self.input_device,
+                )
+                in_stream.start()
             self._mic_stream_ref[0] = in_stream
             _last_mic_cb[0] = _rt.time()   # seed so watchdog doesn't fire immediately
 
@@ -2630,21 +3618,36 @@ def _switch_mic_stream(session, new_idx: int) -> None:
 
     _t.sleep(0.1)
 
-    try:
-        new_stream = sd.InputStream(
-            samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
-            blocksize=DEVICE_BLOCKSIZE, callback=session._mic_cb,
-            device=new_idx,
-        )
-        new_stream.start()
-        session._mic_stream_ref[0] = new_stream
-        _selected_input_device[0] = new_idx
-        _last_mic_cb[0] = _t.time()
-        log.info("Mic stream switched to device %d OK", new_idx)
-        _log_entry("system", "Mic switched.")
-    except Exception as e:
-        log.warning("Mic stream switch failed: %s", e)
-        _log_entry("system", f"Mic switch failed: {e}")
+    # One retry after a short backoff — opening a stream on a USB audio
+    # interface (like the AIOC) right as another stream on the same
+    # physical device is also initializing (e.g. Radio Mode's input switch
+    # racing a Play Test loop's output-stream open) can transiently fail at
+    # the CoreAudio level even though the device itself is fine; confirmed
+    # live (PaMacCore err -10851 / PortAudio -9986) when both happened
+    # within about a second of each other.
+    for _attempt in (1, 2):
+        try:
+            with _audio_open_lock:
+                new_stream = sd.InputStream(
+                    samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
+                    blocksize=DEVICE_BLOCKSIZE, callback=session._mic_cb,
+                    device=new_idx,
+                )
+                new_stream.start()
+            session._mic_stream_ref[0] = new_stream
+            _selected_input_device[0] = new_idx
+            _last_mic_cb[0] = _t.time()
+            log.info("Mic stream switched to device %d OK%s", new_idx,
+                     " (retry)" if _attempt == 2 else "")
+            _log_entry("system", "Mic switched.")
+            break
+        except Exception as e:
+            if _attempt == 1:
+                log.warning("Mic stream switch failed (%s) — retrying once", e)
+                _t.sleep(0.8)
+                continue
+            log.warning("Mic stream switch failed: %s", e)
+            _log_entry("system", f"Mic switch failed: {e}")
 
 
 def start_http_server(port: int, on_stop, session_ref: list, loop=None):
@@ -2795,7 +3798,7 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
             elif self.path in ("/ownermode", "/ownermode/on", "/ownermode/off"):
                 want = (not _owner_only[0]) if self.path == "/ownermode" \
                        else self.path.endswith("/on")
-                if want and not _verification_available():
+                if want and not _owner_profiles:
                     _log_entry("system", "Cannot enable owner-only mode — no voice profile enrolled.")
                     log.info("HTTP ownermode: refused — not enrolled")
                 elif want != _owner_only[0]:
@@ -2804,6 +3807,10 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                     label = "Owner-only mode on." if want else "Everyone mode — listening to all voices."
                     log.info("HTTP ownermode: %s", "ON" if want else "OFF")
                     _log_entry("system", label)
+                    _current_dev = _current_input_device_name()
+                    if want and _current_dev not in _owner_profiles:
+                        _log_entry("system", f"Note: no voice profile enrolled for {_current_dev!r} — "
+                                              "accepting all speakers on it until you add one.")
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
@@ -2861,14 +3868,79 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                 if len(_enroll_staging) < 3:
                     out = {"ok": False, "error": f"need 3 samples, have {len(_enroll_staging)}"}
                 else:
+                    device_key = _current_input_device_name()
                     samples = [{"lang": v["lang"], "prompt": k, "secs": v["secs"],
                                 "embedding": v["embedding"]}
                                for k, v in sorted(_enroll_staging.items())]
-                    _save_voice_profile(samples)
+                    _save_voice_profile(samples, device_key)
                     _enroll_staging.clear()
-                    _log_entry("system", "Voice profile enrolled (3 samples).")
-                    log.info("Voice profile saved: %d samples", len(samples))
-                    out = {"ok": True, "samples": len(samples)}
+                    _log_entry("system", f"Voice profile enrolled for {device_key!r} (3 samples).")
+                    log.info("Voice profile saved for %r: %d samples", device_key, len(samples))
+                    out = {"ok": True, "samples": len(samples), "device": device_key}
+                resp = _json.dumps(out).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path.startswith("/voice-enroll/radio-record"):
+                # Dedicated Radio Voice Profile section (matches Pi's fixed
+                # Mic/Radio layout) — records explicitly from the AIOC
+                # regardless of whichever device is currently selected for
+                # the main enrollment section above, so switching input
+                # devices first isn't required. Independent staging area
+                # (_enroll_staging_radio) so it can't collide with an
+                # in-progress recording in the main section.
+                import json as _json, urllib.parse as _up
+                qs   = _up.parse_qs(_up.urlparse(self.path).query)
+                slot = qs.get("slot", ["0"])[0]
+                secs = max(2.0, min(10.0, float(qs.get("secs", ["5"])[0])))
+                lang = qs.get("lang", ["en"])[0]
+                _found = _radio.find_radio_audio_devices()
+                if _get_spk_extractor() is None:
+                    out = {"ok": False, "error": "sherpa-onnx or model unavailable"}
+                elif not _found or _found[1] is None:
+                    out = {"ok": False, "error": "no radio audio input found"}
+                elif _is_speaking[0]:
+                    out = {"ok": False, "error": "Zeebot is speaking — try again"}
+                else:
+                    pcm  = _record_pcm_blocking(secs, device=_found[1])
+                    peak = int(np.max(np.abs(pcm))) if len(pcm) else 0
+                    emb  = _compute_embedding(pcm, DEVICE_RATE)
+                    if emb is None:
+                        out = {"ok": False, "error": "embedding failed"}
+                    elif peak < 500:
+                        out = {"ok": False, "error": f"too quiet (peak {peak}) — transmit closer/louder"}
+                    else:
+                        _enroll_staging_radio[slot] = {"embedding": emb.tolist(),
+                                                       "secs": secs, "lang": lang}
+                        out = {"ok": True, "slot": slot, "secs": secs, "peak": peak,
+                               "staged": len(_enroll_staging_radio)}
+                resp = _json.dumps(out).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path == "/voice-enroll/radio-save":
+                import json as _json
+                _found = _radio.find_radio_audio_devices()
+                if len(_enroll_staging_radio) < 3:
+                    out = {"ok": False, "error": f"need 3 samples, have {len(_enroll_staging_radio)}"}
+                elif not _found or _found[1] is None:
+                    out = {"ok": False, "error": "no radio audio input found"}
+                else:
+                    device_key = sd.query_devices(_found[1])["name"]
+                    samples = [{"lang": v["lang"], "prompt": k, "secs": v["secs"],
+                                "embedding": v["embedding"]}
+                               for k, v in sorted(_enroll_staging_radio.items())]
+                    _save_voice_profile(samples, device_key)
+                    _enroll_staging_radio.clear()
+                    _log_entry("system", f"Radio voice profile enrolled for {device_key!r} (3 samples).")
+                    log.info("Radio voice profile saved for %r: %d samples", device_key, len(samples))
+                    out = {"ok": True, "samples": len(samples), "device": device_key}
                 resp = _json.dumps(out).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -2878,8 +3950,9 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
 
             elif self.path == "/voice-enroll/test":
                 import json as _json
-                if not _verification_available():
-                    out = {"ok": False, "error": "no profile enrolled or model unavailable"}
+                device_key = _current_input_device_name()
+                if not _verification_available(device_key):
+                    out = {"ok": False, "error": f"no profile enrolled for {device_key!r} or model unavailable"}
                 elif _is_speaking[0]:
                     out = {"ok": False, "error": "Zeebot is speaking — try again"}
                 else:
@@ -2888,10 +3961,11 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                     if emb is None:
                         out = {"ok": False, "error": "embedding failed"}
                     else:
-                        score = _owner_score(emb)
+                        score = _owner_score(emb, device_key)
                         out = {"ok": True, "score": round(score, 3),
                                "threshold": _spk_threshold[0],
-                               "pass": score >= _spk_threshold[0]}
+                               "pass": score >= _spk_threshold[0],
+                               "device": device_key}
                 resp = _json.dumps(out).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -2899,20 +3973,23 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                 self.end_headers()
                 self.wfile.write(resp)
 
-            elif self.path == "/voice-enroll/clear":
-                import json as _json
-                try:
-                    os.remove(VOICE_PROFILE_FILE)
-                except FileNotFoundError:
-                    pass
-                _owner_profile[0] = None
+            elif self.path.startswith("/voice-enroll/clear"):
+                import json as _json, urllib.parse as _up
+                qs = _up.parse_qs(_up.urlparse(self.path).query)
+                device_key = qs.get("device", [None])[0] or _current_input_device_name()
+                raw = _read_voice_profiles_raw()
+                raw.pop(device_key, None)
+                os.makedirs(os.path.dirname(VOICE_PROFILES_FILE), exist_ok=True)
+                with open(VOICE_PROFILES_FILE, "w") as f:
+                    json.dump(raw, f)
+                _load_voice_profiles()
                 _enroll_staging.clear()
-                if _owner_only[0]:
+                if _owner_only[0] and not _owner_profiles:
                     _owner_only[0] = False
                     _save_voice_mode()
-                _log_entry("system", "Voice profile cleared — everyone mode.")
-                log.info("Voice profile cleared")
-                resp = _json.dumps({"ok": True}).encode()
+                _log_entry("system", f"Voice profile cleared for {device_key!r}.")
+                log.info("Voice profile cleared for %r", device_key)
+                resp = _json.dumps({"ok": True, "device": device_key}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(resp)))
@@ -2920,16 +3997,77 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                 self.wfile.write(resp)
 
             elif self.path == "/voice-enroll":
-                enrolled = _owner_profile[0] is not None
+                current_device = _current_input_device_name()
+                enrolled = current_device in _owner_profiles
                 model_ok = _get_spk_extractor() is not None
                 enrolled_since = ""
-                if enrolled and _owner_profile[0].get("created"):
+                if enrolled and _owner_profiles[current_device].get("created"):
                     enrolled_since = datetime.datetime.fromtimestamp(
-                        _owner_profile[0]["created"]).strftime("%Y-%m-%d %H:%M")
+                        _owner_profiles[current_device]["created"]).strftime("%Y-%m-%d %H:%M")
                 status_line = (
                     f"Profile enrolled {enrolled_since}" if enrolled
-                    else "No profile enrolled" if model_ok
+                    else "No profile enrolled for this device" if model_ok
                     else "Speaker model unavailable — install sherpa-onnx + model first")
+
+                # Dedicated Radio Voice Profile section — matches Pi's fixed
+                # Mic/Radio layout (see reference screenshot) rather than
+                # only showing whatever device is currently selected.
+                # Resolves and records from the AIOC directly regardless of
+                # what's active in the section above, so switching input
+                # devices on the Calibrate page first isn't required.
+                _ve_radio_found = _radio.find_radio_audio_devices()
+                _radio_in_name = None
+                if _ve_radio_found and _ve_radio_found[1] is not None:
+                    try:
+                        _radio_in_name = sd.query_devices(_ve_radio_found[1])["name"]
+                    except Exception:
+                        _radio_in_name = None
+                _is_current_radio = _radio_in_name is not None and current_device == _radio_in_name
+                _mic_section_label = "Radio Voice Profile" if _is_current_radio else "Mic Voice Profile"
+                _show_radio_section = _radio_in_name is not None and not _is_current_radio
+
+                _radio_enrolled = _radio_in_name in _owner_profiles if _radio_in_name else False
+                _radio_since = ""
+                if _radio_enrolled and _owner_profiles[_radio_in_name].get("created"):
+                    _radio_since = datetime.datetime.fromtimestamp(
+                        _owner_profiles[_radio_in_name]["created"]).strftime("%Y-%m-%d %H:%M")
+                _radio_status_line = (
+                    f"Radio profile enrolled {_radio_since} — used automatically whenever Radio mode "
+                    "is active. If missing, Owner-Only mode still works but accepts all speakers over radio."
+                    if _radio_enrolled else
+                    "No radio profile enrolled — used automatically whenever Radio mode is active. "
+                    "If missing, Owner-Only mode still works but accepts all speakers over radio."
+                )
+                _radio_section = (f"""
+<h3 style="margin-top:20px;">Radio Voice Profile</h3>
+<p class="info">{_radio_status_line}</p>
+<div class="card"><b>Sample 1 — English</b>
+<p class="info">Read aloud: &ldquo;Zeebot wake up. Please check my calendar and read me the news for today.&rdquo;</p>
+<button onclick="recRadio(this,'1','en')">&#9210; Record 5s</button> <span id="rs1"></span></div>
+<div class="card"><b>Sample 2 — Chinese</b>
+<p class="info">Read aloud: &ldquo;Zeebot 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
+<button onclick="recRadio(this,'2','zh')">&#9210; Record 5s</button> <span id="rs2"></span></div>
+<div class="card"><b>Sample 3 — free speech</b>
+<p class="info">Speak naturally for 5 seconds — mix English and Chinese if you like.</p>
+<button onclick="recRadio(this,'3','mixed')">&#9210; Record 5s</button> <span id="rs3"></span></div>
+<div class="card">
+<button id="saveRadio" onclick="saveRadio()">&#128190; Save radio profile</button>
+<button onclick="clearDevice('{_radio_in_name}')" style="border-color:var(--rd)">&#10006; Clear radio profile</button>
+<div id="resultRadio" class="info"></div></div>""") if _show_radio_section else ""
+
+                other_devices = sorted(d for d in _owner_profiles
+                                        if d != current_device and d != _radio_in_name)
+                other_rows = "".join(
+                    f'<div class="card" style="display:flex;justify-content:space-between;'
+                    f'align-items:center;"><span>{d}</span>'
+                    f'<button onclick="clearDevice(\'{d}\')" style="border-color:var(--rd)">'
+                    f'&#10006; Clear</button></div>'
+                    for d in other_devices
+                )
+                other_section = (
+                    f'<h3 style="margin-top:20px;">Other enrolled devices</h3>{other_rows}'
+                    if other_devices else ""
+                )
                 body = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Voice ID — RealTimeTalk</title>
@@ -2947,6 +4085,9 @@ a{{color:var(--you)}} .meter{{height:8px;background:#121925;border-radius:4px;ov
 <h3>&#127908; Voice ID enrollment</h3>
 <p class="info">{status_line} &middot; threshold {_spk_threshold[0]:.2f} &middot; <a href="/calibration">&larr; calibration</a></p>
 <div class="meter"><div id="meter"></div></div>
+<h3>{_mic_section_label}</h3>
+<p class="info">Targets whichever input device is currently active — {current_device}.
+Switch devices (Calibrate page) before recording to enroll a different one.</p>
 <div class="card"><b>Sample 1 — English</b>
 <p class="info">Read aloud: &ldquo;Zeebot wake up. Please check my calendar and read me the news for today.&rdquo;</p>
 <button onclick="rec(this,'1','en')">&#9210; Record 5s</button> <span id="s1"></span></div>
@@ -2957,10 +4098,12 @@ a{{color:var(--you)}} .meter{{height:8px;background:#121925;border-radius:4px;ov
 <p class="info">Speak naturally for 5 seconds — mix English and Chinese if you like.</p>
 <button onclick="rec(this,'3','mixed')">&#9210; Record 5s</button> <span id="s3"></span></div>
 <div class="card">
-<button id="save" onclick="save()">&#128190; Save profile</button>
+<button id="save" onclick="save()">&#128190; Save profile for {current_device}</button>
 <button onclick="test(this)">&#127897; Test my voice</button>
-<button onclick="clearProfile()" style="border-color:var(--rd)">&#10006; Clear profile</button>
+<button onclick="clearDevice('{current_device}')" style="border-color:var(--rd)">&#10006; Clear this device's profile</button>
 <div id="result" class="info"></div></div>
+{_radio_section}
+{other_section}
 <script>
 const es = new EventSource('/levels');
 es.onmessage = e => {{ const p = parseInt(e.data.split(',')[0]);
@@ -2979,7 +4122,24 @@ async function rec(btn, slot, lang) {{
 async function save() {{
   const r = await fetch('/voice-enroll/save'); const j = await r.json();
   document.getElementById('result').innerHTML = j.ok
-    ? '<span class="ok">Profile saved. You can enable Owner Only on the dashboard.</span>'
+    ? `<span class="ok">Profile saved for ${{j.device}}. You can enable Owner Only on the dashboard.</span>`
+    : `<span class="bad">${{j.error}}</span>`;
+}}
+async function recRadio(btn, slot, lang) {{
+  btn.disabled = true; const lbl = document.getElementById('rs'+slot);
+  let n = 5; lbl.textContent = 'Recording… transmit now';
+  const timer = setInterval(()=>{{ n--; if(n>0) lbl.textContent = 'Recording… '+n; }}, 1000);
+  try {{
+    const r = await fetch(`/voice-enroll/radio-record?slot=${{slot}}&secs=5&lang=${{lang}}`);
+    const j = await r.json();
+    lbl.innerHTML = j.ok ? `<span class="ok">&#10004; captured (peak ${{j.peak}})</span>`
+                         : `<span class="bad">&#10006; ${{j.error}}</span>`;
+  }} finally {{ clearInterval(timer); btn.disabled = false; }}
+}}
+async function saveRadio() {{
+  const r = await fetch('/voice-enroll/radio-save'); const j = await r.json();
+  document.getElementById('resultRadio').innerHTML = j.ok
+    ? `<span class="ok">Radio profile saved for ${{j.device}}. You can enable Owner Only on the dashboard.</span>`
     : `<span class="bad">${{j.error}}</span>`;
 }}
 async function test(btn) {{
@@ -2988,13 +4148,13 @@ async function test(btn) {{
   try {{
     const r = await fetch('/voice-enroll/test'); const j = await r.json();
     document.getElementById('result').innerHTML = j.ok
-      ? `Similarity <b class="${{j.pass?'ok':'bad'}}">${{j.score}}</b> vs threshold ${{j.threshold}} — ${{j.pass?'PASS':'FAIL'}}`
+      ? `[${{j.device}}] Similarity <b class="${{j.pass?'ok':'bad'}}">${{j.score}}</b> vs threshold ${{j.threshold}} — ${{j.pass?'PASS':'FAIL'}}`
       : `<span class="bad">${{j.error}}</span>`;
   }} finally {{ btn.disabled = false; }}
 }}
-async function clearProfile() {{
-  if (!confirm('Delete the enrolled voice profile?')) return;
-  await fetch('/voice-enroll/clear'); location.reload();
+async function clearDevice(device) {{
+  if (!confirm(`Delete the enrolled voice profile for "${{device}}"?`)) return;
+  await fetch(`/voice-enroll/clear?device=${{encodeURIComponent(device)}}`); location.reload();
 }}
 </script></body></html>"""
                 _html(self, 200, body)
@@ -3099,7 +4259,8 @@ async function clearProfile() {{
 {prev_html}
 <div class="row"><button id="acbtn" onclick="runCal()">Run auto calibration</button></div>
 </div>""")
-                _voice_enrolled = _owner_profile[0] is not None
+                _voice_current_device = _current_input_device_name()
+                _voice_enrolled = _voice_current_device in _owner_profiles
                 _voice_owner_only = _owner_only[0]
                 _voice_id_btn = (
                     '<a href="/voice-enroll" style="padding:4px 11px;font-size:13px;'
@@ -3115,9 +4276,59 @@ async function clearProfile() {{
                        else "#021a0e" if _voice_owner_only
                        else "#051928" if _voice_enrolled
                        else "transparent",
-                    title="Enroll or test the owner voice profile",
+                    title=f"Enroll or test the owner voice profile for {_voice_current_device} "
+                          f"({len(_owner_profiles)} device(s) enrolled total)",
                     chk="&nbsp;&#10003;" if _voice_owner_only else "",
                 )
+                # Radio + Monitor render unconditionally (matches Pi exactly);
+                # DTMF/EchoTest are gated on _radio_profile_active[0], also
+                # matching Pi exactly — hardware presence alone doesn't show
+                # them, only actually having Radio Mode on does.
+                _radio_btn = (
+                    '<button id="radiobtn" onclick="toggleRadioMode()" '
+                    'style="padding:4px 11px;font-size:13px;'
+                    + ('color:#ef4444;border-color:#ef4444;background:#1a0303;'
+                       if _radio_profile_active[0] else
+                       'color:#475569;border-color:#334155;')
+                    + '" title="Radio Mode: listen + reply over the AIOC instead of the local mic/speaker">'
+                    + '&#128246; Radio' + ('&nbsp;&#10003;' if _radio_profile_active[0] else '')
+                    + '</button>'
+                )
+                _monitor_btn = (
+                    '<button id="monitorbtn" onclick="toggleRadioMonitor()" '
+                    'style="padding:4px 11px;font-size:13px;'
+                    + ('color:#34d399;border-color:#34d399;background:#021a0e;'
+                       if _radio_monitor_active[0] else
+                       'color:#475569;border-color:#334155;')
+                    + '" title="Live RX passthrough: radio audio in &#8594; speaker out">'
+                    + '&#128266; Monitor' + ('&nbsp;&#10003;' if _radio_monitor_active[0] else '')
+                    + '</button>'
+                )
+                _dtmf_btns = (
+                    '<a href="/dtmf-monitor" style="padding:4px 11px;font-size:13px;'
+                    'text-decoration:none;border:1px solid #334155;border-radius:8px;'
+                    'color:#60a5fa;background:#071a2e;" title="DTMF signal monitor">'
+                    '&#128225; DTMF Mon</a>'
+                    '<a href="/dtmf-train" style="padding:4px 11px;font-size:13px;'
+                    'text-decoration:none;border:1px solid #334155;border-radius:8px;'
+                    'color:#f59e0b;background:#130e02;" title="Train DTMF profiles">'
+                    '&#9881; DTMF Train</a>'
+                    '<a href="/dtmf-retrain" style="padding:4px 11px;font-size:13px;'
+                    'text-decoration:none;border:1px solid #334155;border-radius:8px;'
+                    'color:#a78bfa;background:#0e0820;" title="Retrain specific digits">'
+                    '&#8635; DTMF Retrain</a>'
+                ) if _radio_profile_active[0] else ""
+                _echotest_btn = (
+                    '<button id="echotestbtn" onclick="toggleEchoTest()" '
+                    'style="padding:4px 11px;font-size:13px;'
+                    + ('color:#34d399;border-color:#34d399;background:#021a0e;'
+                       if _echotest_active[0] else
+                       'color:#475569;border-color:#334155;')
+                    + '" title="Detect a radio transmission (squelch), record it, and transmit it '
+                    + 'back on-air by keying PTT until playback finishes">'
+                    + '&#9654; EchoTest' + ('&nbsp;&#10003;' if _echotest_active[0] else '')
+                    + '</button>'
+                ) if _radio_profile_active[0] else ""
                 body = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Calibration — RealTimeTalk</title>
@@ -3173,7 +4384,7 @@ a:hover{{text-decoration:underline;}}
 </style></head><body>
 <div class="ph">
   <span class="pt">&#9679;&nbsp;Calibration</span>
-  <a href="/dashboard" class="back">&#8592; Dashboard</a>
+  <a href="/dashboard" class="back" onclick="sessionStorage.removeItem('devExpanded')">&#8592; Dashboard</a>
 </div>
 <div class="devpanel" id="curdev">
   <b>Mic:</b> {ds["mic"]} &nbsp;&middot;&nbsp; Gate: <span id="panelgate">{ds["gate"]}</span> &nbsp;&middot;&nbsp; Gain: {ds["gain"]}x<br>
@@ -3186,6 +4397,10 @@ a:hover{{text-decoration:underline;}}
   <button onclick="setCalMode('speaker')" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if not is_headset and _override else ''}">Speaker</button>
   <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
   {_voice_id_btn}
+  {_radio_btn}
+  {_monitor_btn}
+  {_echotest_btn}
+  {_dtmf_btns}
 </div>
 {spk_adj_section}
 <div style="margin:14px 0 6px;display:flex;align-items:center;gap:10px;">
@@ -3215,6 +4430,14 @@ a:hover{{text-decoration:underline;}}
 <script>
 /* --- Mic level meter --- */
 const MAX=32768, gate0={gate};
+// Snapshot of toggle state as rendered — Radio Mode can flip on its own
+// (auto-enable/disable on AIOC plug/unplug) with no user click on this
+// page, so upd()'s regular poll below also watches for a mismatch and
+// reloads to pick up the buttons/sections that depend on it (Radio,
+// Monitor, EchoTest, DTMF Mon/Train/Retrain, device panel).
+let _lastRadioActive={str(_radio_profile_active[0]).lower()};
+let _lastMonitorActive={str(_radio_monitor_active[0]).lower()};
+let _lastEchotestActive={str(_echotest_active[0]).lower()};
 let calRunning=false;
 const canvas=document.getElementById('meter');
 const ctx=canvas.getContext('2d');
@@ -3299,6 +4522,13 @@ function upd(){{fetch('/speaker-cal/vol').then(r=>r.json()).then(d=>{{
   if(pg) pg.textContent=d.gate;
   const bp=document.getElementById('btnPlay');
   if(bp) bp.disabled=d.loop_playing;
+  // Radio Mode can flip itself (AIOC plug/unplug auto-enable/disable) with
+  // no click on this page — reload to pick up the buttons/sections that
+  // depend on it once noticed, rather than requiring a manual refresh.
+  if(d.radio_active!==_lastRadioActive || d.monitor_active!==_lastMonitorActive
+     || d.echotest_active!==_lastEchotestActive){{
+    location.reload();
+  }}
 }});}}
 function adjVol(d){{fetch('/speaker-cal/adjust?type=vol&delta='+d).then(()=>upd());}}
 function adjSW(d){{fetch('/speaker-cal/adjust?type=sw&delta='+d).then(()=>upd());}}
@@ -3327,10 +4557,56 @@ function runCal(){{
   }}).catch(e=>{{if(btn)btn.disabled=false;if(st)st.textContent='Error: '+e;}});
 }}
 setInterval(upd,2000);
+/* --- Radio Mode toggle --- */
+function toggleRadioMode(){{
+  fetch('/radio-mode').then(r=>r.json()).then(d=>{{
+    const b=document.getElementById('radiobtn');
+    if(!b)return;
+    if(d.active){{
+      b.style.color='#ef4444';b.style.borderColor='#ef4444';b.style.background='#1a0303';
+      b.innerHTML='&#128246; Radio&nbsp;&#10003;';
+    }} else {{
+      b.style.color='#475569';b.style.borderColor='#334155';b.style.background='';
+      b.innerHTML='&#128246; Radio';
+    }}
+  }});
+}}
+/* --- EchoTest toggle --- */
+function toggleEchoTest(){{
+  fetch('/echotest').then(r=>r.json()).then(d=>{{
+    const b=document.getElementById('echotestbtn');
+    if(!b)return;
+    if(d.active){{
+      b.style.color='#34d399';b.style.borderColor='#34d399';b.style.background='#021a0e';
+      b.innerHTML='&#9654; EchoTest&nbsp;&#10003;';
+    }} else {{
+      b.style.color='#475569';b.style.borderColor='#334155';b.style.background='';
+      b.innerHTML='&#9654; EchoTest';
+    }}
+  }});
+}}
+/* --- Radio monitor toggle --- */
+function toggleRadioMonitor(){{
+  fetch('/radio-monitor').then(r=>r.json()).then(d=>{{
+    const b=document.getElementById('monitorbtn');
+    if(!b)return;
+    if(d.active){{
+      b.style.color='#34d399';b.style.borderColor='#34d399';b.style.background='#021a0e';
+      b.innerHTML='&#128266; Monitor&nbsp;&#10003;';
+    }} else {{
+      b.style.color='#475569';b.style.borderColor='#334155';b.style.background='';
+      b.innerHTML='&#128266; Monitor';
+    }}
+  }});
+}}
 /* --- Device selection --- */
 let _devExpanded=false, _devTimer=null;
 function toggleDevices(){{
   _devExpanded=!_devExpanded;
+  // Persist across reloads (device-change / Radio Mode auto-refresh) —
+  // only a manual collapse or leaving the Calibrate page clears this.
+  if(_devExpanded) sessionStorage.setItem('devExpanded','1');
+  else sessionStorage.removeItem('devExpanded');
   const list=document.getElementById('devlist');
   const tog=document.getElementById('devtoggle');
   list.style.display=_devExpanded?'block':'none';
@@ -3351,19 +4627,27 @@ function loadDevices(){{
     if(d.error){{out.innerHTML='<span style="color:#f55">Error: '+d.error+'</span>';return;}}
     let h='';
     h+='<p style="margin:4px 0 8px;color:#9cf;font-weight:bold">Speakers</p>';
-    h+='<table class="snrtbl"><tr><th>Name</th><th>Card</th><th>State</th><th></th></tr>';
+    h+='<table class="snrtbl"><tr><th>Name</th><th>Card</th><th>State</th><th></th><th>&#128266; Monitor</th></tr>';
     (d.sinks||[]).forEach(s=>{{
       if(s.name.startsWith('rtt_agc')||s.name.includes('monitor')) return;
       const active=(s.name===d.default_sink);
+      // Match by device NAME, not index — CoreAudio renumbers indices when
+      // Bluetooth devices connect/disconnect, so the index isn't a stable
+      // identity across page loads the way the name is.
+      const monHere=d.monitor_active&&d.monitor_out===(s.desc||s.name);
       h+='<tr'+(active?' class="active-row"':'')+'>'
         +'<td>'+(s.desc||s.name)+(active?' <span style="color:#5f5">✓</span>':'')+'</td>'
         +'<td style="white-space:nowrap">'+(s.card?'card '+s.card:'BT')+'</td>'
         +'<td>'+(s.state==='SUSPENDED'?'Idle':s.state==='RUNNING'?'<span style="color:#5f5">Running</span>':s.state)+'</td>'
         +'<td><button class="use-btn'+(active?' active':'')+'"'
-        +' data-dtype="sink" data-dname="'+s.name+'"'
+        +' data-dtype="sink" data-dname="'+encodeURIComponent(s.desc||s.name)+'"'
         +' onclick="setDevice(this.dataset.dtype,this.dataset.dname)"'
         +(active?' disabled':'')
-        +'>'+(active?'Active':'Use')+'</button></td></tr>';
+        +'>'+(active?'Active':'Use')+'</button></td>'
+        +'<td>'+(d.radio_available
+          ?'<button class="use-btn'+(monHere?' active':'')+'" onclick="toggleMonitorFor(\\''+encodeURIComponent(s.desc||s.name)+'\\')">'
+           +(monHere?'&#10003; On':'On')+'</button>'
+          :'&mdash;')+'</td></tr>';
     }});
     h+='</table>';
     h+='<p style="margin:12px 0 8px;color:#9cf;font-weight:bold">Microphones</p>';
@@ -3376,7 +4660,7 @@ function loadDevices(){{
         +'<td style="white-space:nowrap">'+(s.card?'card '+s.card:'-')+'</td>'
         +'<td>'+(s.state==='SUSPENDED'?'Idle':s.state==='RUNNING'?'<span style="color:#5f5">Running</span>':s.state)+'</td>'
         +'<td><button class="use-btn'+(active?' active':'')+'"'
-        +' data-dtype="source" data-dname="'+s.name+'"'
+        +' data-dtype="source" data-dname="'+encodeURIComponent(s.desc||s.name)+'"'
         +' onclick="setDevice(this.dataset.dtype,this.dataset.dname)"'
         +(active?' disabled':'')
         +'>'+(active?'Active':'Use')+'</button></td></tr>';
@@ -3392,22 +4676,38 @@ function loadDevices(){{
     out.dataset.loaded='1';
   }}).catch(e=>{{out.innerHTML='<span style="color:#f55">Failed: '+e+'</span>';}});
 }}
+function toggleMonitorFor(name){{
+  fetch('/radio-monitor?out='+name).then(r=>r.json()).then(d=>{{
+    loadDevices();
+    const b=document.getElementById('monitorbtn');
+    if(!b)return;
+    if(d.active){{
+      b.style.color='#34d399';b.style.borderColor='#34d399';b.style.background='#021a0e';
+      b.innerHTML='&#128266; Monitor&nbsp;&#10003;';
+    }} else {{
+      b.style.color='#475569';b.style.borderColor='#334155';b.style.background='';
+      b.innerHTML='&#128266; Monitor';
+    }}
+  }});
+}}
 function setDevice(type,name){{
+  // name arrives already URI-encoded (see data-dname above) — don't
+  // encode again here, that would double-encode it.
   const msg=document.getElementById('devmsg');
-  msg.textContent=(type==='sink'?'Setting speaker':'Setting mic')+': '+name+' — restarting audio in 1s…';
-  fetch('/device-set?type='+type+'&name='+encodeURIComponent(name))
+  msg.textContent=(type==='sink'?'Setting speaker':'Setting mic')+': '+decodeURIComponent(name)+' — restarting audio in 1s…';
+  fetch('/device-set?type='+type+'&name='+name)
     .then(r=>r.json()).then(d=>{{
       msg.textContent=d.msg||'Done.';
       if(d.ok){{
-        sessionStorage.setItem('devExpanded','1');
         if(_devTimer){{ clearInterval(_devTimer); _devTimer=null; }}
         setTimeout(()=>location.reload(),4500);
       }} else msg.style.color='#f55';
     }}).catch(e=>{{msg.textContent='Error: '+e; msg.style.color='#f55';}});
 }}
-// Restore expanded state after a device-switch reload
-if(sessionStorage.getItem('devExpanded')){{
-  sessionStorage.removeItem('devExpanded');
+// Restore expanded state on load — survives any reload of this page
+// (device switch, Radio Mode auto-refresh) until manually collapsed or
+// the Dashboard link is used to leave.
+if(sessionStorage.getItem('devExpanded')==='1'){{
   toggleDevices();
 }}
 function setCalMode(mode){{
@@ -3675,7 +4975,28 @@ setInterval(upd, 2000);
 
             elif self.path == "/speaker-cal/loop-start":
                 _headset_cal_loop[0] = True
-                def _loop():
+                # Target priority mirrors Pi: Radio Mode transmitting (PTT'd,
+                # on-air) beats Monitor (play to whatever device Monitor is
+                # currently listening through) beats the plain local speaker.
+                _loop_tx_radio = bool(_radio_profile_active[0] and _ptt_alive())
+                _loop_radio_out = None
+                if _loop_tx_radio:
+                    _rf = _radio.find_radio_audio_devices()
+                    if _rf and _rf[2] is not None:
+                        _loop_radio_out = _rf[2]
+                    else:
+                        _loop_tx_radio = False
+                if _loop_tx_radio:
+                    _loop_out_dev = _loop_radio_out
+                    _loop_via = "radio (PTT)"
+                elif _radio_monitor_active[0] and _radio_monitor_out_dev[0] is not None:
+                    _loop_out_dev = _radio_monitor_out_dev[0]
+                    _loop_via = f"monitor ({_device_label(_loop_out_dev)})"
+                else:
+                    _loop_out_dev = _selected_output_device[0]
+                    _loop_via = "speaker"
+
+                def _loop(tx_radio=_loop_tx_radio, out_dev=_loop_out_dev):
                     import tempfile as _tf, time as _t2
                     # Render the test phrase once at full amplitude (gain applied live).
                     phrase = "This is an audio test. One, two, three, four, five."
@@ -3706,22 +5027,242 @@ setInterval(upd, 2000);
                             pos[0]   = (pos[0] + avail) % n_phrase
                         outdata[:, 0] = np.clip(out * gain, -1.0, 1.0)
 
-                    out_dev = _selected_output_device[0]
                     try:
-                        with sd.OutputStream(samplerate=TTS_SAMPLE_RATE, device=out_dev,
-                                             channels=1, dtype='float32',
-                                             blocksize=1024, callback=_cb):
+                        if tx_radio:
+                            _ptt_key()
+                            _t2.sleep(_ptt_prekey_s())
+                        # One retry after a short backoff — opening this stream
+                        # right as Radio Mode's own mic-input switch is also
+                        # initializing on the same physical AIOC USB device can
+                        # transiently fail at the CoreAudio level even though
+                        # the device itself is fine (confirmed live).
+                        # Construction + start both touch native PortAudio
+                        # stream lifecycle, so both happen under the shared
+                        # audio-open lock — but only briefly, not held for
+                        # the loop's whole (possibly long) playback duration.
+                        _stream = None
+                        for _attempt in (1, 2):
+                            try:
+                                with _audio_open_lock:
+                                    _stream = sd.OutputStream(samplerate=TTS_SAMPLE_RATE, device=out_dev,
+                                                              channels=1, dtype='float32',
+                                                              blocksize=1024, callback=_cb)
+                                    _stream.start()
+                                break
+                            except Exception as e:
+                                if _attempt == 1:
+                                    log.warning("Test loop stream open failed (%s) — retrying once", e)
+                                    _t2.sleep(0.8)
+                                    continue
+                                raise
+                        try:
                             while _headset_cal_loop[0]:
                                 _t2.sleep(0.05)
+                        finally:
+                            try: _stream.stop(); _stream.close()
+                            except Exception: pass
                     except Exception as e:
                         log.error("Test loop error: %s", e)
+                    finally:
+                        if tx_radio:
+                            _t2.sleep(_ptt_tail_s())
+                            try: _ptt_release()
+                            except Exception: pass
                 import threading as _tloop
                 _tloop.Thread(target=_loop, daemon=True).start()
-                _html(self, 200, "<p>Loop started.</p>")
+                _html(self, 200, f"<p>Loop started via {_loop_via}.</p>")
 
             elif self.path == "/speaker-cal/loop-stop":
                 _headset_cal_loop[0] = False
                 _html(self, 200, "<p>Loop stopped.</p>")
+
+            elif self.path == "/radio-mode":
+                import json as _json
+                sess = session_ref[0]
+                if _radio_profile_active[0]:
+                    _radio_profile_active[0] = False
+                    # Deliberate manual disable — don't let the hotplug
+                    # watcher immediately auto-re-enable it while the AIOC
+                    # is still connected; only a fresh unplug/replug clears this.
+                    _radio_auto_enable_suppressed[0] = True
+                    active = False
+                    prev = _radio_prev_input_device[0]
+                    _radio_prev_input_device[0] = None
+                    if sess is not None and prev is not None:
+                        threading.Thread(target=_switch_mic_stream, args=(sess, prev),
+                                          daemon=True).start()
+                    log.info("Radio Mode OFF — restoring input device %s", prev)
+                else:
+                    _found = _radio.find_radio_audio_devices()
+                    if _found and _found[1] is not None:
+                        _radio_prev_input_device[0] = _selected_input_device[0]
+                        _radio_profile_active[0] = True
+                        active = True
+                        if sess is not None:
+                            threading.Thread(target=_switch_mic_stream, args=(sess, _found[1]),
+                                              daemon=True).start()
+                        log.info("Radio Mode ON — switching input to AIOC audio-in (#%d)", _found[1])
+                    else:
+                        active = False   # no radio connected — can't turn on
+                resp = _json.dumps({"active": active}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path == "/echotest":
+                import json as _json
+                if _echotest_active[0]:
+                    _echotest_stop_flag[0] = True
+                    _echotest_active[0] = False
+                    log.info("EchoTest listener stopped")
+                else:
+                    _echotest_stop_flag[0] = False
+                    threading.Thread(target=_echotest_listener, args=(_echotest_stop_flag,),
+                                      daemon=True, name="echotest-listener").start()
+                    _echotest_active[0] = True
+                    log.info("EchoTest listener started")
+                resp = _json.dumps({"active": _echotest_active[0]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path.startswith("/radio-monitor"):
+                import json as _json, urllib.parse as _up
+                _qs = _up.parse_qs(_up.urlparse(self.path).query)
+                # Target by device NAME, not index — CoreAudio renumbers indices
+                # whenever a Bluetooth device connects/disconnects (confirmed:
+                # Mac mini Speakers alone shifted from #4 to #7 across one
+                # session), so a fixed index resolved at page-render time can
+                # already be stale by the time this request lands. sounddevice
+                # re-resolves a name string fresh against the live device list
+                # at stream-open time, which sidesteps the whole problem —
+                # verified: sd.query_devices('AW720H Chat', 'output') still
+                # finds it correctly even after other devices' indices moved.
+                _target = _qs.get("out", [None])[0]
+                if _target is not None:
+                    _target = _up.unquote(_target)
+                if _target is not None:
+                    # Per-device picker (Speakers table "Monitor" column): if this
+                    # exact device is already the active target, toggle off;
+                    # otherwise (re)start pointed at the newly-picked device.
+                    if _radio_monitor_active[0] and _radio_monitor_out_dev[0] == _target:
+                        _stop_radio_monitor()
+                        active = False
+                    else:
+                        if _radio_monitor_active[0]:
+                            _stop_radio_monitor()
+                            import time as _t9
+                            _t9.sleep(0.2)
+                        active = _start_radio_monitor(out_dev=_target)
+                elif _radio_monitor_active[0]:
+                    _stop_radio_monitor()
+                    active = False
+                else:
+                    active = _start_radio_monitor()
+                resp = _json.dumps({"active": active,
+                                     "out": (str(_radio_monitor_out_dev[0])
+                                             if _radio_monitor_out_dev[0] is not None else None)}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path in ("/dtmf-monitor", "/dtmf-train", "/dtmf-retrain"):
+                _script  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dtmf_monitor.py")
+                # Hardcoded venv path rather than deriving from sys.executable —
+                # this handler runs inside the launchd-spawned daemon process,
+                # whose sys.executable may not reflect what a plain `python3`
+                # on the user's own shell PATH resolves to, and this same
+                # string is shown to the user as a copy-pasteable command.
+                _python  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv", "bin", "python3")
+                _mode    = {"dtmf-monitor": "monitor", "dtmf-train": "train",
+                            "dtmf-retrain": "retrain"}[self.path.lstrip("/")]
+                _args    = {"monitor": "", "train": "--train", "retrain": "--retrain"}[_mode]
+                _titles  = {"monitor": "DTMF Monitor", "train": "DTMF Train", "retrain": "DTMF Retrain"}
+                _colors  = {"monitor": "#60a5fa", "train": "#f59e0b", "retrain": "#a78bfa"}
+                _profiles = {}
+                try:
+                    with open(os.path.expanduser("~/.openclaw/workspace/rtt_dtmf_profiles.json")) as _pf:
+                        _profiles = json.load(_pf)
+                except Exception:
+                    pass
+                # macOS has no xterm — open the CLI tool in Terminal.app via
+                # osascript instead (the launchd wrapper's DYLD_LIBRARY_PATH
+                # env is needed for `hid`, and training/retrain need a real
+                # tty for raw-keypress input, so run it through the login
+                # shell rather than as a bare Popen with captured stdio).
+                _cmd = f"DYLD_LIBRARY_PATH=/opt/homebrew/lib {_python} {_script} {_args}"
+                _launched = False
+                try:
+                    _osa = ('tell application "Terminal" to do script '
+                            + json.dumps(_cmd))
+                    subprocess.Popen(["osascript", "-e", _osa])
+                    _launched = True
+                except Exception:
+                    pass
+                _n = len(_profiles)
+                _prof_rows = "".join(
+                    f"<tr><td style='padding:3px 10px;font-weight:bold'>{_d}</td>"
+                    f"<td style='padding:3px 10px;'>{_p['row_hz']:.1f}</td>"
+                    f"<td style='padding:3px 10px;'>{_p['col_hz']:.1f}</td>"
+                    f"<td style='padding:3px 10px;'>{_p['samples']}</td></tr>"
+                    for _d, _p in sorted(_profiles.items())) if _profiles else ""
+                _prof_html = (f"<table style='border-collapse:collapse;font-size:13px;margin:10px 0;'>"
+                              f"<tr><th>Digit</th><th>Row Hz</th><th>Col Hz</th><th>Samples</th></tr>"
+                              f"{_prof_rows}</table>") if _prof_rows else "<p style='color:#475569'>No profiles trained yet.</p>"
+                _cmd_map = {"monitor": _cmd,
+                            "train":   _cmd,
+                            "retrain": _cmd}
+                _body = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>{_titles[_mode]} — RealTimeTalk</title>
+<style>body{{font-family:monospace;background:#07090f;color:#dde4ef;padding:20px;max-width:600px;}}
+h2{{color:{_colors[_mode]};}} a{{color:#38bdf8;text-decoration:none;}}
+table{{border:1px solid #1a2535;}} th{{background:#0d1119;padding:6px 12px;color:#64748b;}}
+.nav{{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;}}
+.nav a{{padding:5px 12px;border:1px solid #1a2535;border-radius:6px;font-size:13px;color:#64748b;}}
+.nav a.active{{color:{_colors[_mode]};border-color:{_colors[_mode]};}}
+.cmd{{background:#0d1119;border:1px solid #1a2535;padding:10px 14px;border-radius:6px;
+      font-size:14px;color:#34d399;margin:10px 0;display:flex;align-items:center;gap:10px;}}
+.copybtn{{padding:3px 10px;font-size:12px;border:1px solid #1a2535;border-radius:5px;
+          background:#0d1119;color:#64748b;cursor:pointer;font-family:monospace;white-space:nowrap;}}
+.copybtn:hover{{border-color:#34d399;color:#34d399;}}
+.copybtn.copied{{color:#34d399;border-color:#34d399;}}</style></head><body>
+<div class='nav'>
+  <a href='/calibration'>&larr; Calibration</a>
+  <a href='/dtmf-monitor' {'class="active"' if _mode=='monitor' else ''}>&#128225; Monitor</a>
+  <a href='/dtmf-train'   {'class="active"' if _mode=='train'   else ''}>&#9881; Train</a>
+  <a href='/dtmf-retrain' {'class="active"' if _mode=='retrain' else ''}>&#8635; Retrain</a>
+</div>
+<h2>{_titles[_mode]}</h2>
+<p>Profiles: <b>{_n} digit(s) trained</b>  |  File: <code style='font-size:11px'>~/.openclaw/workspace/rtt_dtmf_profiles.json</code></p>
+{_prof_html}
+<hr style='border-color:#1a2535;margin:14px 0;'>
+{'<p style="color:#34d399;">&#10003; Terminal.app launched</p>' if _launched else '<p style="color:#64748b;font-size:12px;">Could not open Terminal.app — run manually:</p>'}
+<div class='cmd'><span id='cmd'>{_cmd_map[_mode]}</span><button class='copybtn' onclick='copyCmd()'>Copy</button></div>
+<script>
+function copyCmd(){{
+  var t=document.getElementById('cmd').textContent;
+  navigator.clipboard.writeText(t).then(function(){{
+    var b=document.querySelector('.copybtn');
+    b.textContent='Copied!';b.classList.add('copied');
+    setTimeout(function(){{b.textContent='Copy';b.classList.remove('copied');}},1500);
+  }});
+}}
+</script>
+<p style='color:#475569;font-size:12px;margin-top:12px;'>
+Restart daemon after training to reload profiles.</p>
+</body></html>"""
+                _enc = _body.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(_enc)))
+                self.end_headers()
+                self.wfile.write(_enc)
 
             elif self.path.startswith("/speaker-cal/adjust"):
                 import json as _json, re as _re5, urllib.parse as _up
@@ -3762,19 +5303,36 @@ setInterval(upd, 2000);
             elif self.path == "/device-status":
                 import json as _json
                 try:
-                    # Query devices in a subprocess so PortAudio re-initialises and
-                    # picks up hot-plug changes (plugged/unplugged mics/speakers).
-                    _qr = subprocess.run(
-                        [sys.executable, "-c",
-                         "import sounddevice as sd, json;"
-                         "print(json.dumps([{'name':d['name'],"
-                         "'max_input_channels':d['max_input_channels'],"
-                         "'max_output_channels':d['max_output_channels']}"
-                         " for d in sd.query_devices()]))"],
-                        capture_output=True, text=True, timeout=5)
-                    _devs = _json.loads(_qr.stdout) if _qr.returncode == 0 else sd.query_devices()
+                    # Fresh subprocess query (shared, throttled helper) so
+                    # PortAudio re-initialises and picks up hot-plug changes
+                    # (plugged/unplugged mics/speakers) instead of relying
+                    # on this process's own cache.
+                    _devs = _query_devices_fresh() or sd.query_devices()
+                    # Resolve the selected index by NAME against this fresh
+                    # list rather than reusing the stored index directly —
+                    # confirmed live: after a device disconnects, other
+                    # devices can end up renumbered into its old array
+                    # position, so blindly trusting the stale index marks
+                    # the WRONG device as active instead of correctly
+                    # showing that the original one is just gone.
                     _out_idx = _selected_output_device[0]
-                    _in_idx  = _selected_input_device[0]
+                    if _out_idx is not None:
+                        try:
+                            _out_name = sd.query_devices(_out_idx)["name"]
+                            _out_idx = next((i for i, d in enumerate(_devs)
+                                             if d["name"] == _out_name and d["max_output_channels"] > 0),
+                                            None)
+                        except Exception:
+                            _out_idx = None
+                    _in_idx = _selected_input_device[0]
+                    if _in_idx is not None:
+                        try:
+                            _in_name = sd.query_devices(_in_idx)["name"]
+                            _in_idx = next((i for i, d in enumerate(_devs)
+                                            if d["name"] == _in_name and d["max_input_channels"] > 0),
+                                           None)
+                        except Exception:
+                            _in_idx = None
                     if _out_idx is None:
                         for _i, _d in enumerate(_devs):
                             if _d["max_output_channels"] > 0:
@@ -3809,6 +5367,10 @@ setInterval(upd, 2000);
                         "sinks":   _sinks,
                         "sources": _sources,
                         "alsa_cards": [],
+                        "monitor_active": _radio_monitor_active[0],
+                        "monitor_out": (str(_radio_monitor_out_dev[0])
+                                        if _radio_monitor_out_dev[0] is not None else None),
+                        "radio_available": bool(_radio.find_radio_audio_devices()),
                     }
                 except Exception as e:
                     data = {"error": str(e)}
@@ -3826,11 +5388,52 @@ setInterval(upd, 2000);
                 dev_name = _up.unquote(qs.get("name",[""])[0])
                 result   = {"ok": False, "msg": ""}
                 try:
-                    _dev_idx = int(dev_name)
-                    _devs    = sd.query_devices()
-                    if _dev_idx < 0 or _dev_idx >= len(_devs):
-                        raise ValueError(f"Device index {_dev_idx} out of range (0–{len(_devs)-1})")
-                    _dev_info = _devs[_dev_idx]
+                    # Resolve by NAME, not a raw index — confirmed live: the
+                    # Audio Devices table (built from a fresh subprocess
+                    # query) showed a speaker at one index, but this
+                    # handler's own in-process sd.query_devices() disagreed
+                    # on what was at that same index, rejecting a device the
+                    # UI had just shown as selectable. Two-step: validate the
+                    # name genuinely exists via the fresh (subprocess) list —
+                    # catches "device doesn't exist" correctly — then resolve
+                    # the index actually usable for opening streams IN THIS
+                    # PROCESS via _resolve_device_by_name (in-process). If
+                    # the fresh check confirms it exists but this process's
+                    # own cache still doesn't see it, that's the same
+                    # staleness _watch_mic_stream's recovery already handles
+                    # — reinit once and retry the in-process resolution.
+                    # Backward-compatible: if dev_name still looks like a
+                    # bare index (older cached page / manual URL), accept it
+                    # directly instead.
+                    _kind = "output" if dev_type == "sink" else "input"
+                    _ch_key = "max_output_channels" if dev_type == "sink" else "max_input_channels"
+                    _dev_idx = None
+                    if dev_name.lstrip("-").isdigit():
+                        _i = int(dev_name)
+                        _devs = sd.query_devices()
+                        if 0 <= _i < len(_devs) and _devs[_i].get(_ch_key, 0) > 0:
+                            _dev_idx = _i
+                            dev_name = _devs[_i]["name"]
+                    else:
+                        _fresh = _query_devices_fresh()
+                        _exists = bool(_fresh) and any(
+                            _d.get("name") == dev_name and _d.get(_ch_key, 0) > 0 for _d in _fresh)
+                        if _exists:
+                            _dev_idx = _resolve_device_by_name(dev_name, _kind)
+                            if _dev_idx is None:
+                                log.info("device-set: %r confirmed present but not in this "
+                                         "process's cache — reinitializing PortAudio", dev_name)
+                                try:
+                                    with _audio_open_lock:
+                                        sd._terminate()
+                                        sd._initialize()
+                                except Exception as exc:
+                                    log.warning("device-set: PortAudio reinit failed: %s", exc)
+                                _dev_idx = _resolve_device_by_name(dev_name, _kind)
+                    if _dev_idx is None:
+                        raise ValueError(f"Device {dev_name!r} not found or has no "
+                                          f"{'output' if dev_type == 'sink' else 'input'} channels")
+                    _dev_info = sd.query_devices(_dev_idx)
                     if dev_type == "sink":
                         if _dev_info["max_output_channels"] < 1:
                             raise ValueError(f"Device {_dev_idx} has no output channels")
@@ -3967,12 +5570,13 @@ setInterval(upd, 2000);
                         f'if(b)b.remove();}},5000);</script>'
                     )
                     _device_change_msg[0] = ""
-                elif _owner_only[0] and not _verification_available():
+                elif _owner_only[0] and not _verification_available(_current_input_device_name()):
                     device_banner = (
                         '<div id="dbanner" style="background:#3a1500;border:1px solid #7a3000;'
                         'color:#f59e0b;padding:3px 8px;border-radius:8px;">'
-                        '&#9888; Owner-only requested but no voice profile/model &mdash; '
-                        'accepting ALL speakers. <a href="/voice-enroll" style="color:#f59e0b">Enroll</a></div>'
+                        f'&#9888; Owner-only requested but no voice profile for '
+                        f'{_current_input_device_name()!r} &mdash; accepting ALL speakers on it. '
+                        '<a href="/voice-enroll" style="color:#f59e0b">Enroll</a></div>'
                     )
                 else:
                     device_banner = ""
@@ -3981,7 +5585,7 @@ setInterval(upd, 2000);
                 monitoring = sess._monitoring if sess else False
                 multilang  = sess._multilang if sess else "off"
                 owner_only = _owner_only[0]
-                enrolled   = _owner_profile[0] is not None
+                enrolled   = _current_input_device_name() in _owner_profiles
 
                 # Per-button hints shown in the hint-zone on hover (state-aware)
                 _ml_desc = {
@@ -4095,8 +5699,8 @@ body{{font-family:'Outfit',system-ui,sans-serif;font-size:16px;background:var(--
 .hrow{{display:flex;align-items:center;gap:8px;margin-bottom:8px;}}
 .brand{{font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;color:var(--tx);letter-spacing:.08em;text-transform:uppercase;}}
 .spill{{margin-left:10px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:5px 14px;border-radius:20px;border:2px solid transparent;white-space:nowrap;}}
-.nav{{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:7px;}}
-a.btn{{display:inline-flex;align-items:center;gap:3px;padding:7px 14px;border-radius:8px;font-family:'Outfit',sans-serif;font-size:14px;font-weight:500;color:var(--mu);background:var(--sf2);border:1px solid var(--bd);text-decoration:none;min-height:36px;white-space:nowrap;transition:background .12s,border-color .12s,color .12s;}}
+.nav{{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:7px;}}
+a.btn{{display:inline-flex;align-items:center;gap:3px;padding:5px 9px;border-radius:7px;font-family:'Outfit',sans-serif;font-size:12px;font-weight:500;color:var(--mu);background:var(--sf2);border:1px solid var(--bd);text-decoration:none;min-height:28px;white-space:nowrap;transition:background .12s,border-color .12s,color .12s;}}
 a.btn:hover{{background:#1e2d3d;border-color:var(--you);color:var(--you);}}
 a.btn.on{{background:var(--gnb);border-color:var(--gn);color:var(--gn);}}
 a.btn.on:hover{{background:#053d20;border-color:var(--gn);color:#fff;}}
@@ -4117,8 +5721,8 @@ a.irupt{{color:var(--rd);background:var(--rdb);border:1px solid var(--rd);border
 a.irupt:hover{{background:var(--rd);color:#fff;}}
 a.cont{{color:var(--gn);background:var(--gnb);border:1px solid var(--gn);border-radius:4px;padding:2px 8px;font-size:.82em;font-style:normal;text-decoration:none;margin-left:8px;}}
 a.cont:hover{{background:var(--gn);color:#000;}}
-@media(max-width:520px){{body{{font-size:15px;}}#top{{padding:10px 12px 8px;}}a.btn{{padding:9px 13px;min-height:42px;font-size:14px;}}#dp{{font-size:12px;}}#log{{padding:8px 10px;}}}}
-@media(min-width:900px){{body{{font-size:17px;}}#top{{padding:14px 24px 10px;}}a.btn{{font-size:15px;padding:8px 16px;min-height:38px;}}#dp{{font-size:13px;}}#log{{padding:14px 24px;}}}}
+@media(max-width:520px){{body{{font-size:15px;}}#top{{padding:10px 12px 8px;}}a.btn{{padding:5px 8px;font-size:11px;}}#dp{{font-size:12px;}}#log{{padding:8px 10px;}}}}
+@media(min-width:900px){{body{{font-size:17px;}}#top{{padding:14px 24px 10px;}}a.btn{{font-size:13px;padding:6px 12px;}}#dp{{font-size:13px;}}#log{{padding:14px 24px;}}}}
 </style></head><body>
 <div id="top">
 <div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" style="margin-left:10px;" data-hint="{_hints['calibrate']}">&#9999; Calibrate</a></div>
@@ -4149,7 +5753,8 @@ setInterval(function(){{
                 active = sess._active if sess else False
                 body = json.dumps({"status": "running", "voice": "active" if active else "silent",
                                    "owner_mode": "owner-only" if _owner_only[0] else "everyone",
-                                   "enrolled": _owner_profile[0] is not None,
+                                   "enrolled_devices": sorted(_owner_profiles),
+                                   "current_device": _current_input_device_name(),
                                    "spk_threshold": _spk_threshold[0]}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type",   "application/json")
@@ -4209,6 +5814,9 @@ async def main(http_port: int, input_device=None, output_device=None,
 
     session_ref: list = [None]
     start_http_server(http_port, lambda: loop.call_soon_threadsafe(stop_event.set), session_ref, loop=loop)
+    _threading.Thread(target=_radio_hotplug_watcher, args=(session_ref,), daemon=True, name="radio-hotplug").start()
+    _threading.Thread(target=_echotest_worker, daemon=True, name="echotest-worker").start()
+    _threading.Thread(target=_radio_rx_tap_watchdog, daemon=True, name="radio-rx-tap-watchdog").start()
     log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say 'Zeebot wake up' to activate)")
 
     # Restore sleep state persisted across daemon/service restarts (e.g. mic device change).
@@ -4217,18 +5825,18 @@ async def main(http_port: int, input_device=None, output_device=None,
         _sleep_requested[0] = True
         log.info("Restored sleep state from disk — waiting for wake signal…")
 
-    # Speaker verification: restore mode/threshold and the enrolled profile.
+    # Speaker verification: restore mode/threshold and all per-device profiles.
     _load_voice_mode()
     if _spk_threshold_cli[0] is not None:
         _spk_threshold[0] = _spk_threshold_cli[0]
-    enrolled = _load_voice_profile()
+    _load_voice_profiles()
     if not _HAVE_SHERPA or not os.path.exists(SPK_MODEL_PATH):
         log.info("Speaker verification: disabled — %s",
                  "sherpa-onnx not installed" if not _HAVE_SHERPA else "model file missing")
     else:
         log.info("Speaker verification: %s, %s, threshold %.2f",
                  "owner-only" if _owner_only[0] else "everyone mode",
-                 f"enrolled {len(_owner_profile[0]['samples'])} sample(s)" if enrolled else "no profile",
+                 f"{len(_owner_profiles)} device(s) enrolled" if _owner_profiles else "no profiles",
                  _spk_threshold[0])
         # Pre-warm the extractor so the first utterance isn't slow.
         _threading.Thread(target=_get_spk_extractor, daemon=True, name="spk-prewarm").start()

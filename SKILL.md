@@ -7,8 +7,8 @@ description: >
   and synthesises replies with ElevenLabs multilingual v2 (Chinese/mixed),
   OpenAI TTS (English/fallback), and macOS `say` (offline last resort).
   Voice activation: "Zeebot wake up" (asks "Yes?" for confirmation) / "Zeebot
-  go to sleep". Optional owner-only mode gates all voice on an enrolled
-  speaker profile (sherpa-onnx + 3D-Speaker CAM++ zh-en).
+  go to sleep". Optional owner-only mode gates all voice on a speaker
+  profile enrolled per input device (sherpa-onnx + 3D-Speaker CAM++ zh-en).
 ---
 
 # RealTimeTalk Mac — Skill Guide
@@ -100,18 +100,27 @@ _enqueue_mic(data)               # every _mic_cb path funnels here
 _verify_speaker(transcript)
   └─ segment = self._pop_segment()        # FIFO pop, matches transcript order
   └─ if not _owner_only[0]: return True   # gate is a no-op unless enabled
+  └─ device_key = _current_input_device_name()   # per-device profile selection
   └─ emb = _compute_embedding(segment, SAMPLE_RATE)   # 24k→16k resample, sherpa-onnx
-  └─ score = _owner_score(emb)            # max cosine vs profile mean + samples
+  └─ score = _owner_score(emb, device_key)   # max cosine vs THIS device's profile mean + samples
   └─ score >= _spk_threshold[0]           # pass/reject, always logged
 ```
 
+Profiles are keyed by input device name (`_owner_profiles: dict`), not a
+single global profile — same `dict-keyed-by-device-name` pattern as
+`_cal_store` for speaker calibration. `_current_input_device_name()`
+resolves the stable key from `_selected_input_device[0]` (no index suffix,
+survives hot-plug reordering).
+
 Module-level functions (pure Python/numpy, no platform dependency —
 `RealTimeTalk-daemon.py:899` area): `_get_spk_extractor` (lazy singleton),
-`_resample_to_16k`, `_compute_embedding`, `_cosine`, `_owner_score`,
-`_load_voice_profile`/`_save_voice_profile`, `_load_voice_mode`/`_save_voice_mode`,
-`_verification_available`, `_record_pcm_blocking` (enrollment/test recording
-via a second `sd.rec()` stream — see README's "Known limitations" for the
-concurrent-stream caveat on some USB mics).
+`_resample_to_16k`, `_compute_embedding`, `_cosine`, `_owner_score(emb, device_key)`,
+`_load_voice_profiles`/`_save_voice_profile(samples, device_key)`,
+`_read_voice_profiles_raw` (on-disk dict, full per-sample metadata),
+`_load_voice_mode`/`_save_voice_mode`, `_verification_available(device_key)`,
+`_record_pcm_blocking` (enrollment/test recording via a second `sd.rec()`
+stream — see README's "Known limitations" for the concurrent-stream caveat
+on some USB mics).
 
 New HTTP endpoints: `/ownermode[/on|/off]`, `/ownermode/threshold?value=N`,
 `/voice-enroll[/record|/save|/test|/clear]`. State persists to

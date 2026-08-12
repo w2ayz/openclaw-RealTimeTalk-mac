@@ -33,7 +33,7 @@ echo
 # ── 1. Homebrew dependencies ─────────────────────────────────────────────────
 
 echo "Checking Homebrew dependencies..."
-for pkg in portaudio ffmpeg node; do
+for pkg in portaudio ffmpeg node hidapi; do
     if brew list "$pkg" >/dev/null 2>&1; then
         green "  ✓ $pkg installed"
     else
@@ -59,7 +59,7 @@ if [[ ! -x "$VENV_PY" ]]; then
     echo "Creating Python venv at $VENV_DIR..."
     /usr/bin/python3 -m venv "$VENV_DIR"
 fi
-echo "Installing Python deps (sounddevice, websockets, numpy, zhconv)..."
+echo "Installing Python deps (see requirements.txt)..."
 "$VENV_PY" -m pip install --quiet --upgrade pip
 "$VENV_PY" -m pip install --quiet -r "$SKILL_DIR/requirements.txt"
 green "  ✓ venv ready"

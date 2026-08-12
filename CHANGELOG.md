@@ -1,5 +1,134 @@
 # Changelog
 
+## [3.9.1] — 2026-08-12
+
+Radio Mode — the AIOC ham-radio dongle support explicitly deferred in
+3.8.0's "Not ported this round". Digirig Mobile is not included: its CM108
+codec reports a generic product string that collides with unrelated USB
+mics, needing IOKit-based USB topology correlation to disambiguate that
+this port doesn't attempt (see `radio_interfaces.py`'s module docstring).
+
+### Added
+- **Radio Mode.** Toggle on the Calibrate page routes STT input from the
+  AIOC's audio-in and TTS replies out over the AIOC's audio-out, keyed by
+  PTT (DTR line). Auto-enables on AIOC plug-in and auto-disables on
+  unplug, with a manual override that sticks until the next unplug/replug
+  cycle. New files: `radio_interfaces.py` (interface registry, PTT/audio
+  device resolution, `SquelchTracker`), `dtmf_monitor.py` (standalone
+  DTMF Mon/Train/Retrain CLI, launched from the dashboard).
+- **Radio-aware AGC.** Radio Mode routes mic capture through the numpy
+  RMS+tanh leveler instead of WebRTC AGC — `webrtc_noise_gain`'s Mac
+  binding has no per-effect toggles to replicate Pi's PipeWire config
+  (disabling VAD/transient-suppression/AEC for radio audio), and the
+  leveler sidesteps the problem by not having those effects to begin with.
+- **Monitor.** Live RX passthrough (radio audio in → any speaker), with a
+  per-device picker in the Audio Devices table. Software gain (AIOC's RX
+  output measures ~-48dBFS idle).
+- **EchoTest.** Detects an incoming transmission via squelch, records it,
+  replays it back on-air via PTT.
+- **DTMF Mon/Train/Retrain**, ported from Pi's `dtmf_monitor.py` —
+  Goertzel tone detection against learned per-digit profiles, launched in
+  Terminal.app from the Calibrate page.
+- **Radio Voice Profile.** Dedicated enrollment section (separate from the
+  per-device flow generalized in 3.8.0) that records directly from the
+  AIOC regardless of which device is currently selected for the main mic
+  — matches Pi's fixed Mic/Radio layout without requiring a device switch
+  first.
+- Play Test loop routes over PTT when Radio Mode is on, or to the
+  Monitor's current target when Monitor is on, matching Pi's priority
+  order.
+
+### Fixed
+- `_record_pcm_blocking` (voice enrollment/test) never passed an explicit
+  `device=` to `sd.rec()`, so it silently used the OS-wide default input
+  regardless of Radio Mode's input switch.
+- Output device selection (`/device-set`, the device status panel) trusted
+  a raw CoreAudio index that isn't stable across reinit/hot-plug cycles —
+  AIOC's identically-named input/output entries made this concretely
+  wrong (an output stream landing on the input-only entry, 0 channels).
+  Resolution is now name-based, verified against a fresh subprocess device
+  query rather than this process's own cache, which does not reliably
+  notice a device has disconnected.
+- A cluster of PortAudio/CoreAudio concurrency issues surfaced by Radio
+  Mode's background watchdogs, consolidated behind one process-wide
+  reentrant lock (`_audio_open_lock`) around every native stream
+  open/close and `sd._terminate()`/`_initialize()` call: concurrent reinit
+  from two independent recovery loops (segfault), a resource leak from an
+  earlier fix that skipped cleanup on a vanished device (which then
+  permanently blocked reopening), and an 8s startup grace period so the
+  hot-plug watcher's auto-enable can't race the session's own first mic
+  stream.
+
+### Known limitations
+- The AIOC HID config protocol (`detect_hw_variant`, hardware-revision
+  labeling) needs `DYLD_LIBRARY_PATH` set at process launch for the `hid`
+  package's native loader — included in the LaunchAgent plist template,
+  but `DYLD_LIBRARY_PATH` set via `os.environ` *after* process start does
+  not retroactively affect ctypes' library search, so a wrapper binary
+  that execs the daemon with its own stripped environment (rather than
+  the plist's `ProgramArguments` launching the daemon directly) will not
+  pick this up. Cosmetic only — PTT/audio routing/DTMF do not depend on it.
+
+## [3.8.0] — 2026-07-29
+
+Version number tracks the Pi release this port draws from, same convention
+as every previous Mac bump. Pi caught up fast (v3.0.1 → v3.9.1 in 9 days),
+almost entirely built around a new Radio Mode hardware layer — this release
+covers the Pi v3.8.0 concepts, generalized. Pi v3.8.0's own headline feature
+was "separate voice profile for Radio mode"; Mac has no radio hardware, but
+the underlying problem (a voice embedding enrolled on one audio path not
+matching reliably on a different one) applies just as much to switching
+between a USB mic, a Bluetooth headset, or an iPhone Continuity mic. Plus
+the two other Pi v3.8.0 improvements, which port directly as-is. The rest of
+Pi's v3.1.0-v3.9.1 range (Radio Mode itself: AIOC/Digirig, PTT, DTMF,
+EchoTest) is intentionally not in this release — see "Not ported" below.
+
+### Added
+- **Per-device voice profiles.** Owner-only verification now supports an
+  enrolled profile *per input device* instead of exactly one — generalizes
+  Pi's `radio: bool` parameter (mic vs. radio) to an arbitrary device-name
+  key, following the same dict-keyed-by-device-name pattern Mac's speaker
+  calibration already uses (`_cal_store`). `_verify_speaker` resolves which
+  profile to score against from whichever input device is currently active,
+  automatically — no manual mode switch needed.
+- `/voice-enroll` now always enrolls/tests against the currently active
+  input device (labeled by name) and lists any other already-enrolled
+  devices with a per-device Clear button, instead of a fixed two-profile
+  (mic/radio) layout.
+- Dashboard fail-open banner and the Calibrate page's Voice ID button both
+  name the specific device that's missing a profile, rather than a generic
+  "no profile" message.
+- `/status` reports `enrolled_devices: [...]` and `current_device` instead
+  of a single `enrolled` bool.
+- One-time migration: the old single-profile file
+  (`rtt_voice_profile.json`) is adopted into the new per-device store
+  (`rtt_voice_profiles.json`) under whichever input device is active at
+  first boot after this update, then archived as `.migrated` rather than
+  deleted.
+- **Continuous echo-coupling tracking during TTS playback** (Pi v3.8.0):
+  the self-interrupt threshold used to be frozen from a 1-second guard
+  window at the start of each reply; it now keeps an EMA of the
+  output/mic coupling ratio for the whole reply, so a long or unevenly-loud
+  response doesn't drift out of range of a threshold set from its first
+  second. Ticks that already look like a real barge-in are excluded from
+  the running estimate. New `SPEAK_COUPLING_EMA = 0.15` constant.
+
+### Changed
+- **Compact dashboard nav** (Pi v3.8.0 CSS): nav button padding/font-size
+  trimmed across all breakpoints so the full button row (Wake, Sleep,
+  Monitor, Multi-lang, Owner Only, Clear Log, Restart, Gateway Reset)
+  reliably fits on one line instead of occasionally wrapping — Mac hit the
+  same width problem Pi did once Owner Only was added.
+
+### Not ported this round
+The rest of Pi's v3.1.0-v3.9.1 range is the Radio Mode hardware layer
+(AIOC/Digirig ham-radio dongles, PTT, DTMF, EchoTest) — scoped separately;
+see the project plan for the macOS port's open risks (Digirig's audio
+device disambiguates cleanly on Linux via ALSA `usbid`, with no direct
+macOS equivalent yet) before that lands.
+
+---
+
 ## [3.0.1] — 2026-07-20
 
 ### Changed
