@@ -161,6 +161,14 @@ ECHOTEST_COOLDOWN_S  = 2.0   # after transmitting a replay on-air, ignore new se
                               # own TX bleeding into RX would otherwise re-trigger capture immediately
 ECHOTEST_COS_TAIL_S  = 0.5   # squelch/COS hold-open seconds
 
+# Devices that report valid output channels to CoreAudio/sounddevice but
+# aren't real, usable speakers — confirmed live: "LG ULTRAWIDE" (an HDMI
+# monitor's phantom audio endpoint) produces no audible output at all, on
+# this user's hardware, despite passing every channel-count check. Auto
+# fallback-selection logic must skip these explicitly, or a disconnect
+# elsewhere can silently pick one as the new "working" output device.
+INVALID_OUTPUT_DEVICES = {"LG ULTRAWIDE"}
+
 # Compat alias — many places still reference ALSA_OUTPUT; on Mac it's a no-op label
 ALSA_OUTPUT       = "coreaudio:default"
 
@@ -1041,9 +1049,11 @@ def _fresh_device_label_and_resync(dev_ref: list, kind: str) -> str:
     # Named device isn't in the fresh list at all — it's genuinely gone.
     # Fall back to whatever fresh device is capable in the requested
     # direction and resync to that, so the daemon stops pointing at
-    # vanished hardware instead of just mislabeling it.
+    # vanished hardware instead of just mislabeling it. Skip known-bad
+    # devices (INVALID_OUTPUT_DEVICES) — passing the channel-count check
+    # doesn't mean the device actually produces audible output.
     for i, d in enumerate(fresh):
-        if d.get(ch_key, 0) > 0:
+        if d.get(ch_key, 0) > 0 and d.get("name") not in INVALID_OUTPUT_DEVICES:
             dev_ref[0] = i
             return f"{d['name']} (#{i}) — replaced {stale_name!r}, disconnected"
     return f"{stale_name} (disconnected, no replacement found)"
@@ -5335,7 +5345,7 @@ Restart daemon after training to reload profiles.</p>
                             _in_idx = None
                     if _out_idx is None:
                         for _i, _d in enumerate(_devs):
-                            if _d["max_output_channels"] > 0:
+                            if _d["max_output_channels"] > 0 and _d["name"] not in INVALID_OUTPUT_DEVICES:
                                 _out_idx = _i; break
                     if _in_idx is None:
                         for _i, _d in enumerate(_devs):
