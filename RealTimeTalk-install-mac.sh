@@ -107,19 +107,23 @@ echo
 
 read -r -p "Input device index  [Enter for system default]: " IN_DEV
 read -r -p "Output device index [Enter for system default]: " OUT_DEV
+read -r -p "Agent name          [Enter for default 'Zeebot']: " AGENT_NAME_ARG
+read -r -p "Wake phrase         [Enter for '<name> wake up']: " WAKE_PHRASE_ARG
 
 EXTRA_ARGS=()
-if [[ -n "$IN_DEV" ]]; then EXTRA_ARGS+=("--input-device" "$IN_DEV"); fi
-if [[ -n "$OUT_DEV" ]]; then EXTRA_ARGS+=("--output-device" "$OUT_DEV"); fi
+if [[ -n "$IN_DEV" ]];         then EXTRA_ARGS+=("--input-device"  "$IN_DEV");         fi
+if [[ -n "$OUT_DEV" ]];        then EXTRA_ARGS+=("--output-device" "$OUT_DEV");        fi
+if [[ -n "$AGENT_NAME_ARG" ]]; then EXTRA_ARGS+=("--agent-name"    "$AGENT_NAME_ARG"); fi
+if [[ -n "$WAKE_PHRASE_ARG" ]]; then EXTRA_ARGS+=("--wake-phrase"  "$WAKE_PHRASE_ARG"); fi
 
 # ── 6. Render and install LaunchAgent plist ──────────────────────────────────
 
 mkdir -p "$HOME/Library/LaunchAgents"
 mkdir -p /tmp/openclaw
 
-# Build ProgramArguments XML fragment with optional device flags
+# Build ProgramArguments XML fragment with optional flags
 EXTRA_XML=""
-for arg in "${EXTRA_ARGS[@]}"; do
+for arg in "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"; do
     EXTRA_XML+="        <string>${arg}</string>
 "
 done

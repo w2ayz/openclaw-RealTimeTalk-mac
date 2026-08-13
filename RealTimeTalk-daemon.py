@@ -26,7 +26,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.9.1"
+__version__ = "3.9.2"
 
 import argparse
 import asyncio
@@ -1369,6 +1369,8 @@ CALIBRATE_PHRASES = {
     "mic calibration", "microphone calibration",
     "adjust mic for noise", "adjust microphone for noise",
 }
+
+AGENT_NAME = "Zeebot"  # overridden at startup by --agent-name
 
 TRANSCRIPTION_PROMPT = "Zeebot."  # teaches name spelling only; too short to hallucinate as a command
 TRANSCRIPTION_PROMPT_NORM = "zeebot"
@@ -3265,7 +3267,7 @@ class RealtimeSession:
                 self._busy.set()
                 try:
                     await asyncio.get_running_loop().run_in_executor(
-                        None, speak, "Going silent now. Say Zeebot wake up to resume.", self.alsa_output
+                        None, speak, f"Going silent now. Say {AGENT_NAME} wake up to resume.", self.alsa_output
                     )
                 finally:
                     _busy_clear()
@@ -3566,7 +3568,7 @@ class RealtimeSession:
                     },
                 },
             }))
-            log.info("Session active — speak now (routed through Zeebot / OpenClaw)")
+            log.info("Session active — speak now (routed through %s / OpenClaw)", AGENT_NAME)
 
             import time as _rt
             with _audio_open_lock:
@@ -4052,10 +4054,10 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
 <h3 style="margin-top:20px;">Radio Voice Profile</h3>
 <p class="info">{_radio_status_line}</p>
 <div class="card"><b>Sample 1 — English</b>
-<p class="info">Read aloud: &ldquo;Zeebot wake up. Please check my calendar and read me the news for today.&rdquo;</p>
+<p class="info">Read aloud: &ldquo;{AGENT_NAME} wake up. Please check my calendar and read me the news for today.&rdquo;</p>
 <button onclick="recRadio(this,'1','en')">&#9210; Record 5s</button> <span id="rs1"></span></div>
 <div class="card"><b>Sample 2 — Chinese</b>
-<p class="info">Read aloud: &ldquo;Zeebot 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
+<p class="info">Read aloud: &ldquo;{AGENT_NAME} 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
 <button onclick="recRadio(this,'2','zh')">&#9210; Record 5s</button> <span id="rs2"></span></div>
 <div class="card"><b>Sample 3 — free speech</b>
 <p class="info">Speak naturally for 5 seconds — mix English and Chinese if you like.</p>
@@ -4099,10 +4101,10 @@ a{{color:var(--you)}} .meter{{height:8px;background:#121925;border-radius:4px;ov
 <p class="info">Targets whichever input device is currently active — {current_device}.
 Switch devices (Calibrate page) before recording to enroll a different one.</p>
 <div class="card"><b>Sample 1 — English</b>
-<p class="info">Read aloud: &ldquo;Zeebot wake up. Please check my calendar and read me the news for today.&rdquo;</p>
+<p class="info">Read aloud: &ldquo;{AGENT_NAME} wake up. Please check my calendar and read me the news for today.&rdquo;</p>
 <button onclick="rec(this,'1','en')">&#9210; Record 5s</button> <span id="s1"></span></div>
 <div class="card"><b>Sample 2 — Chinese</b>
-<p class="info">Read aloud: &ldquo;Zeebot 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
+<p class="info">Read aloud: &ldquo;{AGENT_NAME} 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
 <button onclick="rec(this,'2','zh')">&#9210; Record 5s</button> <span id="s2"></span></div>
 <div class="card"><b>Sample 3 — free speech</b>
 <p class="info">Speak naturally for 5 seconds — mix English and Chinese if you like.</p>
@@ -5641,7 +5643,7 @@ Restart daemon after training to reload profiles.</p>
                     if e["role"] == "you":
                         rows += f'<div class="you">{ts_span}<b>You:</b> {e["text"]}</div>'
                     elif e["role"] == "zeebot":
-                        rows += f'<div class="zeebot">{ts_span}<b>Zeebot:</b> {e["text"]}</div>'
+                        rows += f'<div class="zeebot">{ts_span}<b>{AGENT_NAME}:</b> {e["text"]}</div>'
                     elif e["role"] == "monitor":
                         rows += f'<div class="mon">{ts_span}{e["text"]}</div>'
                     elif e["role"] == "thinking":
@@ -5650,7 +5652,7 @@ Restart daemon after training to reload profiles.</p>
                         if dur is None:
                             # Still waiting — live counter + interrupt button
                             rows += (f'<div class="thinking">{ts_span}'
-                                     f'Zeebot is thinking... '
+                                     f'{AGENT_NAME} is thinking... '
                                      f'<span class="tctr" data-start="{ep:.3f}">0</span>s'
                                      f' &nbsp;<a href="/interrupt" class="irupt">✕ Interrupt</a></div>')
                         # else: Zeebot replied — hide this line entirely
@@ -5687,7 +5689,7 @@ Restart daemon after training to reload profiles.</p>
                        }.get(state, ("#141d2b","#64748b"))
                 state_pill_style = f"background:{_sc[0]};color:{_sc[1]};border-color:{_sc[1]};"
                 speaking_banner = (
-                    '<div class="speaking">&#128266; Zeebot is speaking&hellip;'
+                    f'<div class="speaking">&#128266; {AGENT_NAME} is speaking&hellip;'
                     ' &nbsp;<a href="/interrupt" class="irupt">&#10005; Stop</a></div>'
                     if speaking else
                     '<div class="speaking">&#9646;&#9646; Paused'
@@ -5827,7 +5829,7 @@ async def main(http_port: int, input_device=None, output_device=None,
     _threading.Thread(target=_radio_hotplug_watcher, args=(session_ref,), daemon=True, name="radio-hotplug").start()
     _threading.Thread(target=_echotest_worker, daemon=True, name="echotest-worker").start()
     _threading.Thread(target=_radio_rx_tap_watchdog, daemon=True, name="radio-rx-tap-watchdog").start()
-    log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say 'Zeebot wake up' to activate)")
+    log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say '%s wake up' to activate)", AGENT_NAME)
 
     # Restore sleep state persisted across daemon/service restarts (e.g. mic device change).
     if _load_sleep_state():
@@ -5944,11 +5946,41 @@ if __name__ == "__main__":
                    help=f"Noise gate threshold — pre-gain peak below this → silence (default: {MIC_GATE_PEAK})")
     p.add_argument("--spk-threshold",   type=float, default=None,
                    help=f"Speaker-verification cosine threshold override (default: {SPK_THRESHOLD_DEFAULT})")
+    p.add_argument("--agent-name",      type=str, default="Zeebot",
+                   help="Agent name used in wake/sleep phrases and UI (default: Zeebot)")
+    p.add_argument("--wake-phrase",     type=str, default=None,
+                   help="Primary wake phrase override (default: '<name> wake up')")
     p.add_argument("--list-devices",    action="store_true",
                    help="Print available CoreAudio devices and exit")
     p.add_argument("--calibrate",       action="store_true",
                    help="Measure ambient noise and print recommended --mic-gate value, then exit")
     args = p.parse_args()
+
+    # --- Agent name / wake phrase configuration ---
+    _agent_name    = args.agent_name.strip()
+    _agent_name_lc = _agent_name.lower()
+    _wake_primary  = args.wake_phrase.strip().lower() if args.wake_phrase else f"{_agent_name_lc} wake up"
+
+    AGENT_NAME                = _agent_name
+    TRANSCRIPTION_PROMPT      = f"{_agent_name}."
+    TRANSCRIPTION_PROMPT_NORM = _agent_name_lc
+
+    WAKE_PHRASES  = {_wake_primary, "real time talk on", "real-time talk on", "realtimetalk on"}
+    if args.wake_phrase:
+        WAKE_PHRASES.add(f"{_agent_name_lc} wake up")  # keep name-derived phrase alongside custom one
+    SLEEP_PHRASES = {f"{_agent_name_lc} go to sleep",
+                     "real time talk off", "real-time talk off", "realtimetalk off"}
+
+    _n = _agent_name_lc
+    MONITOR_ON_PHRASES  = ({p for p in MONITOR_ON_PHRASES  if not p.startswith("zeebot ")} |
+                           {f"{_n} start monitoring", f"{_n} monitor on", f"{_n} monitoring on",
+                            f"{_n} start monitor",    f"{_n} begin monitoring"})
+    MONITOR_OFF_PHRASES = ({p for p in MONITOR_OFF_PHRASES if not p.startswith("zeebot ")} |
+                           {f"{_n} stop monitoring",  f"{_n} monitor off", f"{_n} monitoring off",
+                            f"{_n} stop monitor",     f"{_n} end monitoring"})
+    CONTINUE_PHRASES       = {p for p in CONTINUE_PHRASES       if p != "zeebot continue"}       | {f"{_n} continue"}
+    OWNER_ONLY_ON_PHRASES  = {p for p in OWNER_ONLY_ON_PHRASES  if p != "zeebot only listen to me"}  | {f"{_n} only listen to me"}
+    OWNER_ONLY_OFF_PHRASES = {p for p in OWNER_ONLY_OFF_PHRASES if p != "zeebot listen to everyone"} | {f"{_n} listen to everyone"}
 
     if args.list_devices:
         devs = _list_audio_devices()

@@ -1,5 +1,7 @@
 # Mac Deployment Guide
 
+> **RealTimeTalk v3.9.2** — for the full change history see [CHANGELOG.md](CHANGELOG.md).
+
 Step-by-step reference for installing RealTimeTalk on a Mac (Mac Mini or
 any Mac with CoreAudio). Written to be followed by someone who hasn't seen
 this repo before. For a feature overview, see [README.md](README.md); for
@@ -27,7 +29,7 @@ internals, see [SKILL.md](SKILL.md).
 | `hidapi` | `brew install hidapi` (installer does this too) — only needed for Radio Mode's AIOC hardware-revision detection; everything else works without it |
 | `librsvg` | `brew install librsvg` (the wrapper-build script does this too) — only needed to render `ZeebotTalk.app`'s icon; the wrapper still builds fine without it, just with the generic default icon |
 | Python 3.9+ | System Python from Command Line Tools is fine |
-| The [Edge TTS skill](https://github.com/w2ayz/openclaw-edge-tts) | Must already be installed at `~/.openclaw/workspace/skills/edge-tts/` |
+| Edge TTS skill | Must be installed at `~/.openclaw/workspace/skills/edge-tts/` before running the installer. See §3.5. |
 
 ### Hardware
 
@@ -85,21 +87,68 @@ safe to delete to reset that specific piece of state:
 
 ## 3. Adding API keys
 
-Edit (or create) `~/.openclaw/openclaw.json`:
+Use the Python one-liner below — it merges safely into the existing JSON
+without disturbing other keys, and avoids the character-corruption risk
+of hand-editing a long API key:
 
-```json
-{
-  "talk": {
-    "providers": {
-      "openai":     { "apiKey": "sk-..." },
-      "elevenlabs": { "apiKey": "..." }
-    }
-  }
-}
+```bash
+python3 - <<'PY'
+import json, sys
+
+KEY   = "sk-..."          # your regular OpenAI key (sk-proj-... or sk-...)
+ELKEY = ""                # optional ElevenLabs key, or leave blank
+
+path = __import__("os").path.expanduser("~/.openclaw/openclaw.json")
+d = json.load(open(path))
+p = d.setdefault("talk", {}).setdefault("providers", {})
+p.setdefault("openai", {})["apiKey"] = KEY
+if ELKEY:
+    p.setdefault("elevenlabs", {})["apiKey"] = ELKEY
+json.dump(d, open(path, "w"), indent=2)
+print("done — key length:", len(KEY))
+PY
 ```
 
-`elevenlabs` is optional — merge this into whatever's already in your
-`talk` block rather than replacing it wholesale if the file already exists.
+> **Key format:** use a regular `sk-...` or `sk-proj-...` key. The OAuth
+> profile (`openai:victorzengyi@gmail.com` / `openai-codex`) is rejected
+> by the Realtime API. A project-scoped `sk-proj-...` key works fine.
+
+`elevenlabs` is optional — omit or leave blank and it falls back to
+OpenAI TTS for Chinese/mixed content.
+
+---
+
+## 3.5. Installing the Edge TTS skill
+
+The installer checks for `~/.openclaw/workspace/skills/edge-tts/scripts/tts-converter.js`
+and exits if it's missing. The skill wraps `node-edge-tts` (npm). Set it up once:
+
+```bash
+mkdir -p ~/.openclaw/workspace/skills/edge-tts/scripts
+
+# Create package.json
+cat > ~/.openclaw/workspace/skills/edge-tts/package.json <<'EOF'
+{
+  "name": "openclaw-edge-tts",
+  "version": "2.0.0",
+  "dependencies": {
+    "node-edge-tts": "^1.2.10",
+    "commander": "^12.0.0"
+  }
+}
+EOF
+
+npm install --prefix ~/.openclaw/workspace/skills/edge-tts
+```
+
+Then copy `tts-converter.js` from your `c2e-slack` repo (or any other
+source that exports the same CLI interface) into
+`~/.openclaw/workspace/skills/edge-tts/scripts/tts-converter.js`.
+
+> **Note:** edge-tts is a legacy fallback only — it's present in the
+> daemon's source but is never called by default (OpenAI TTS is primary).
+> The installer still gates on the file existing, so this step is required
+> even though the feature isn't in active use.
 
 ---
 
@@ -121,8 +170,51 @@ The installer:
 1. `brew install`s `portaudio`, `ffmpeg`, `node`, `hidapi`
 2. Creates a Python venv at `venv/` and installs everything in `requirements.txt`
 3. Verifies `openai.apiKey` is set (exits with instructions if missing)
-4. Lists CoreAudio devices and prompts for input/output device indices
-5. Writes and loads the LaunchAgent plist
+4. Lists CoreAudio devices and prompts for:
+   - Input device index (Enter for system default)
+   - Output device index (Enter for system default)
+   - **Agent name** (Enter for `Zeebot`)
+   - **Wake phrase** (Enter to derive from name: `<name> wake up`)
+5. Writes and loads the LaunchAgent plist with the chosen flags
+
+> **Installer bug (fixed):** Earlier versions exited with
+> `EXTRA_ARGS[@]: unbound variable` when all prompts were left blank.
+> This bash 3.2 `set -u` bug is fixed — pressing Enter for all prompts
+> now works correctly.
+>
+> **If you're on an older clone**, apply the fix manually on line 122 of
+> the installer:
+> ```bash
+> # old (broken on bash 3.2 with empty array):
+> for arg in "${EXTRA_ARGS[@]}"; do
+> # fixed:
+> for arg in "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"; do
+> ```
+>
+> **Legacy workaround (pre-fix):** run steps 4–5 manually after the venv
+> is created (the installer will have completed steps 1–3 before failing):
+>
+> ```bash
+> SKILL_DIR=~/.openclaw/workspace/skills/realtimetalk
+> VENV_PY=$SKILL_DIR/venv/bin/python3
+> PLIST_DEST=~/Library/LaunchAgents/ai.openclaw.realtimetalk.plist
+> mkdir -p ~/Library/LaunchAgents /tmp/openclaw
+> python3 - <<PY
+> src = open("$SKILL_DIR/ai.openclaw.realtimetalk.plist").read()
+> src = src.replace("__VENV_PYTHON__", "$VENV_PY")
+> src = src.replace("__DAEMON_PATH__", "$SKILL_DIR/RealTimeTalk-daemon.py")
+> src = src.replace("__SKILL_DIR__",   "$SKILL_DIR")
+> open("$PLIST_DEST", "w").write(src)
+> PY
+> launchctl bootout gui/$(id -u)/ai.openclaw.realtimetalk 2>/dev/null || true
+> launchctl bootstrap gui/$(id -u) "$PLIST_DEST"
+> ```
+>
+> If your mic wasn't connected during install (device list showed no
+> inputs), add `--input-device <index>` after the daemon is running by
+> editing the plist and reloading via bootout+bootstrap (§5). Get the
+> index from `./RealTimeTalk-toggle.sh devices` after plugging the mic in.
+> Note: `--input-device` takes an **integer** index, not a device name.
 
 Then open **http://localhost:19000/dashboard**.
 
@@ -148,13 +240,26 @@ Tools) and renders its app icon from `assets/ZeebotTalk-icon.svg`
 falls back to the generic default if the SVG or `rsvg-convert` isn't
 available, rather than failing the whole build). Then:
 
-1. Edit `~/Library/LaunchAgents/ai.openclaw.realtimetalk.plist` — change
-   `ProgramArguments`'s first `<string>` from the venv's `python3` path to:
+1. Edit `~/Library/LaunchAgents/ai.openclaw.realtimetalk.plist` — make
+   **two changes** to `ProgramArguments`:
+   - Replace the first `<string>` (the venv `python3` path) with the wrapper binary:
+     ```
+     /Users/<you>/Applications/ZeebotTalk.app/Contents/MacOS/ZeebotTalk
+     ```
+   - **Remove** the second `<string>` — the daemon script path (e.g.
+     `/Users/<you>/.openclaw/workspace/skills/realtimetalk/RealTimeTalk-daemon.py`).
+     ZeebotTalk has this path baked in at compile time and launches Python
+     itself; passing it again as an argument causes `unrecognized arguments`
+     and the daemon exits immediately with code 2.
+
+   The array should look like this afterwards (any extra device flags go here too):
+   ```xml
+   <array>
+       <string>/Users/<you>/Applications/ZeebotTalk.app/Contents/MacOS/ZeebotTalk</string>
+       <string>--http-port</string>
+       <string>19000</string>
+   </array>
    ```
-   /Users/<you>/Applications/ZeebotTalk.app/Contents/MacOS/ZeebotTalk
-   ```
-   Leave the rest of the array (`--http-port 19000`, etc.) as-is — the
-   wrapper passes all arguments straight through to the daemon.
 2. Reload with a **full unload/reload, not a restart**:
    ```bash
    launchctl bootout gui/$(id -u)/ai.openclaw.realtimetalk
@@ -177,10 +282,32 @@ it's idempotent (rebuilds and re-signs in place).
 
 ---
 
+## 5.5. Speaker verification model (Voice ID)
+
+The Voice ID enrollment page (`/voice-enroll`) requires the sherpa-onnx
+speaker-embedding model. Without it the page shows
+`sherpa-onnx or model unavailable` and recording is disabled.
+
+```bash
+mkdir -p ~/.local/share/rtt/speaker
+curl -L -o ~/.local/share/rtt/speaker/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx \
+  "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+```
+
+> **Note the typo in the release tag:** `recongition` (not `recognition`) —
+> that's the upstream tag name; the URL above is correct as written.
+
+The file is ~27 MB. After downloading, restart the daemon — the log
+should then show `Speaker-embedding extractor loaded (dim=192)` on startup.
+Voice ID is optional; omitting it leaves speaker verification disabled
+(everyone's voice is accepted) with a banner on the Voice ID page.
+
+---
+
 ## 6. Verifying the install
 
 1. `curl -s -o /dev/null -w '%{http_code}\n' http://localhost:19000/dashboard` → `200`
-2. Say "Zeebot wake up" near the mic → daemon should respond
+2. Say the wake phrase (default: "Zeebot wake up", or whatever you've configured) near the mic → daemon should respond
 3. Check the log for a clean startup, no repeated errors:
    ```bash
    tail -n 30 /tmp/openclaw/realtimetalk.log
@@ -227,14 +354,37 @@ cd ~/.openclaw/workspace/skills/realtimetalk
 ./RealTimeTalk-toggle.sh devices    # list CoreAudio devices the daemon can see
 ```
 
+To change agent name or wake phrase post-install, edit the plist and do a full
+bootout+bootstrap (§5):
+
+```xml
+<!-- ~/Library/LaunchAgents/ai.openclaw.realtimetalk.plist -->
+<array>
+    <string>/Users/<you>/Applications/ZeebotTalk.app/Contents/MacOS/ZeebotTalk</string>
+    <string>--agent-name</string>
+    <string>Grogu</string>
+    <string>--wake-phrase</string>
+    <string>grogu wake up</string>
+    <string>--http-port</string>
+    <string>19000</string>
+</array>
+```
+
+`--wake-phrase` is optional — omit it and the wake phrase defaults to `<name> wake up`.
+If specified, `<name> wake up` is also kept as an additional recognised phrase.
+
 ---
 
 ## 9. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
-| `OSError: [Errno 48] Address already in use` on restart | A stale process is still holding port 19000 — `launchctl kickstart -k` doesn't reliably kill the previous child. Find and kill it manually: `lsof -i:19000 -P \| grep LISTEN`, then `kill -TERM <pid>`, then retry. |
+| `OSError: [Errno 48] Address already in use` on restart | A stale process is still holding port 19000 — `launchctl kickstart -k` doesn't reliably kill the previous child. Kill it first: `lsof -i:19000 -P \| grep LISTEN \| awk '{print $2}' \| xargs kill -TERM`, then do a full bootout+bootstrap. |
 | Plist edit doesn't seem to take effect | You used `kickstart -k` or `RealTimeTalk-toggle.sh restart` — neither reloads a changed plist file. Use `launchctl bootout` + `bootstrap` instead (§5). |
+| `EXTRA_ARGS[@]: unbound variable` during install | bash 3.2 `set -u` bug — fixed in v3.9.2. Update to the latest commit; or see the manual workaround in §4 if you're stuck on an older clone. |
+| Daemon exits immediately with code 2 after switching to ZeebotTalk | The daemon script path is still in `ProgramArguments` as the second element. ZeebotTalk bakes that path in at compile time — passing it again causes `unrecognized arguments`. Remove the `__DAEMON_PATH__` entry from the plist array (see §5). |
+| `argument --input-device: invalid int value` | `--input-device` takes an integer index (e.g. `1`), not a device name string. Use `./RealTimeTalk-toggle.sh devices` to get the index. |
+| Voice ID page shows `sherpa-onnx or model unavailable` | The speaker-embedding model file is missing. Download it — see §5.5. |
 | Daemon exits with signal 11 (segfault), auto-restarts via launchd | Known failure class from concurrent PortAudio stream operations — should be fixed as of v3.9.1 (see CHANGELOG), but if you hit a new one, check `/tmp/openclaw/realtimetalk.log` around the crash for what else was happening (Monitor/EchoTest toggling, device hot-plug) and report it. |
 | `import hid` fails / AIOC shows generic name instead of "AIOC v1.2+" | `DYLD_LIBRARY_PATH` isn't reaching the process. Confirm `brew install hidapi` succeeded, confirm the plist's `EnvironmentVariables` includes `DYLD_LIBRARY_PATH`, and confirm you reloaded via bootout+bootstrap, not kickstart. Cosmetic only — nothing else depends on `hid`. |
 | Speaker/mic panel shows a device you disconnected | Should self-correct within ~2 seconds (the Calibrate page polls and re-resolves by name against a fresh device list as of v3.9.1). If it doesn't, restart the daemon. |
