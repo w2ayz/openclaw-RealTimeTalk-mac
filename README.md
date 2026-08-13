@@ -103,10 +103,20 @@ Optional — if unset, Chinese/mixed replies fall back to OpenAI TTS
 
 ## Installation
 
+For a full walkthrough (prerequisites, file structure, permissions,
+troubleshooting), see [DEPLOYMENT.md](DEPLOYMENT.md). Quick version:
+
 ```bash
-git clone https://github.com/w2ayz/openclaw-RealTimeTalk-mac.git ~/openclaw-RealTimeTalk-mac
-bash ~/openclaw-RealTimeTalk-mac/RealTimeTalk-install-mac.sh
+mkdir -p ~/.openclaw/workspace/skills
+git clone https://github.com/w2ayz/openclaw-RealTimeTalk-mac.git ~/.openclaw/workspace/skills/realtimetalk
+bash ~/.openclaw/workspace/skills/realtimetalk/RealTimeTalk-install-mac.sh
 ```
+
+(Clone directly into the OpenClaw skills directory — same convention as
+every other skill, e.g. `skills/edge-tts/`. The installer and every other
+script here resolve paths relative to wherever they're run from, so a
+different location works too, but this is what the rest of the OpenClaw
+setup expects.)
 
 The installer:
 1. `brew install`s portaudio, ffmpeg, node (skipped if already present)
@@ -129,7 +139,7 @@ AVFoundation under its own stable bundle identity before launching the
 daemon as its child process:
 
 ```bash
-bash ~/openclaw-RealTimeTalk-mac/RealTimeTalk-build-wrapper-mac.sh
+bash ~/.openclaw/workspace/skills/realtimetalk/RealTimeTalk-build-wrapper-mac.sh
 ```
 
 Then point the LaunchAgent plist's `ProgramArguments` at the built app
