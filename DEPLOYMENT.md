@@ -168,13 +168,28 @@ The installer:
 1. `brew install`s `portaudio`, `ffmpeg`, `node`, `hidapi`
 2. Creates a Python venv at `venv/` and installs everything in `requirements.txt`
 3. Verifies `openai.apiKey` is set (exits with instructions if missing)
-4. Lists CoreAudio devices and prompts for input/output device indices
-5. Writes and loads the LaunchAgent plist
+4. Lists CoreAudio devices and prompts for:
+   - Input device index (Enter for system default)
+   - Output device index (Enter for system default)
+   - **Agent name** (Enter for `Zeebot`)
+   - **Wake phrase** (Enter to derive from name: `<name> wake up`)
+5. Writes and loads the LaunchAgent plist with the chosen flags
 
-> **Known installer bug — system-default devices:** If you press Enter
-> for both device prompts (accepting system defaults), the installer exits
-> with `EXTRA_ARGS[@]: unbound variable`. This is a `set -u` bug with
-> empty bash arrays. Workaround: run steps 4–5 manually after the venv
+> **Installer bug (fixed):** Earlier versions exited with
+> `EXTRA_ARGS[@]: unbound variable` when all prompts were left blank.
+> This bash 3.2 `set -u` bug is fixed — pressing Enter for all prompts
+> now works correctly.
+>
+> **If you're on an older clone**, apply the fix manually on line 122 of
+> the installer:
+> ```bash
+> # old (broken on bash 3.2 with empty array):
+> for arg in "${EXTRA_ARGS[@]}"; do
+> # fixed:
+> for arg in "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"; do
+> ```
+>
+> **Legacy workaround (pre-fix):** run steps 4–5 manually after the venv
 > is created (the installer will have completed steps 1–3 before failing):
 >
 > ```bash
@@ -336,6 +351,25 @@ cd ~/.openclaw/workspace/skills/realtimetalk
 ./RealTimeTalk-toggle.sh log        # tail -f the log
 ./RealTimeTalk-toggle.sh devices    # list CoreAudio devices the daemon can see
 ```
+
+To change agent name or wake phrase post-install, edit the plist and do a full
+bootout+bootstrap (§5):
+
+```xml
+<!-- ~/Library/LaunchAgents/ai.openclaw.realtimetalk.plist -->
+<array>
+    <string>/Users/<you>/Applications/ZeebotTalk.app/Contents/MacOS/ZeebotTalk</string>
+    <string>--agent-name</string>
+    <string>Grogu</string>
+    <string>--wake-phrase</string>
+    <string>grogu wake up</string>
+    <string>--http-port</string>
+    <string>19000</string>
+</array>
+```
+
+`--wake-phrase` is optional — omit it and the wake phrase defaults to `<name> wake up`.
+If specified, `<name> wake up` is also kept as an additional recognised phrase.
 
 ---
 
