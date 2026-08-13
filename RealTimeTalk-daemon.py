@@ -2460,6 +2460,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
             TICK_SAMPLES = TTS_SAMPLE_RATE * 50 // 1000   # samples per 50 ms tick
 
             interrupt_threshold = SPEAK_INTERRUPT_PEAK    # updated after guard, then tracked continuously
+            guard_floor = SPEAK_INTERRUPT_PEAK   # threshold floor set by the guard measurement — see below
             guard_max_out = 0   # peak output PCM seen during guard
             guard_max_mic = 0   # peak mic level seen during guard (echo baseline)
             coupling: float | None = None   # continuously-tracked echo/coupling ratio, past the guard window
@@ -2500,6 +2501,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                                 int(output_peak * coupling * INTERRUPT_SAFETY),
                                 SPEAK_INTERRUPT_PEAK,
                             )
+                            guard_floor = interrupt_threshold
                             log.info("  coupling=%.3f (echo=%d/out=%d) interrupt_threshold=%d",
                                      coupling, guard_max_mic, guard_max_out, interrupt_threshold)
                         else:
@@ -2510,13 +2512,26 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                 # Keep tracking coupling past the initial guard so a long or unevenly-
                 # loud reply doesn't outrun a threshold frozen from the first second —
                 # but never learn from a tick that already looks like a real barge-in,
-                # or a genuine interruption would just get EMA'd away.
-                if tick_out > 200 and p <= interrupt_threshold:
+                # or a genuine interruption would just get EMA'd away. Also require the
+                # tick to be genuinely loud (comparable to this reply's peak), not just
+                # above the 200 floor — a quiet tick's mic/output ratio is dominated by
+                # room noise floor rather than real echo, and letting those ticks drag
+                # the EMA down was observed live shrinking the threshold ~40% within a
+                # second (561 → 316), causing a normal loud syllable later in the same
+                # reply to falsely trigger a self-interrupt.
+                if tick_out > max(200, int(output_peak * 0.3)) and p <= interrupt_threshold:
                     local = p / tick_out
                     coupling = local if coupling is None else (
                         coupling * (1 - SPEAK_COUPLING_EMA) + local * SPEAK_COUPLING_EMA)
+                    # guard_floor never shrinks below the guard's own measurement: the guard
+                    # takes a MAX over a full second, which is statistically always ≥ any
+                    # single later EMA sample, so unclamped tracking only ever drifts down
+                    # over a long reply — confirmed live (1420 → 399 within 36s, tripping a
+                    # false self-interrupt on an ordinary loud syllable). The EMA can still
+                    # push the threshold higher if echo genuinely grows louder later on.
                     interrupt_threshold = max(
-                        int(output_peak * coupling * INTERRUPT_SAFETY), SPEAK_INTERRUPT_PEAK)
+                        int(output_peak * coupling * INTERRUPT_SAFETY), SPEAK_INTERRUPT_PEAK,
+                        guard_floor)
 
                 if _http_interrupt[0]:
                     log.info("HTTP interrupt — stopping TTS")
