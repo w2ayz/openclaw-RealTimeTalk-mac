@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.12.0] — 2026-08-13
+
+Version-number alignment with the [Pi fork](https://github.com/w2ayz/openclaw-RealTimeTalk)
+— no functional changes here. The Pi fork ported this session's applicable
+fixes (owner-only wake-confirmation skip, the `strip_markdown()` backtick
+bug, the self-interrupt threshold decay fix) and bumped to v3.12.0 to match;
+this repo jumps its own counter from 3.9.3 to the same number so `vX.Y.Z`
+means the same release point on both platforms going forward. Mac-specific
+work from this session (ElevenLabs-as-primary, CJK unit reading, the LG
+ULTRAWIDE output blocklist) doesn't apply to the Pi fork and stays as-is here.
+
 ## [3.9.3] — 2026-08-12
 
 Owner-only wake UX, TTS text fidelity (dropped/mispronounced numbers,
