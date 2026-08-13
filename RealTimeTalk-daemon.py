@@ -26,7 +26,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.9.1"
+__version__ = "3.9.2"
 
 import argparse
 import asyncio

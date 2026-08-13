@@ -1,5 +1,7 @@
 # Mac Deployment Guide
 
+> **RealTimeTalk v3.9.2** — for the full change history see [CHANGELOG.md](CHANGELOG.md).
+
 Step-by-step reference for installing RealTimeTalk on a Mac (Mac Mini or
 any Mac with CoreAudio). Written to be followed by someone who hasn't seen
 this repo before. For a feature overview, see [README.md](README.md); for
@@ -379,7 +381,7 @@ If specified, `<name> wake up` is also kept as an additional recognised phrase.
 |---|---|
 | `OSError: [Errno 48] Address already in use` on restart | A stale process is still holding port 19000 — `launchctl kickstart -k` doesn't reliably kill the previous child. Kill it first: `lsof -i:19000 -P \| grep LISTEN \| awk '{print $2}' \| xargs kill -TERM`, then do a full bootout+bootstrap. |
 | Plist edit doesn't seem to take effect | You used `kickstart -k` or `RealTimeTalk-toggle.sh restart` — neither reloads a changed plist file. Use `launchctl bootout` + `bootstrap` instead (§5). |
-| `EXTRA_ARGS[@]: unbound variable` during install | You pressed Enter for both device prompts (system defaults). This is a `set -u` bug in the installer. See the workaround in §4. |
+| `EXTRA_ARGS[@]: unbound variable` during install | bash 3.2 `set -u` bug — fixed in v3.9.2. Update to the latest commit; or see the manual workaround in §4 if you're stuck on an older clone. |
 | Daemon exits immediately with code 2 after switching to ZeebotTalk | The daemon script path is still in `ProgramArguments` as the second element. ZeebotTalk bakes that path in at compile time — passing it again causes `unrecognized arguments`. Remove the `__DAEMON_PATH__` entry from the plist array (see §5). |
 | `argument --input-device: invalid int value` | `--input-device` takes an integer index (e.g. `1`), not a device name string. Use `./RealTimeTalk-toggle.sh devices` to get the index. |
 | Voice ID page shows `sherpa-onnx or model unavailable` | The speaker-embedding model file is missing. Download it — see §5.5. |

@@ -1,5 +1,52 @@
 # Changelog
 
+## [3.9.2] — 2026-08-12
+
+Mac-only patch. Adds configurable agent name and wake phrase so each
+deployment can brand the daemon to its local OpenClaw agent (e.g. Grogu,
+Aria, Zeebot) without editing source. The default remains **Zeebot**,
+preserving full backwards compatibility for existing installs that don't
+pass the new flags.
+
+### Added
+- **`--agent-name <name>` flag.** Sets the agent's display name in the
+  dashboard HTML, conversation log, startup log message, and all
+  voice-command phrase sets (wake, sleep, monitor, continue,
+  owner-only). Default: `Zeebot`.
+- **`--wake-phrase <phrase>` flag.** Overrides the primary wake phrase.
+  Optional — omit it and the wake phrase derives automatically as
+  `<name> wake up`. When supplied, `<name> wake up` is kept as an
+  additional recognised phrase alongside the override, so the natural
+  form always works regardless of what custom phrase is configured.
+- **Installer prompts for agent name and wake phrase.** The installer
+  now asks for both after the device prompts (press Enter for
+  defaults). The chosen values are written as `--agent-name` /
+  `--wake-phrase` flags directly into the LaunchAgent plist — no
+  source editing required per deployment.
+- All phrase sets rebuilt at startup from the configured name: `WAKE_PHRASES`,
+  `SLEEP_PHRASES`, `MONITOR_ON_PHRASES`, `MONITOR_OFF_PHRASES`,
+  `CONTINUE_PHRASES`, `OWNER_ONLY_ON_PHRASES`, `OWNER_ONLY_OFF_PHRASES`.
+  Name-agnostic phrases (e.g. `"real time talk on"`) are preserved as-is.
+
+### Fixed
+- `EXTRA_ARGS[@]: unbound variable` in the installer when all prompts
+  were left blank (system defaults selected). Root cause: bash 3.2's
+  `set -u` treats an empty array as unbound. Fixed with the standard
+  bash 3.2-safe expansion idiom:
+  `"${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"`
+- "Session active — speak now (routed through **Zeebot** / OpenClaw)"
+  startup log line was hardcoded; it now uses the configured agent name.
+
+### Deployment notes
+- **Existing installs:** no action required — `--agent-name` defaults to
+  `Zeebot`, behaviour is identical to 3.9.1.
+- **To switch agent name post-install:** edit the LaunchAgent plist to
+  add `--agent-name <name>` (and optionally `--wake-phrase`) to
+  `ProgramArguments`, then do a full `bootout`+`bootstrap` (not
+  `kickstart`). See DEPLOYMENT.md §8.
+
+---
+
 ## [3.9.1] — 2026-08-12
 
 Radio Mode — the AIOC ham-radio dongle support explicitly deferred in
