@@ -2168,10 +2168,23 @@ def _preprocess_units(text: str) -> str:
     instead of spoken — confirmed live. Spelling them out here sidesteps that
     regardless of which TTS engine ends up handling the call.
 
-    "72°F" → "72 degrees Fahrenheit", "20°C" → "20 degrees Celsius",
-    "15°" → "15 degrees", "45%" → "45 percent"
+    Branches on language like _preprocess_zh_time: a reply containing CJK
+    gets Chinese unit words (华氏度/摄氏度/百分之) so speech doesn't code-switch
+    into English mid-sentence for a number embedded in an otherwise-Chinese
+    reply; everything else gets spelled-out English.
+
+    "72°F" → "72 degrees Fahrenheit" / "72华氏度" (zh)
+    "20°C" → "20 degrees Celsius" / "20摄氏度" (zh)
+    "15°"  → "15 degrees" / "15度" (zh)
+    "45%"  → "45 percent" / "百分之45" (zh — unit precedes the number, as spoken)
     """
     import re
+    if any(_is_cjk(c) for c in text):
+        text = re.sub(r'(\d+(?:\.\d+)?)\s*°\s*F\b', r'\1华氏度', text)
+        text = re.sub(r'(\d+(?:\.\d+)?)\s*°\s*C\b', r'\1摄氏度', text)
+        text = re.sub(r'(\d+(?:\.\d+)?)\s*°', r'\1度', text)
+        text = re.sub(r'(\d+(?:\.\d+)?)\s*%', r'百分之\1', text)
+        return text
     text = re.sub(r'(?<=\d)\s*°\s*F\b', ' degrees Fahrenheit', text)
     text = re.sub(r'(?<=\d)\s*°\s*C\b', ' degrees Celsius', text)
     text = re.sub(r'(?<=\d)\s*°', ' degrees', text)
