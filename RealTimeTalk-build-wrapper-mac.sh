@@ -23,6 +23,7 @@ APP_NAME="ZeebotTalk"
 APP_DIR="$HOME/Applications/$APP_NAME.app"
 VENV_SITE_PACKAGES="$SKILL_DIR/venv/lib/python3.9/site-packages"
 DAEMON_PY="$SKILL_DIR/RealTimeTalk-daemon.py"
+ICON_SVG="$SKILL_DIR/assets/ZeebotTalk-icon.svg"
 
 # The system Python that ships with Xcode Command Line Tools — same
 # interpreter the venv's own python3 is a symlink to, but invoking it
@@ -52,14 +53,52 @@ if [[ ! -d "$VENV_SITE_PACKAGES" ]]; then
     red "    Run RealTimeTalk-install-mac.sh first."
     exit 1
 fi
+if [[ -f "$ICON_SVG" ]] && ! command -v rsvg-convert >/dev/null 2>&1; then
+    echo "Installing librsvg (for icon rendering)..."
+    brew install librsvg
+fi
 
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 
-# Scratch dir for build-time-only inputs (Swift source, entitlements) that
-# should never end up sitting inside the shipped bundle — see the
-# launcher.swift section below for why.
+# Clean up stray source files an older hand-built version of this app may
+# have left directly in Contents/MacOS/ — this script builds those in a
+# scratch dir instead (see below), but a loose leftover .swift/.plist file
+# sitting next to the binary makes some codesign versions choke trying to
+# seal it as a bundle resource, even on a rebuild.
+rm -f "$APP_DIR/Contents/MacOS/launcher.swift" "$APP_DIR/Contents/MacOS/entitlements.plist"
+
+# Scratch dir for build-time-only inputs (Swift source, entitlements,
+# iconset) that should never end up sitting inside the shipped bundle —
+# see the launcher.swift section below for why.
 SWIFT_SRC_DIR="$(mktemp -d)"
 trap 'rm -rf "$SWIFT_SRC_DIR"' EXIT
+
+# ── App icon ──────────────────────────────────────────────────────────────
+# Rendered from assets/ZeebotTalk-icon.svg at build time rather than
+# committing a binary .icns — keeps the source diffable and the bundle
+# always in sync with the current design. Optional: falls back to no
+# custom icon (generic .app icon) if the SVG or rsvg-convert is missing,
+# so this script still works for anyone who deletes/doesn't have it.
+
+ICON_PLIST_ENTRY=""
+if [[ -f "$ICON_SVG" ]] && command -v rsvg-convert >/dev/null 2>&1; then
+    echo "Rendering app icon..."
+    ICONSET="$SWIFT_SRC_DIR/$APP_NAME.iconset"
+    mkdir -p "$ICONSET"
+    for size in 16 32 128 256 512; do
+        double=$((size * 2))
+        rsvg-convert -w "$size" -h "$size" "$ICON_SVG" -o "$ICONSET/icon_${size}x${size}.png"
+        rsvg-convert -w "$double" -h "$double" "$ICON_SVG" -o "$ICONSET/icon_${size}x${size}@2x.png"
+    done
+    iconutil -c icns "$ICONSET" -o "$APP_DIR/Contents/Resources/$APP_NAME.icns"
+    ICON_PLIST_ENTRY="    <key>CFBundleIconFile</key>
+    <string>$APP_NAME</string>
+"
+    green "  ✓ icon rendered: $APP_DIR/Contents/Resources/$APP_NAME.icns"
+else
+    echo "  skipping custom icon (SVG or rsvg-convert not found)"
+fi
+echo
 
 # ── Info.plist ────────────────────────────────────────────────────────────
 
@@ -84,7 +123,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <string>ZeebotTalk needs microphone access to listen for voice commands.</string>
     <key>LSUIElement</key>
     <true/>
-</dict>
+$ICON_PLIST_ENTRY</dict>
 </plist>
 PLIST
 

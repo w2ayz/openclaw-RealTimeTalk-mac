@@ -1,0 +1,47 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Background: dark navy gradient, matching the dashboard's own color identity -->
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#111a2b"/>
+      <stop offset="55%" stop-color="#0a0e18"/>
+      <stop offset="100%" stop-color="#05060c"/>
+    </linearGradient>
+    <!-- Subtle top-left sheen for depth, macOS-style -->
+    <radialGradient id="sheen" cx="30%" cy="20%" r="80%">
+      <stop offset="0%" stop-color="#2a3b52" stop-opacity="0.5"/>
+      <stop offset="45%" stop-color="#2a3b52" stop-opacity="0.1"/>
+      <stop offset="100%" stop-color="#2a3b52" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Signal-wave gradient: cyan to green, the two accent colors used
+         throughout the dashboard UI (you:#38bdf8, gn:#34d399) -->
+    <linearGradient id="wave" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- macOS squircle-ish rounded-square background -->
+  <rect x="0" y="0" width="1024" height="1024" rx="228" ry="228" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1024" height="1024" rx="228" ry="228" fill="url(#sheen)"/>
+
+  <!-- Mark: two bold transmission arcs + source dot, reading as both
+       "voice" (soundwaves) and "radio" (keyed PTT transmission) — the
+       app's two identities (RealTimeTalk conversation + Radio Mode).
+       Simplified from an earlier 3-arc pass, which lost the outer arc at
+       small sizes; fewer/bolder strokes hold up much better tiny. -->
+  <g transform="translate(512,585)" filter="url(#glow)">
+    <path d="M -272 20 A 330 330 0 0 1 272 20" fill="none"
+          stroke="url(#wave)" stroke-width="52" stroke-linecap="round" opacity="0.85"/>
+    <path d="M -156 -90 A 330 330 0 0 1 156 -90" fill="none"
+          stroke="url(#wave)" stroke-width="60" stroke-linecap="round"
+          transform="translate(0,205)"/>
+    <circle cx="0" cy="0" r="66" fill="url(#wave)"/>
+  </g>
+</svg>

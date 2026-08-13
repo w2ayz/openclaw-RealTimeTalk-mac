@@ -25,6 +25,7 @@ internals, see [SKILL.md](SKILL.md).
 | Xcode Command Line Tools | `xcode-select --install` — provides the system Python 3.9 and `swiftc` (needed for the mic-permission wrapper, §5) |
 | `portaudio`, `ffmpeg`, `node` | `brew install portaudio ffmpeg node` (the installer does this for you) |
 | `hidapi` | `brew install hidapi` (installer does this too) — only needed for Radio Mode's AIOC hardware-revision detection; everything else works without it |
+| `librsvg` | `brew install librsvg` (the wrapper-build script does this too) — only needed to render `ZeebotTalk.app`'s icon; the wrapper still builds fine without it, just with the generic default icon |
 | Python 3.9+ | System Python from Command Line Tools is fine |
 | The [Edge TTS skill](https://github.com/w2ayz/openclaw-edge-tts) | Must already be installed at `~/.openclaw/workspace/skills/edge-tts/` |
 
@@ -53,6 +54,7 @@ internals, see [SKILL.md](SKILL.md).
 ├── RealTimeTalk-toggle.sh          # start/stop/restart/status/log/devices — day-to-day control
 ├── ai.openclaw.realtimetalk.plist  # LaunchAgent template — installer copies + fills this in
 ├── test_speak.py                   # standalone TTS smoke-test script
+├── assets/ZeebotTalk-icon.svg      # wrapper app icon source — rendered to .icns at build time (§5)
 ├── README.md, SKILL.md, CHANGELOG.md, DEPLOYMENT.md (this file)
 └── venv/                           # created by the installer, not in git
 ```
@@ -141,7 +143,10 @@ bash ~/.openclaw/workspace/skills/realtimetalk/RealTimeTalk-build-wrapper-mac.sh
 
 This builds `~/Applications/ZeebotTalk.app` (ad-hoc signed, no Apple
 Developer account needed — requires `swiftc` from Xcode Command Line
-Tools). Then:
+Tools) and renders its app icon from `assets/ZeebotTalk-icon.svg`
+(auto-installs `librsvg` via Homebrew if missing; skips the icon and
+falls back to the generic default if the SVG or `rsvg-convert` isn't
+available, rather than failing the whole build). Then:
 
 1. Edit `~/Library/LaunchAgents/ai.openclaw.realtimetalk.plist` — change
    `ProgramArguments`'s first `<string>` from the venv's `python3` path to:
