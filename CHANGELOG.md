@@ -1,5 +1,60 @@
 # Changelog
 
+## [3.9.3] — 2026-08-12
+
+Owner-only wake UX, TTS text fidelity (dropped/mispronounced numbers,
+English leaking into Chinese replies), and a self-interrupt threshold
+that decayed over long replies until it falsely triggered on Zeebot's
+own voice. Also switches ElevenLabs to the primary TTS engine for all
+replies (previously CJK-only), model `eleven_v3`.
+
+### Changed
+- **Owner-only mode skips the wake confirmation round-trip.** Previously
+  every wake phrase — even in owner-only mode — got a "Yes?" and waited
+  for a second confirming utterance before activating, to filter
+  unauthenticated false-positives. Once voice biometric verification
+  already confirms the speaker is the enrolled owner, that confirmation
+  step is redundant; owner-only now activates immediately on a verified
+  wake phrase.
+- **ElevenLabs is now the primary TTS engine for every reply**, not just
+  CJK text. Default voice/model: `eleven_v3` / "Lily - Velvety Actress".
+  OpenAI TTS remains the fallback on network/key failure.
+
+### Fixed
+- **`strip_markdown()` deleted backtick-wrapped content instead of
+  keeping it.** Unlike the adjacent bold/italic regexes (which correctly
+  preserve inner text via a capture group), the backtick regex replaced
+  the whole span — including its content — with an empty string. Replies
+  routinely wrap numeric values in backticks (e.g. `` `72°F` ``), so
+  temperatures, percentages, and other figures were being silently
+  erased from spoken replies entirely rather than mispronounced.
+- **Percent/degree symbols now spelled out before TTS**, since `eleven_v3`
+  skips ElevenLabs' usual automatic text normalization and read raw `%`/
+  `°F`/`°C` incorrectly. New `_preprocess_units()`, mirroring the existing
+  `_preprocess_zh_time()`/`_preprocess_acronyms()` pipeline. Branches on
+  language like `_preprocess_zh_time`: Chinese-language replies get
+  Chinese unit words (`华氏度`/`摄氏度`/`百分之`, with `百分之` correctly
+  placed before the number per spoken word order) instead of code-switching
+  into English mid-sentence (previously "白天最高大概 72 degrees
+  Fahrenheit"); everything else gets spelled-out English.
+- **Self-interrupt threshold silently decayed below its own guard
+  measurement on long replies**, eventually causing an ordinary loud
+  syllable in Zeebot's own voice to falsely trigger a "someone spoke"
+  interrupt. Root cause was two-fold: the continuous EMA-based coupling
+  tracker (added in Pi's v3.8.0 port) updated from any tick above a flat
+  200-sample floor, including quiet passages where the mic/output ratio
+  is dominated by room noise floor rather than real echo; and even after
+  gating that, the initial guard-period measurement is a max-over-max
+  ratio across a full second — statistically always ≥ any later per-tick
+  sample — so unclamped continuous tracking would still trend downward
+  over any long-enough reply. Fixed by requiring learning ticks to be
+  comparably loud to the reply's peak (≥30%), and by never letting the
+  threshold drop below its guard-measured baseline (it can still rise if
+  echo genuinely gets louder later in the reply). Confirmed live: before
+  the fix, threshold decayed 25-72% within seconds and triggered false
+  interrupts on 20-25s replies; after, three consecutive long replies
+  (20s/37s/83s) played through with zero false interrupts.
+
 ## [3.9.2] — 2026-08-12
 
 Mac-only patch. Adds configurable agent name and wake phrase so each
