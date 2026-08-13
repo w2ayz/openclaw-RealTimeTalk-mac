@@ -1360,12 +1360,12 @@ CALIBRATE_PHRASES = {
     "adjust mic for noise", "adjust microphone for noise",
 }
 
-TRANSCRIPTION_PROMPT = "Zeebot."  # teaches name spelling only; too short to hallucinate as a command
-TRANSCRIPTION_PROMPT_NORM = "zeebot"
+TRANSCRIPTION_PROMPT = "Grogu."  # teaches name spelling only; too short to hallucinate as a command
+TRANSCRIPTION_PROMPT_NORM = "grogu"
 
-WAKE_PHRASES     = {"zeebot wake up", "real time talk on", "real-time talk on", "realtimetalk on",
-                    "zibob wake up", "zibot wake up", "libot wake up", "ziba wake up"}
-SLEEP_PHRASES    = {"zeebot go to sleep", "real time talk off", "real-time talk off", "realtimetalk off"}
+WAKE_PHRASES     = {"grogu wake up", "real time talk on", "real-time talk on", "realtimetalk on",
+                    "grogo wake up", "grogoo wake up", "gropo wake up", "groku wake up"}
+SLEEP_PHRASES    = {"grogu go to sleep", "real time talk off", "real-time talk off", "realtimetalk off"}
 
 # Wake confirmation — affirmative responses accepted after Zeebot asks "Yes?"
 _WAKE_CONFIRM_AFFIRM = {
@@ -1376,30 +1376,30 @@ _WAKE_CONFIRM_AFFIRM = {
 _WAKE_CONFIRM_TIMEOUT = 15.0  # seconds to wait for confirmation before treating as mis-fire
 
 MONITOR_ON_PHRASES  = {
-    "zeebot start monitoring", "start monitoring", "zeebot monitor on",
-    "monitor on", "zeebot monitoring on", "monitoring on",
-    "start monitor", "zeebot start monitor",
-    "begin monitoring", "begin monitor", "zeebot begin monitoring",
+    "grogu start monitoring", "start monitoring", "grogu monitor on",
+    "monitor on", "grogu monitoring on", "monitoring on",
+    "start monitor", "grogu start monitor",
+    "begin monitoring", "begin monitor", "grogu begin monitoring",
     "turn on monitoring", "turn monitoring on", "enable monitoring",
     "activate monitoring", "starting monitoring", "monitoring please",
     "monitor please", "please start monitoring", "please monitor",
 }
 MONITOR_OFF_PHRASES = {
-    "zeebot stop monitoring", "stop monitoring", "zeebot monitor off",
-    "monitor off", "zeebot monitoring off", "monitoring off",
-    "stop monitor", "zeebot stop monitor",
-    "end monitoring", "end monitor", "zeebot end monitoring",
+    "grogu stop monitoring", "stop monitoring", "grogu monitor off",
+    "monitor off", "grogu monitoring off", "monitoring off",
+    "stop monitor", "grogu stop monitor",
+    "end monitoring", "end monitor", "grogu end monitoring",
     "turn off monitoring", "turn monitoring off", "disable monitoring",
     "deactivate monitoring", "stopping monitoring", "please stop monitoring",
 }
-CONTINUE_PHRASES = {"continue", "zeebot continue", "please continue", "go on", "go ahead",
+CONTINUE_PHRASES = {"continue", "grogu continue", "please continue", "go on", "go ahead",
                     "keep going", "继续", "继续说", "你继续", "请继续"}
 # Owner-only mode toggles. Keep phrases ≥3 words — _matches_phrase's 60%
 # word-overlap fuzzy pass makes short phrases trigger-happy.
-OWNER_ONLY_ON_PHRASES  = {"only listen to me", "zeebot only listen to me",
+OWNER_ONLY_ON_PHRASES  = {"only listen to me", "grogu only listen to me",
                           "owner only mode", "owner mode on",
                           "只听我的", "只听我说话", "只听我的话"}
-OWNER_ONLY_OFF_PHRASES = {"listen to everyone", "zeebot listen to everyone",
+OWNER_ONLY_OFF_PHRASES = {"listen to everyone", "grogu listen to everyone",
                           "everyone mode", "owner mode off",
                           "听大家的", "听所有人的", "听大家说话"}
 
@@ -3255,7 +3255,7 @@ class RealtimeSession:
                 self._busy.set()
                 try:
                     await asyncio.get_running_loop().run_in_executor(
-                        None, speak, "Going silent now. Say Zeebot wake up to resume.", self.alsa_output
+                        None, speak, "Going silent now. Say Grogu wake up to resume.", self.alsa_output
                     )
                 finally:
                     _busy_clear()
@@ -4042,10 +4042,10 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
 <h3 style="margin-top:20px;">Radio Voice Profile</h3>
 <p class="info">{_radio_status_line}</p>
 <div class="card"><b>Sample 1 — English</b>
-<p class="info">Read aloud: &ldquo;Zeebot wake up. Please check my calendar and read me the news for today.&rdquo;</p>
+<p class="info">Read aloud: &ldquo;Grogu wake up. Please check my calendar and read me the news for today.&rdquo;</p>
 <button onclick="recRadio(this,'1','en')">&#9210; Record 5s</button> <span id="rs1"></span></div>
 <div class="card"><b>Sample 2 — Chinese</b>
-<p class="info">Read aloud: &ldquo;Zeebot 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
+<p class="info">Read aloud: &ldquo;Grogu 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
 <button onclick="recRadio(this,'2','zh')">&#9210; Record 5s</button> <span id="rs2"></span></div>
 <div class="card"><b>Sample 3 — free speech</b>
 <p class="info">Speak naturally for 5 seconds — mix English and Chinese if you like.</p>
@@ -4089,10 +4089,10 @@ a{{color:var(--you)}} .meter{{height:8px;background:#121925;border-radius:4px;ov
 <p class="info">Targets whichever input device is currently active — {current_device}.
 Switch devices (Calibrate page) before recording to enroll a different one.</p>
 <div class="card"><b>Sample 1 — English</b>
-<p class="info">Read aloud: &ldquo;Zeebot wake up. Please check my calendar and read me the news for today.&rdquo;</p>
+<p class="info">Read aloud: &ldquo;Grogu wake up. Please check my calendar and read me the news for today.&rdquo;</p>
 <button onclick="rec(this,'1','en')">&#9210; Record 5s</button> <span id="s1"></span></div>
 <div class="card"><b>Sample 2 — Chinese</b>
-<p class="info">Read aloud: &ldquo;Zeebot 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
+<p class="info">Read aloud: &ldquo;Grogu 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
 <button onclick="rec(this,'2','zh')">&#9210; Record 5s</button> <span id="s2"></span></div>
 <div class="card"><b>Sample 3 — free speech</b>
 <p class="info">Speak naturally for 5 seconds — mix English and Chinese if you like.</p>
@@ -5631,7 +5631,7 @@ Restart daemon after training to reload profiles.</p>
                     if e["role"] == "you":
                         rows += f'<div class="you">{ts_span}<b>You:</b> {e["text"]}</div>'
                     elif e["role"] == "zeebot":
-                        rows += f'<div class="zeebot">{ts_span}<b>Zeebot:</b> {e["text"]}</div>'
+                        rows += f'<div class="zeebot">{ts_span}<b>Grogu:</b> {e["text"]}</div>'
                     elif e["role"] == "monitor":
                         rows += f'<div class="mon">{ts_span}{e["text"]}</div>'
                     elif e["role"] == "thinking":
@@ -5640,7 +5640,7 @@ Restart daemon after training to reload profiles.</p>
                         if dur is None:
                             # Still waiting — live counter + interrupt button
                             rows += (f'<div class="thinking">{ts_span}'
-                                     f'Zeebot is thinking... '
+                                     f'Grogu is thinking... '
                                      f'<span class="tctr" data-start="{ep:.3f}">0</span>s'
                                      f' &nbsp;<a href="/interrupt" class="irupt">✕ Interrupt</a></div>')
                         # else: Zeebot replied — hide this line entirely
@@ -5677,7 +5677,7 @@ Restart daemon after training to reload profiles.</p>
                        }.get(state, ("#141d2b","#64748b"))
                 state_pill_style = f"background:{_sc[0]};color:{_sc[1]};border-color:{_sc[1]};"
                 speaking_banner = (
-                    '<div class="speaking">&#128266; Zeebot is speaking&hellip;'
+                    '<div class="speaking">&#128266; Grogu is speaking&hellip;'
                     ' &nbsp;<a href="/interrupt" class="irupt">&#10005; Stop</a></div>'
                     if speaking else
                     '<div class="speaking">&#9646;&#9646; Paused'
@@ -5817,7 +5817,7 @@ async def main(http_port: int, input_device=None, output_device=None,
     _threading.Thread(target=_radio_hotplug_watcher, args=(session_ref,), daemon=True, name="radio-hotplug").start()
     _threading.Thread(target=_echotest_worker, daemon=True, name="echotest-worker").start()
     _threading.Thread(target=_radio_rx_tap_watchdog, daemon=True, name="radio-rx-tap-watchdog").start()
-    log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say 'Zeebot wake up' to activate)")
+    log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say 'Grogu wake up' to activate)")
 
     # Restore sleep state persisted across daemon/service restarts (e.g. mic device change).
     if _load_sleep_state():
