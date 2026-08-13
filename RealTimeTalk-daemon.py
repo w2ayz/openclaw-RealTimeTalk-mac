@@ -74,17 +74,15 @@ OPENCLAW_CONFIG   = os.path.expanduser("~/.openclaw/openclaw.json")
 OPENCLAW_GW_URL   = "ws://127.0.0.1:18789"
 OPENCLAW_SESSION  = "agent:main:main"
 
-# OpenAI TTS — fallback TTS engine for Chinese/mixed text, primary for English
-# (handles mixed Chinese/English natively if ElevenLabs is unavailable)
+# OpenAI TTS — fallback TTS engine when ElevenLabs is unavailable.
 OPENAI_TTS_MODEL  = "tts-1-hd"
 OPENAI_TTS_VOICE  = "nova"        # nova works well for Chinese and English
 OPENAI_TTS_TIMEOUT = 15.0         # seconds before falling back to say
 _openai_tts_key: list = [""]      # set from openai_key in main()
 
-# ElevenLabs TTS — primary for Chinese/mixed Chinese-English text (consistent
-# voice across languages in one call; OpenAI TTS is the fallback on failure).
-ELEVENLABS_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"   # "Rachel" — multilingual v2
-ELEVENLABS_MODEL    = "eleven_multilingual_v2"
+# ElevenLabs TTS — primary voice engine for all assistant replies.
+ELEVENLABS_VOICE_ID = "pFZP5JQG7iQjIQuC4Bku"   # "Lily - Velvety Actress"
+ELEVENLABS_MODEL    = "eleven_v3"
 ELEVENLABS_TIMEOUT  = 15.0
 _elevenlabs_tts_key: list = [""]  # set from load_elevenlabs_key() in main()
 
@@ -1979,7 +1977,7 @@ def _update_service_gate(new_gate: int):
 def strip_markdown(text: str) -> str:
     text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
     text = re.sub(r'\*(.+?)\*', r'\1', text)
-    text = re.sub(r'`{1,3}[^`\n]*`{1,3}', '', text)
+    text = re.sub(r'`{1,3}([^`\n]*)`{1,3}', r'\1', text)
     text = re.sub(r'^\s*#+\s+', '', text, flags=re.MULTILINE)
     text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', text)
     text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)
@@ -2162,6 +2160,25 @@ def _preprocess_acronyms(text: str) -> str:
                   lambda m: ' '.join(m.group(1)), text)
 
 
+def _preprocess_units(text: str) -> str:
+    """Expand percent/degree symbols into words before TTS.
+
+    eleven_v3 doesn't apply ElevenLabs' usual automatic text normalization,
+    so raw symbols like "72°F" or "45%" come out mangled or silently dropped
+    instead of spoken — confirmed live. Spelling them out here sidesteps that
+    regardless of which TTS engine ends up handling the call.
+
+    "72°F" → "72 degrees Fahrenheit", "20°C" → "20 degrees Celsius",
+    "15°" → "15 degrees", "45%" → "45 percent"
+    """
+    import re
+    text = re.sub(r'(?<=\d)\s*°\s*F\b', ' degrees Fahrenheit', text)
+    text = re.sub(r'(?<=\d)\s*°\s*C\b', ' degrees Celsius', text)
+    text = re.sub(r'(?<=\d)\s*°', ' degrees', text)
+    text = re.sub(r'(?<=\d)\s*%', ' percent', text)
+    return text
+
+
 # ── TTS (OpenAI TTS primary, macOS `say` fallback, ffmpeg PCM decode) ────────
 
 TTS_SAMPLE_RATE = 24000  # daemon plays back at 24 kHz mono PCM int16
@@ -2200,12 +2217,7 @@ def _openai_tts_to_mp3(text: str, out_path: str, timeout: float = OPENAI_TTS_TIM
 
 
 def _elevenlabs_tts_to_mp3(text: str, out_path: str, timeout: float = ELEVENLABS_TIMEOUT) -> bool:
-    """Render text via ElevenLabs multilingual v2 → MP3 at out_path.
-
-    Used for Chinese/mixed Chinese-English replies: unlike per-segment Piper/say
-    splitting, ElevenLabs handles the full mixed-language sentence in one call so
-    the voice doesn't switch mid-reply. Falls back to OpenAI TTS on failure.
-    """
+    """Render text via ElevenLabs → MP3 at out_path."""
     import json, urllib.request, urllib.error
     key = _elevenlabs_tts_key[0]
     if not key:
@@ -2301,10 +2313,9 @@ def _decode_to_pcm(audio_path: str) -> "np.ndarray":
 
 def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silence_ms: int = 300,
           resumable: bool = False):
-    """Synthesise text via OpenAI TTS (with macOS `say` fallback) and play via sounddevice.
+    """Synthesise text via ElevenLabs TTS (with OpenAI/macOS fallback) and play via sounddevice.
 
-    Sends the full text in one call — OpenAI TTS handles mixed Chinese/English
-    and all number/time formats natively. Decodes to 24 kHz mono PCM int16,
+    Sends the full text in one call. Decodes to 24 kHz mono PCM int16,
     applies software volume, and plays via the selected CoreAudio output.
     Polls the mic level during playback; if the user starts speaking, calls
     sd.stop() to interrupt.
@@ -2318,6 +2329,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         return
     clean = _preprocess_zh_time(clean)
     clean = _preprocess_acronyms(clean)
+    clean = _preprocess_units(clean)
 
     log.info("speak() → %r  vol=%.2f sys_vol=%d out_dev=%s",
              clean[:80], volume, _cal_sys_vol_pct[0], _selected_output_device[0])
@@ -2335,16 +2347,14 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         temp_files.append(mp3_path)
         pcm = np.zeros(0, dtype=np.int16)
 
-        # Chinese/mixed text: try ElevenLabs multilingual v2 first — one call for
-        # the whole sentence keeps the voice consistent across languages, unlike
-        # per-segment splitting. Falls through to OpenAI TTS on failure/no key.
-        if any(_is_cjk(ch) for ch in clean):
-            if _elevenlabs_tts_to_mp3(clean, mp3_path):
-                pcm = _decode_to_pcm(mp3_path)
-                log.info("  ElevenLabs TTS OK — PCM decode: %d samples (%.1fs)",
-                         pcm.size, pcm.size / TTS_SAMPLE_RATE)
-            else:
-                log.info("  ElevenLabs TTS unavailable/failed — falling back to OpenAI TTS")
+        # Prefer ElevenLabs for the whole reply. OpenAI stays as the network/key
+        # fallback so voice responses continue working if ElevenLabs is down.
+        if _elevenlabs_tts_to_mp3(clean, mp3_path):
+            pcm = _decode_to_pcm(mp3_path)
+            log.info("  ElevenLabs TTS OK — PCM decode: %d samples (%.1fs)",
+                     pcm.size, pcm.size / TTS_SAMPLE_RATE)
+        else:
+            log.info("  ElevenLabs TTS unavailable/failed — falling back to OpenAI TTS")
 
         if pcm.size == 0:
             ok_oai = _openai_tts_to_mp3(clean, mp3_path)
@@ -3231,7 +3241,10 @@ class RealtimeSession:
         # Wake phrase — always checked regardless of active/monitoring state.
         # Already active → simple acknowledgement. Silent or monitoring → ask for
         # confirmation before activating (avoids self-triggering off Zeebot's own TTS
-        # or background chatter that happens to include the wake phrase).
+        # or background chatter that happens to include the wake phrase) —
+        # UNLESS owner-only mode already biometrically verified this transcript
+        # came from the enrolled voice (via _verify_speaker above), in which
+        # case the confirmation round-trip is redundant and skipped.
         if _matches_phrase(normalized, WAKE_PHRASES):
             if self._active:
                 self._busy.set()
@@ -3239,6 +3252,23 @@ class RealtimeSession:
                     log.info("Wake phrase detected — already active")
                     await asyncio.get_running_loop().run_in_executor(
                         None, speak, "Yes, I'm here.", self.alsa_output
+                    )
+                finally:
+                    _busy_clear()
+                return
+            if _owner_only[0] and _verification_available(_current_input_device_name()):
+                log.info("Wake phrase detected — owner voice verified, activating immediately")
+                _log_entry("system", "Voice activated (owner verified)")
+                self._busy.set()
+                try:
+                    if self._monitoring:
+                        self._monitoring = False
+                        _persist_monitoring[0] = False
+                    self._active = True
+                    _persist_active[0] = True
+                    _last_interaction[0] = _ti.time()
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, speak, "I'm listening.", self.alsa_output
                     )
                 finally:
                     _busy_clear()
