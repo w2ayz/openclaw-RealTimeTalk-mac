@@ -473,12 +473,14 @@ def _radio_hotplug_watcher(session_ref: list) -> None:
                         # silently no-ops otherwise: the flag above flips to
                         # "Radio Mode on" and this log line fires, but nothing
                         # is actually listening on the AIOC until some future,
-                        # unrelated wake. Trigger the same reconnect /wake does
-                        # so the switch actually takes effect now.
-                        _wake_activate[0] = True
+                        # unrelated wake. Reconnect so transcription comes back
+                        # up (NOT _wake_activate — a hardware change should
+                        # restore STT/Silent listening, not jump straight to
+                        # Active; a genuine wake phrase afterward activates it
+                        # the normal way).
                         _last_interaction[0] = _hpw_time.time()
                         _event_loop[0].call_soon_threadsafe(_wake_event[0].set)
-                        log.info("Radio hotplug: daemon was asleep — waking to apply AIOC input switch")
+                        log.info("Radio hotplug: daemon was asleep — reconnecting to apply AIOC input switch")
                     log.info("Radio Mode auto-enabled on AIOC plug-in — switching input to AIOC audio-in (#%d), "
                              "output to AIOC audio-out (#%s)", _found[1], _found[2])
 
@@ -5586,15 +5588,16 @@ Restart daemon after training to reload profiles.</p>
                             # no live effect and no indication anything is
                             # pending reads as "the switch didn't work" (this
                             # exact confusion is why this branch exists —
-                            # confirmed live). Trigger the same reconnect
-                            # /wake does so the switch actually takes effect
-                            # now instead of at some unknown future wake.
+                            # confirmed live). Reconnect so transcription
+                            # comes back up (NOT _wake_activate — a device
+                            # change should restore STT/Silent listening, not
+                            # jump straight to Active; a genuine wake phrase
+                            # afterward activates it the normal way).
                             import time as _tds
-                            _wake_activate[0] = True
                             _last_interaction[0] = _tds.time()
                             loop.call_soon_threadsafe(_wake_event[0].set)
-                            log.info("device-set: daemon was asleep — waking to apply mic switch")
-                            result["msg"] = f"Mic set to {_dev_info['name']}. Waking daemon to apply it…"
+                            log.info("device-set: daemon was asleep — reconnecting to apply mic switch")
+                            result["msg"] = f"Mic set to {_dev_info['name']}. Reconnecting to apply it…"
                         else:
                             result["msg"] = f"Mic set to {_dev_info['name']}."
                         result["ok"]  = True
