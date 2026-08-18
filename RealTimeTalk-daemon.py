@@ -281,6 +281,8 @@ _persist_multilang:  list = ["off"] # multilang state across reconnects: "off"|"
 _persist_active:     list = [False] # active (voice-routing) state across 60-min OpenAI session reconnects
 _sleep_requested:    list = [False] # watchdog sets this; main() waits for /wake before reconnecting
 _wake_event:         list = [None]  # asyncio.Event created in main(); HTTP /wake sets it to reconnect
+_event_loop:         list = [None]  # asyncio loop from main(); lets background threads (hotplug watcher)
+                                     # call loop.call_soon_threadsafe(...) to trigger a wake cross-thread
 _is_sleeping:        list = [False] # True while OpenAI is intentionally disconnected (auto-sleep)
 _wake_activate:      list = [False] # HTTP /wake while sleeping — next session starts active immediately
 _pending_monitor_wake: list = [False]  # Monitor button pressed while sleeping — pre-arms monitoring on wake
@@ -296,6 +298,7 @@ _spk_threshold_cli:   list = [None]   # --spk-threshold override; wins over the 
 # Radio mode (AIOC) — see radio_interfaces.py for the interface registry.
 _radio_profile_active: list = [False]  # Radio Mode toggle — gates PTT/TX routing, radio AGC path
 _radio_prev_input_device: list = [None]  # mic device index to restore when Radio Mode turns off
+_radio_prev_output_device: list = [None]  # speaker device index to restore when Radio Mode turns off
 
 # Auto-enable Radio Mode on AIOC plug-in. _radio_auto_enable_suppressed is
 # set whenever the user manually turns Radio Mode off while the AIOC is
@@ -448,12 +451,36 @@ def _radio_hotplug_watcher(session_ref: list) -> None:
                         and not _radio_auto_enable_suppressed[0]):
                     _radio_prev_input_device[0] = _selected_input_device[0]
                     _radio_profile_active[0] = True
+                    _selected_input_device[0] = _found[1]   # so a reconnect picks this up even if
+                                                             # no live session exists to hot-swap onto
+                    # Also switch the dashboard's "Active" speaker to the AIOC's
+                    # output, mirroring Pi's `pactl set-default-sink <radio_sink>`
+                    # — the actual TX routing in speak() already resolves the
+                    # radio output fresh on its own regardless of this, but
+                    # leaving _selected_output_device pointed at the local
+                    # speaker while Radio Mode is on made the dashboard show
+                    # "Mac mini Speakers" as active/Running even though nothing
+                    # was actually routed there — confirmed live, reads as a bug.
+                    if _found[2] is not None:
+                        _radio_prev_output_device[0] = _selected_output_device[0]
+                        _selected_output_device[0] = _found[2]
                     sess = session_ref[0]
                     if sess is not None:
                         _threading.Thread(target=_switch_mic_stream, args=(sess, _found[1]),
                                            daemon=True).start()
-                    log.info("Radio Mode auto-enabled on AIOC plug-in — switching input to AIOC audio-in (#%d)",
-                             _found[1])
+                    elif _is_sleeping[0] and _wake_event[0] and _event_loop[0]:
+                        # No live session (daemon asleep) — confirmed live this
+                        # silently no-ops otherwise: the flag above flips to
+                        # "Radio Mode on" and this log line fires, but nothing
+                        # is actually listening on the AIOC until some future,
+                        # unrelated wake. Trigger the same reconnect /wake does
+                        # so the switch actually takes effect now.
+                        _wake_activate[0] = True
+                        _last_interaction[0] = _hpw_time.time()
+                        _event_loop[0].call_soon_threadsafe(_wake_event[0].set)
+                        log.info("Radio hotplug: daemon was asleep — waking to apply AIOC input switch")
+                    log.info("Radio Mode auto-enabled on AIOC plug-in — switching input to AIOC audio-in (#%d), "
+                             "output to AIOC audio-out (#%s)", _found[1], _found[2])
 
             if not now_alive and _radio_last_seen_connected[0]:
                 # Unplugged. Stop Monitor/EchoTest unconditionally (both can
@@ -485,11 +512,16 @@ def _radio_hotplug_watcher(session_ref: list) -> None:
                     _radio_profile_active[0] = False
                     prev = _radio_prev_input_device[0]
                     _radio_prev_input_device[0] = None
+                    prev_out = _radio_prev_output_device[0]
+                    _radio_prev_output_device[0] = None
+                    if prev_out is not None:
+                        _selected_output_device[0] = prev_out
                     sess = session_ref[0]
                     if sess is not None and prev is not None:
                         _threading.Thread(target=_switch_mic_stream, args=(sess, prev),
                                            daemon=True).start()
-                    log.info("Radio Mode auto-disabled on AIOC unplug — restoring input device %s", prev)
+                    log.info("Radio Mode auto-disabled on AIOC unplug — restoring input device %s, "
+                             "output device %s", prev, prev_out)
 
             _radio_last_seen_connected[0] = now_alive
         except Exception as exc:
@@ -5158,20 +5190,28 @@ setInterval(upd, 2000);
                     active = False
                     prev = _radio_prev_input_device[0]
                     _radio_prev_input_device[0] = None
+                    prev_out = _radio_prev_output_device[0]
+                    _radio_prev_output_device[0] = None
+                    if prev_out is not None:
+                        _selected_output_device[0] = prev_out
                     if sess is not None and prev is not None:
                         threading.Thread(target=_switch_mic_stream, args=(sess, prev),
                                           daemon=True).start()
-                    log.info("Radio Mode OFF — restoring input device %s", prev)
+                    log.info("Radio Mode OFF — restoring input device %s, output device %s", prev, prev_out)
                 else:
                     _found = _radio.find_radio_audio_devices()
                     if _found and _found[1] is not None:
                         _radio_prev_input_device[0] = _selected_input_device[0]
                         _radio_profile_active[0] = True
                         active = True
+                        if _found[2] is not None:
+                            _radio_prev_output_device[0] = _selected_output_device[0]
+                            _selected_output_device[0] = _found[2]
                         if sess is not None:
                             threading.Thread(target=_switch_mic_stream, args=(sess, _found[1]),
                                               daemon=True).start()
-                        log.info("Radio Mode ON — switching input to AIOC audio-in (#%d)", _found[1])
+                        log.info("Radio Mode ON — switching input to AIOC audio-in (#%d), "
+                                 "output to AIOC audio-out (#%s)", _found[1], _found[2])
                     else:
                         active = False   # no radio connected — can't turn on
                 resp = _json.dumps({"active": active}).encode()
@@ -5537,8 +5577,27 @@ Restart daemon after training to reload profiles.</p>
                                 args=(sess, _dev_idx),
                                 daemon=True,
                             ).start()
+                            result["msg"] = f"Mic set to {_dev_info['name']}."
+                        elif _is_sleeping[0] and _wake_event[0] and loop:
+                            # No live session to hot-swap onto (daemon is
+                            # asleep) — the preference above is saved and
+                            # WILL be picked up whenever the daemon next
+                            # reconnects, but silently waiting for that with
+                            # no live effect and no indication anything is
+                            # pending reads as "the switch didn't work" (this
+                            # exact confusion is why this branch exists —
+                            # confirmed live). Trigger the same reconnect
+                            # /wake does so the switch actually takes effect
+                            # now instead of at some unknown future wake.
+                            import time as _tds
+                            _wake_activate[0] = True
+                            _last_interaction[0] = _tds.time()
+                            loop.call_soon_threadsafe(_wake_event[0].set)
+                            log.info("device-set: daemon was asleep — waking to apply mic switch")
+                            result["msg"] = f"Mic set to {_dev_info['name']}. Waking daemon to apply it…"
+                        else:
+                            result["msg"] = f"Mic set to {_dev_info['name']}."
                         result["ok"]  = True
-                        result["msg"] = f"Mic set to {_dev_info['name']}."
                     else:
                         result["msg"] = "Missing type or name"
                 except Exception as e:
@@ -5880,6 +5939,7 @@ async def main(http_port: int, input_device=None, output_device=None,
     gw_task = asyncio.create_task(gw.listen(stop_event))
 
     _wake_event[0] = asyncio.Event()
+    _event_loop[0] = loop
     _last_interaction[0] = __import__("time").time()   # seed idle clock before first session
 
     session_ref: list = [None]
@@ -5932,7 +5992,7 @@ async def main(http_port: int, input_device=None, output_device=None,
         session = RealtimeSession(
             api_key=openai_key, loop=loop, gw=gw,
             stop_event=stop_event,
-            input_device=input_device, alsa_output=alsa_output,
+            input_device=_selected_input_device[0], alsa_output=alsa_output,
             session_key=session_key,
         )
         if _wake_activate[0]:
