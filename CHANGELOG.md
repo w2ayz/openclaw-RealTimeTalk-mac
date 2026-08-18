@@ -1,5 +1,55 @@
 # Changelog
 
+## [3.14.0] — 2026-08-18
+
+### Fixed
+- **Dashboard flashed the whole page every ~3 seconds.** The page used
+  `location.reload()` on a 3s timer to keep the state pill, nav, device
+  panel, banner, and conversation log fresh — a full reload re-fetched
+  Google Fonts/CSS and repainted everything from scratch each time.
+  Ported from Pi v3.12.6: factored the dynamic pieces out of the
+  full-page render into a shared `_dashboard_dynamic()` helper, added a
+  `/dashboard-frag` JSON endpoint backed by it, and rewrote the client-side
+  timer to poll that endpoint and patch only the changed elements in
+  place. Adapted (not a direct copy) to this file's own device-banner/
+  hover-hint logic, which differs from Pi's — Mac shows button hints in a
+  dedicated `#hzone` element rather than overwriting the banner's text, so
+  the hover-hint listeners were switched to event delegation (survive the
+  nav being replaced every poll) and now also pause the poll itself while
+  hovering, so a tooltip or the hovered button isn't yanked out from
+  under the cursor mid-display. Verified live: `/dashboard-frag` returns
+  correct state/HTML fragments and updates in step with real daemon state
+  changes (confirmed via /wake and /sleep).
+- **Voice enrollment recording failing after a device disconnect** (stale
+  in-process device index). `_fresh_device_label_and_resync()` — the
+  self-heal that keeps the dashboard's device display accurate after a
+  hot-unplug — wrote a fresh-SUBPROCESS-resolved device index directly
+  into `_selected_input_device[0]`/`_selected_output_device[0]`, the same
+  globals used to actually open the live InputStream/record audio
+  in-process. Subprocess and in-process PortAudio device numbering aren't
+  guaranteed to match once this process's own cache is stale. Confirmed
+  live: after AIOC was unplugged, the dashboard correctly displayed "USB
+  PnP Sound Device (#1)", but the daemon was stuck in a permanent
+  crash-reconnect loop (`Invalid number of channels [PaErrorCode -9998]`)
+  because this process's own index 1 pointed at a different physical slot
+  with a different channel count. Voice enrollment recording hit the
+  identical bug (`_record_pcm_blocking` defaults to the same global).
+  Fixed by re-resolving by NAME via the existing in-process
+  `_resolve_device_by_name()` (matches `/device-set`'s already-proven
+  pattern), with a reinit-and-retry fallback, instead of trusting the
+  fresh subprocess's index number directly.
+- **DTMF wake from Monitoring left the dashboard stuck showing
+  Monitoring.** Ported from Pi v3.12.4/v3.12.5. `_dtmf_force_active`'s
+  handling (in both `_send_mic` and its `_handle_transcript`
+  belt-and-suspenders copy) set `self._active=True` without clearing
+  `self._monitoring`, unlike every other wake path — so DTMF `123`
+  received while in Monitoring (e.g. after DTMF `456`) left the session
+  active+monitoring simultaneously. Also clears the persisted monitoring
+  flag in the WAKE digit handler so a reconnect doesn't restore it.
+  Verified live: `456` then `123` now correctly logs "Monitoring
+  stopped" / "Voice activated" and the dashboard's Monitor button returns
+  to OFF.
+
 ## [3.13.0] — 2026-08-18
 
 ### Added
