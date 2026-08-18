@@ -1,6 +1,6 @@
 # Mac Deployment Guide
 
-> **RealTimeTalk v3.9.2** — for the full change history see [CHANGELOG.md](CHANGELOG.md).
+> **RealTimeTalk v3.12.0** — for the full change history see [CHANGELOG.md](CHANGELOG.md).
 
 Step-by-step reference for installing RealTimeTalk on a Mac (Mac Mini or
 any Mac with CoreAudio). Written to be followed by someone who hasn't seen
