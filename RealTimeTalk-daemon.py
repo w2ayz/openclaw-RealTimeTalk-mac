@@ -1365,11 +1365,37 @@ def _fresh_device_label_and_resync(dev_ref: list, kind: str) -> str:
         return stale_label   # couldn't verify — better a possibly-stale label than none
 
     ch_key = "max_output_channels" if kind == "output" else "max_input_channels"
+
+    def _resync_to(name: str) -> int | None:
+        """Re-resolve `name` to an index actually valid in THIS process's
+        own PortAudio cache — never write a fresh-SUBPROCESS index directly
+        into dev_ref[0]. Subprocess and in-process device numbering aren't
+        guaranteed to match once this process's own cache is stale (e.g.
+        after a hot-unplug this process hasn't reinitialized for yet) —
+        confirmed live: writing the subprocess-resolved index straight into
+        dev_ref[0] here left it pointing at the wrong physical slot in this
+        process's own stale cache, and the next InputStream open failed
+        with "Invalid number of channels" [PaErrorCode -9998] because that
+        slot's actual channel count didn't match what was requested. One
+        reinit-and-retry, matching /device-set's established recovery
+        pattern for the same class of staleness."""
+        i = _resolve_device_by_name(name, kind)
+        if i is not None:
+            return i
+        try:
+            with _audio_open_lock:
+                sd._terminate()
+                sd._initialize()
+        except Exception as exc:
+            log.warning("Device resync: PortAudio reinit failed: %s", exc)
+        return _resolve_device_by_name(name, kind)
+
     for i, d in enumerate(fresh):
         if d.get("name") == stale_name and d.get(ch_key, 0) > 0:
-            if i != idx:
-                dev_ref[0] = i   # index shifted (other devices connected/disconnected) — resync
-            return f"{stale_name} (#{i})"
+            resynced = _resync_to(stale_name)
+            if resynced is not None and resynced != idx:
+                dev_ref[0] = resynced   # index shifted (other devices connected/disconnected) — resync
+            return f"{stale_name} (#{resynced if resynced is not None else i})"
 
     # Named device isn't in the fresh list at all — it's genuinely gone.
     # Fall back to whatever fresh device is capable in the requested
@@ -1379,8 +1405,11 @@ def _fresh_device_label_and_resync(dev_ref: list, kind: str) -> str:
     # doesn't mean the device actually produces audible output.
     for i, d in enumerate(fresh):
         if d.get(ch_key, 0) > 0 and d.get("name") not in INVALID_OUTPUT_DEVICES:
-            dev_ref[0] = i
-            return f"{d['name']} (#{i}) — replaced {stale_name!r}, disconnected"
+            resynced = _resync_to(d["name"])
+            if resynced is not None:
+                dev_ref[0] = resynced
+            return (f"{d['name']} (#{resynced if resynced is not None else i}) "
+                    f"— replaced {stale_name!r}, disconnected")
     return f"{stale_name} (disconnected, no replacement found)"
 
 
