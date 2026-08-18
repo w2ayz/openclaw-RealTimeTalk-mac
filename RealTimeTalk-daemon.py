@@ -1105,6 +1105,7 @@ def _dtmf_handle_digit(digit: str, now: float, seq: str) -> str:
         seq = ""
         log.info("DTMF wake %r received", DTMF_WAKE_SEQ)
         _log_entry("system", f"DTMF {DTMF_WAKE_SEQ} — waking {AGENT_NAME}")
+        _persist_monitoring[0] = False   # Active supersedes Monitoring — don't leave it stuck on
         if _is_sleeping[0] and _wake_event[0] and _event_loop[0]:
             _last_interaction[0] = now; _wake_activate[0] = True
             _persist_active[0] = True; _save_sleep_state(False)
@@ -3470,6 +3471,9 @@ class RealtimeSession:
             # every DEVICE_BLOCKSIZE and at most every 0.5s (the timeout below).
             if _dtmf_force_active[0]:
                 _dtmf_force_active[0] = False
+                if self._monitoring:
+                    self._monitoring = False   # Active supersedes Monitoring
+                    _log_entry("system", "Monitoring stopped")
                 if not self._active:
                     self._active = True
                     _last_interaction[0] = __import__("time").time()
@@ -3561,6 +3565,9 @@ class RealtimeSession:
         # is only relevant on the unlikely chance a transcript raced it).
         if _dtmf_force_active[0]:
             _dtmf_force_active[0] = False
+            if self._monitoring:
+                self._monitoring = False   # Active supersedes Monitoring
+                _log_entry("system", "Monitoring stopped")
             if not self._active:
                 self._active = True
                 _last_interaction[0] = __import__("time").time()
