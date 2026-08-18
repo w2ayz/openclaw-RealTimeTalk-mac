@@ -26,7 +26,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.12.0"
+__version__ = "3.13.0"
 
 import argparse
 import asyncio
@@ -158,6 +158,27 @@ ECHOTEST_MAX_SECS    = 30.0  # cap a single capture so a stuck-open squelch can'
 ECHOTEST_COOLDOWN_S  = 2.0   # after transmitting a replay on-air, ignore new segments for this long —
                               # own TX bleeding into RX would otherwise re-trigger capture immediately
 ECHOTEST_COS_TAIL_S  = 0.5   # squelch/COS hold-open seconds
+
+# DTMF remote control — transmit a digit sequence over the radio to control
+# the daemon's sleep/wake/monitor state without touching the dashboard.
+# Ported from Pi's always-on _dtmf_listener thread; sequence defaults match
+# both Pi's and this repo's own dtmf_monitor.py training/monitor tool so an
+# already-trained profile file works identically here.
+DTMF_WAKE_SEQ         = "123"   # activate — routes all speech to the agent
+DTMF_SLEEP_SEQ        = "321"   # go Silent (still connected, passive 10-min idle disconnect applies)
+DTMF_DEEPSLEEP_SEQ    = "987"   # disconnect from OpenAI immediately (skip the 10-min idle wait)
+DTMF_WAKE_SILENT_SEQ  = "789"   # reconnect from Deep Sleep into Silent (no routing) — NOT Active
+DTMF_MONITOR_ON_SEQ   = "456"   # passive transcription monitoring (capture-only, no TTS routing)
+DTMF_MONITOR_OFF_SEQ  = "654"
+DTMF_COS_TAIL_S       = 0.5     # squelch/COS hold-open seconds
+DTMF_SEQ_TIMEOUT      = 8.0     # reset the digit buffer if this long passes between digits
+DTMF_DIGIT_COOLDOWN   = 0.4     # ignore a repeat of the same digit faster than this (DTMF tones sustain)
+DTMF_HOLD_TICKS       = 2       # consecutive 25ms-poll agreements needed to accept a digit (was 3/75ms,
+                                 # matching dtmf_monitor.py/Pi — confirmed live that requirement was long
+                                 # enough for a fast 3-digit sequence's MIDDLE digit to get squeezed out
+                                 # between the transitions in and out of it; 2/50ms still debounces real
+                                 # noise but gives a sandwiched digit a real chance to register)
+DTMF_PROFILE_FILE     = os.path.expanduser("~/.openclaw/workspace/rtt_dtmf_profiles.json")
 
 # Devices that report valid output channels to CoreAudio/sounddevice but
 # aren't real, usable speakers — confirmed live: "LG ULTRAWIDE" (an HDMI
@@ -316,6 +337,23 @@ _echotest_queue = queue.Queue(maxsize=3)   # captured (secs, int16 ndarray) segm
 _echotest_squelch: list = [None]   # active radio_interfaces.SquelchTracker, or None when EchoTest is off
 _echotest_state: dict = {"was_open": False, "seg": bytearray(),
                           "prev_tx": False, "ext_tx_grace_until": 0.0}
+
+# DTMF remote control — always-on (no dashboard toggle, unlike Monitor/EchoTest),
+# runs whenever a radio interface is connected. _dtmf_squelch being non-None is
+# what gates _radio_rx_tap_cb into feeding it chunks, mirroring _echotest_squelch's
+# role for EchoTest's own attach/detach lifecycle.
+_dtmf_squelch:  list = [None]      # active radio_interfaces.SquelchTracker, or None when not attached
+_dtmf_cos_open: list = [False]     # live squelch state, updated per-chunk, read by the decode loop
+_dtmf_raw_buf: list = []           # [(timestamp, mono int16 ndarray), ...], trimmed to last ~1s
+_dtmf_raw_lock = _threading.Lock()
+_dtmf_state: dict = {"seq": "", "last_digit": None, "last_time": 0.0}
+# Force-flags: written by the DTMF decode loop (a background thread), applied
+# to the live session by _send_mic's poll (runs on the asyncio loop, so this
+# is the thread-safe hand-off point) — mirrors Pi's _dtmf_force_* mechanism.
+_dtmf_force_active:    list = [False]  # DTMF 123 — activate the current silent session immediately
+_dtmf_force_silent:    list = [False]  # DTMF 321 — silence the current active session immediately
+_dtmf_force_deepsleep: list = [False]  # DTMF 987 — disconnect from OpenAI immediately
+_dtmf_force_monitor:   list = [None]   # DTMF 456/654 — True/False to toggle monitoring, None = no-op
 
 _radio_monitor_buf:      list = [np.zeros(0, dtype=np.float32)]  # ring buffer feeding the monitor's OutputStream
 _radio_monitor_buf_lock = _threading.Lock()
@@ -593,6 +631,26 @@ def _radio_rx_tap_cb(indata, frames, time_info, status) -> None:
             _radio_monitor_buf[0] = buf
     if _echotest_active[0] and _echotest_squelch[0] is not None:
         _echotest_process_chunk(raw, now)
+    if _dtmf_squelch[0] is not None:
+        _dtmf_process_chunk(raw, now)
+
+
+def _dtmf_process_chunk(raw: np.ndarray, now: float) -> None:
+    """Cheap per-chunk hook called from the shared RX tap's callback — only
+    updates squelch state and appends to a short rolling buffer. The actual
+    Goertzel decode is deliberately NOT done here: it's a Python-level loop
+    over each candidate digit's row+col frequencies (up to ~28 Goertzel
+    passes per decode), too slow to risk running inside a real-time
+    PortAudio callback shared with Monitor's live audio — see
+    _dtmf_decode_loop, which polls this buffer from its own thread instead,
+    mirroring dtmf_monitor.py's own capture/decode thread split."""
+    peak = int(np.max(np.abs(raw))) if len(raw) else 0
+    _dtmf_cos_open[0] = _dtmf_squelch[0].update(peak, now)
+    with _dtmf_raw_lock:
+        _dtmf_raw_buf.append((now, raw.copy()))
+        cutoff = now - 1.0
+        while _dtmf_raw_buf and _dtmf_raw_buf[0][0] < cutoff:
+            _dtmf_raw_buf.pop(0)
 
 
 def _radio_rx_tap_acquire() -> bool:
@@ -969,6 +1027,240 @@ def _echotest_listener(stop_flag: list) -> None:
             _echotest_squelch[0] = None
         if not stop_flag[0]:
             _el_time.sleep(3)
+
+
+# ── DTMF remote control ──────────────────────────────────────────────────────
+# Ported from Pi's always-on _dtmf_listener thread. Decodes via the same
+# learned-profile Goertzel approach as this repo's own dtmf_monitor.py
+# training/monitor tool (NOT Pi's 8kHz-decimated version — dtmf_monitor.py
+# trains and decodes at the AIOC's native 48kHz with no decimation step, so
+# using Pi's decimated math here would silently mismatch profiles already
+# trained via `python3 dtmf_monitor.py --train` on this machine).
+
+def _load_dtmf_profiles() -> dict:
+    try:
+        with open(DTMF_PROFILE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _dtmf_goertzel_energy(samples, freq: float, rate: int) -> float:
+    n = len(samples)
+    k = int(0.5 + n * freq / rate)
+    w = 2 * np.pi * k / n
+    c = 2 * np.cos(w)
+    q1 = q2 = 0.0
+    for s in samples:
+        q0 = s + c * q1 - q2; q2 = q1; q1 = q0
+    return q2 * q2 + q1 * q1 - c * q1 * q2
+
+
+def _dtmf_decode_with_profiles(frame: np.ndarray, profiles: dict, rate: int) -> str | None:
+    """Decode a DTMF digit using learned frequency profiles — verbatim port
+    of dtmf_monitor.py's decode_with_profiles (same thresholds), so a
+    profile file trained via that tool decodes identically here."""
+    samples = frame.astype(np.float64).tolist()
+    scores = {}
+    for digit, prof in profiles.items():
+        row_e = _dtmf_goertzel_energy(samples, prof["row_hz"], rate)
+        col_e = _dtmf_goertzel_energy(samples, prof["col_hz"], rate)
+        scores[digit] = row_e + col_e
+    if not scores:
+        return None
+    best = max(scores, key=scores.get)
+    best_e = scores[best]
+    median_e = sorted(scores.values())[len(scores) // 2]
+    if best_e < 1e6 or (median_e > 0 and best_e / median_e < 3.0):
+        return None
+    return best
+
+
+def _dtmf_handle_digit(digit: str, now: float, seq: str) -> str:
+    """Match `seq` against the configured DTMF command sequences and
+    dispatch the corresponding action. Ported from Pi's _dtmf_listener's
+    _handle_digit, adapted to this daemon's sleep/wake globals: Pi tracks
+    sleep with a single _idle_disconnected flag and closes the WebSocket
+    via loop.call_soon_threadsafe from a background thread; this daemon
+    splits that into _sleep_requested/_is_sleeping (checked at the top of
+    main()'s reconnect loop) and hands the actual ws.close() off to
+    _send_mic's poll, which already runs on the event loop. Returns the
+    (possibly-cleared) sequence buffer."""
+    st = _dtmf_state
+    if seq and now - st["last_time"] > DTMF_SEQ_TIMEOUT:
+        seq = ""
+    if digit == st["last_digit"] and now - st["last_time"] < DTMF_DIGIT_COOLDOWN:
+        return seq
+    st["last_digit"] = digit
+    st["last_time"] = now
+    if not seq or seq[-1] != digit:
+        seq += digit
+        log.info("DTMF digit: %s -> seq=%s", digit, seq)
+    max_len = max(len(DTMF_WAKE_SEQ), len(DTMF_SLEEP_SEQ), len(DTMF_DEEPSLEEP_SEQ),
+                  len(DTMF_MONITOR_ON_SEQ), len(DTMF_MONITOR_OFF_SEQ), len(DTMF_WAKE_SILENT_SEQ))
+    if len(seq) > max_len:
+        seq = seq[-max_len:]
+
+    if DTMF_WAKE_SEQ in seq:
+        seq = ""
+        log.info("DTMF wake %r received", DTMF_WAKE_SEQ)
+        _log_entry("system", f"DTMF {DTMF_WAKE_SEQ} — waking {AGENT_NAME}")
+        if _is_sleeping[0] and _wake_event[0] and _event_loop[0]:
+            _last_interaction[0] = now; _wake_activate[0] = True
+            _persist_active[0] = True; _save_sleep_state(False)
+            _event_loop[0].call_soon_threadsafe(_wake_event[0].set)
+        elif _wake_event[0]:
+            _persist_active[0] = True; _wake_activate[0] = True
+            _dtmf_force_active[0] = True   # applied to the live session by _send_mic's poll
+    elif DTMF_SLEEP_SEQ in seq:
+        seq = ""
+        log.info("DTMF sleep %r received", DTMF_SLEEP_SEQ)
+        _log_entry("system", f"DTMF {DTMF_SLEEP_SEQ} — {AGENT_NAME} silent")
+        _persist_active[0] = False
+        _dtmf_force_silent[0] = True
+    elif DTMF_DEEPSLEEP_SEQ in seq:
+        seq = ""
+        log.info("DTMF deep-sleep %r received", DTMF_DEEPSLEEP_SEQ)
+        _log_entry("system", f"DTMF {DTMF_DEEPSLEEP_SEQ} — {AGENT_NAME} sleeping (disconnecting)")
+        _persist_active[0] = False
+        _wake_activate[0] = False        # discard any stale activation intent
+        _persist_monitoring[0] = False   # clear monitoring when going to deep sleep
+        _dtmf_force_deepsleep[0] = True
+    elif DTMF_MONITOR_ON_SEQ in seq:
+        seq = ""
+        log.info("DTMF monitor-on %r received", DTMF_MONITOR_ON_SEQ)
+        _log_entry("system", f"DTMF {DTMF_MONITOR_ON_SEQ} — monitoring on")
+        _persist_monitoring[0] = True
+        _persist_active[0] = False       # monitoring is passive, not active
+        if _is_sleeping[0] and _wake_event[0] and _event_loop[0]:
+            # Pre-arm monitoring for the next session (same mechanism the
+            # /monitor/start HTTP handler uses while sleeping) rather than
+            # _wake_activate, so the reconnected session starts silent+
+            # monitoring, not fully Active.
+            _pending_monitor_wake[0] = True
+            _last_interaction[0] = now
+            _event_loop[0].call_soon_threadsafe(_wake_event[0].set)
+        else:
+            _dtmf_force_monitor[0] = True
+    elif DTMF_MONITOR_OFF_SEQ in seq:
+        seq = ""
+        log.info("DTMF monitor-off %r received", DTMF_MONITOR_OFF_SEQ)
+        _log_entry("system", f"DTMF {DTMF_MONITOR_OFF_SEQ} — monitoring off")
+        _persist_monitoring[0] = False
+        _dtmf_force_monitor[0] = False
+    elif DTMF_WAKE_SILENT_SEQ in seq:
+        seq = ""
+        log.info("DTMF wake-silent %r received", DTMF_WAKE_SILENT_SEQ)
+        _log_entry("system", f"DTMF {DTMF_WAKE_SILENT_SEQ} — waking to silent")
+        _persist_active[0] = False       # silent, not active
+        _wake_activate[0] = False        # override any stale activation intent
+        _persist_monitoring[0] = False   # not monitoring
+        if _is_sleeping[0] and _wake_event[0] and _event_loop[0]:
+            _last_interaction[0] = now
+            _save_sleep_state(False)
+            _event_loop[0].call_soon_threadsafe(_wake_event[0].set)
+        # If already awake (silent/monitoring), nothing extra needed.
+    return seq
+
+
+def _dtmf_decode_loop(profiles: dict) -> None:
+    """Polls the rolling buffer _dtmf_process_chunk fills, decoupled from
+    the real-time audio callback — mirrors dtmf_monitor.py's dtmf_thread
+    (same 25ms poll cadence, same 100ms analysis window), except dispatching
+    real actions via _dtmf_handle_digit instead of printing to a terminal,
+    decimating before Goertzel (dtmf_monitor.py doesn't need to), and using
+    a shorter hold-to-confirm debounce (DTMF_HOLD_TICKS, see its comment).
+
+    Decimating to ~8kHz before Goertzel is Pi's own mitigation for exactly
+    this situation, ported here after confirming live that it's needed:
+    dtmf_monitor.py (a standalone process with only 3 threads total) caught
+    every digit in a fast sequence, but this listener — one of many threads
+    inside the full daemon, competing for the GIL with the asyncio loop,
+    WebRTC AGC, HTTP server, other radio threads, etc. — dropped digits
+    under the same fast keying. The Goertzel recurrence is a raw Python
+    loop (can't vectorize — each step depends on the previous), run twice
+    per candidate digit for up to 12 trained digits: at native 48kHz
+    (~4800 samples/window) that's ~115,000 loop iterations per decode
+    attempt, up to 40 times/second while squelch is open — enough to fall
+    behind under real daemon contention. Frequency resolution is set by
+    the window's DURATION (100ms), not its sample rate, so decimating
+    doesn't lose discriminating power between DTMF tones ~140Hz+ apart —
+    it only cuts the Python-level cost roughly 6x. Profiles stay trained
+    at native rate (dtmf_monitor.py --train doesn't change); only the
+    decode-time rate passed to Goertzel changes to match the decimated
+    samples, which is all that's needed for the math to stay correct."""
+    import time as _ddl_time
+    prev_digit = [None]; hold = [0]; seq = [""]
+    native_rate = _radio_rx_tap_samplerate[0]
+    decim       = max(1, round(native_rate / 8000))
+    decode_rate = native_rate // decim
+    FRAME       = decode_rate // 10   # 100ms analysis window
+    log.info("DTMF decode: native=%dHz -> decimated=%dHz (/%d), frame=%d samples",
+             native_rate, decode_rate, decim, FRAME)
+    while True:
+        _ddl_time.sleep(0.025)
+        if not _dtmf_cos_open[0]:
+            prev_digit[0] = None; hold[0] = 0; continue
+        with _dtmf_raw_lock:
+            recent = [(t, f) for t, f in _dtmf_raw_buf if t > _ddl_time.time() - 0.15]
+        if not recent:
+            continue
+        frames = np.concatenate([f for _, f in recent])[::decim]
+        if len(frames) < FRAME:
+            continue
+        digit = _dtmf_decode_with_profiles(frames[-FRAME:], profiles, decode_rate)
+        if digit == prev_digit[0]:
+            hold[0] += 1
+        else:
+            prev_digit[0] = digit; hold[0] = 1
+        if digit and hold[0] == DTMF_HOLD_TICKS:
+            seq[0] = _dtmf_handle_digit(digit, _ddl_time.time(), seq[0])
+
+
+def _dtmf_listener() -> None:
+    """Controller thread: attaches to the shared AIOC RX tap whenever a
+    radio interface is connected and starts the decode loop once profiles
+    are available. Unlike Monitor/EchoTest there's no dashboard toggle —
+    this runs for the life of the daemon, mirroring Pi's always-on design
+    (DTMF remote control should work even if nobody's looking at a browser).
+    Silently does nothing if no profiles are trained yet — Mac has no
+    multimon-ng fallback (see dtmf_monitor.py's module docstring), so
+    `python3 dtmf_monitor.py --train` is required before this is useful."""
+    import time as _dl_time
+    profiles = _load_dtmf_profiles()
+    if not profiles:
+        log.info("DTMF listener disabled — no trained profiles "
+                 "(run dtmf_monitor.py --train first)")
+        return
+    decode_started = False
+    while True:
+        found = _radio.find_radio_audio_devices()
+        if not found or found[1] is None:
+            _dl_time.sleep(3); continue
+        iface = found[0]
+        _dtmf_squelch[0] = _radio.SquelchTracker(iface.cos_threshold, DTMF_COS_TAIL_S)
+        if not _radio_rx_tap_acquire():
+            log.warning("DTMF: could not attach to radio RX tap")
+            _dtmf_squelch[0] = None
+            _dl_time.sleep(3); continue
+
+        log.info("DTMF listener ready via learned profiles (%d digit(s)) — "
+                 "wake=%s sleep=%s deepsleep=%s/%s mon=%s/%s",
+                 len(profiles), DTMF_WAKE_SEQ, DTMF_SLEEP_SEQ,
+                 DTMF_DEEPSLEEP_SEQ, DTMF_WAKE_SILENT_SEQ,
+                 DTMF_MONITOR_ON_SEQ, DTMF_MONITOR_OFF_SEQ)
+        if not decode_started:
+            _threading.Thread(target=_dtmf_decode_loop, args=(profiles,),
+                               daemon=True, name="dtmf-decode").start()
+            decode_started = True
+
+        try:
+            while _radio.find_radio_audio_devices():
+                _dl_time.sleep(0.5)
+        finally:
+            _radio_rx_tap_release()
+            _dtmf_squelch[0] = None
+        _dl_time.sleep(3)
 
 
 def _list_audio_devices() -> dict:
@@ -3173,6 +3465,44 @@ class RealtimeSession:
 
     async def _send_mic(self, ws):
         while not self.stop_event.is_set():
+            # Apply DTMF force flags immediately (don't wait for next transcript)
+            # — this loop iterates on every mic chunk, so this checks at least
+            # every DEVICE_BLOCKSIZE and at most every 0.5s (the timeout below).
+            if _dtmf_force_active[0]:
+                _dtmf_force_active[0] = False
+                if not self._active:
+                    self._active = True
+                    _last_interaction[0] = __import__("time").time()
+                    _log_entry("system", "Voice activated")
+                    log.info("DTMF force-active applied to session")
+            if _dtmf_force_monitor[0] is not None:
+                _mon = _dtmf_force_monitor[0]
+                _dtmf_force_monitor[0] = None
+                if _mon and not self._monitoring:
+                    self._monitoring = True
+                    self._active = False   # monitoring is passive
+                    _log_entry("system", "Monitoring started")
+                    log.info("DTMF force-monitor ON")
+                elif not _mon and self._monitoring:
+                    self._monitoring = False
+                    _log_entry("system", "Monitoring stopped")
+                    log.info("DTMF force-monitor OFF")
+            if _dtmf_force_deepsleep[0]:
+                _dtmf_force_deepsleep[0] = False
+                _persist_active[0] = False
+                _persist_monitoring[0] = False
+                self._monitoring = False   # turn off monitoring on current session
+                _sleep_requested[0] = True
+                _is_sleeping[0] = True
+                _save_sleep_state(True)
+                log.info("DTMF deep-sleep — closing WebSocket")
+                await ws.close()   # closes OpenAI WS; run()'s async-with exits cleanly
+                return
+            if _dtmf_force_silent[0]:
+                _dtmf_force_silent[0] = False
+                self._active = False
+                _log_entry("system", "Voice silenced")
+                log.info("DTMF force-silent applied to session")
             try:
                 chunk = await asyncio.wait_for(self._mic_q.get(), timeout=0.5)
             except asyncio.TimeoutError:
@@ -3226,6 +3556,20 @@ class RealtimeSession:
         return False
 
     async def _handle_transcript(self, transcript: str):
+        # Apply DTMF force flags (belt-and-suspenders alongside _send_mic —
+        # that poll runs at least every 0.5s, almost always faster, so this
+        # is only relevant on the unlikely chance a transcript raced it).
+        if _dtmf_force_active[0]:
+            _dtmf_force_active[0] = False
+            if not self._active:
+                self._active = True
+                _last_interaction[0] = __import__("time").time()
+                _log_entry("system", "Voice activated")
+        if _dtmf_force_silent[0]:
+            _dtmf_force_silent[0] = False
+            self._active = False
+            _log_entry("system", "Voice silenced")
+
         # Discard transcripts that arrive while Zeebot is speaking — they are
         # echo of Zeebot's own TTS, not the user's voice.
         if self._busy.is_set():
@@ -5950,6 +6294,7 @@ async def main(http_port: int, input_device=None, output_device=None,
     _threading.Thread(target=_radio_hotplug_watcher, args=(session_ref,), daemon=True, name="radio-hotplug").start()
     _threading.Thread(target=_echotest_worker, daemon=True, name="echotest-worker").start()
     _threading.Thread(target=_radio_rx_tap_watchdog, daemon=True, name="radio-rx-tap-watchdog").start()
+    _threading.Thread(target=_dtmf_listener, daemon=True, name="dtmf-radio").start()
     log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say '%s wake up' to activate)", AGENT_NAME)
 
     # Restore sleep state persisted across daemon/service restarts (e.g. mic device change).

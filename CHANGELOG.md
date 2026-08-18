@@ -1,5 +1,47 @@
 # Changelog
 
+## [3.13.0] — 2026-08-18
+
+### Added
+- **DTMF remote control**, ported from Pi's always-on `_dtmf_listener` thread
+  (previously Mac only had `dtmf_monitor.py`'s standalone training/monitor
+  CLI, with no live wiring back into the daemon). Transmit a digit sequence
+  over the radio to control sleep/wake/monitor state without touching the
+  dashboard: `123` Wake (goes fully Active), `321` Sleep (Silent, still
+  connected), `987` Deep Sleep (disconnects from OpenAI immediately, skips
+  the 10-min idle wait), `789` Wake-Silent (reconnects from Deep Sleep into
+  Silent — NOT Active), `456`/`654` Monitor ON/OFF. Runs unconditionally
+  whenever a radio interface is connected, decoding via the shared AIOC RX
+  tap (same one Monitor/EchoTest already use) rather than opening a third
+  independent stream. Requires DTMF profiles already trained via
+  `dtmf_monitor.py --train` — silently disabled if none exist.
+
+### Fixed
+- **DTMF digit decode was too slow for real multi-digit sequences when
+  running inside the full daemon**, even though decode logic is otherwise
+  identical to `dtmf_monitor.py`'s own proven Goertzel/profile-matching
+  algorithm. `dtmf_monitor.py`'s standalone process (only 3 threads) caught
+  every digit; the in-daemon listener — competing for the GIL with the
+  asyncio loop, WebRTC AGC, HTTP server, and other radio threads — dropped
+  digits under the same fast keying, confirmed live. Root cause: the
+  Goertzel recurrence is a raw Python loop (can't vectorize), run twice per
+  candidate digit for all trained digits; at native 48kHz that's ~115,000
+  loop iterations per decode attempt, up to 40/second while squelch is
+  open — enough to fall behind under real contention. Fixed by decimating
+  to ~8kHz before Goertzel (frequency resolution comes from the 100ms
+  window's *duration*, not its sample rate, so this doesn't lose
+  discriminating power between DTMF tones) — the same mitigation Pi's own
+  `_dtmf_listener` already uses, for the same reason.
+- **The middle digit of a fast 3-digit sequence was still getting dropped**
+  even after the decimation fix, e.g. `789` decoding as `7,9` with no `8`.
+  The decoder required a digit to read identically for 3 consecutive 25ms
+  polls (75ms) before accepting it; a digit sandwiched between two
+  transitions often didn't get 75ms of clean tone before the next one
+  started. Reduced to 2 consecutive polls (50ms) — confirmed live this
+  reliably catches all three digits of `789`/`987`/`123`/`321`/`456`/`654`
+  transmitted at normal keying speed, still enough of a debounce to reject
+  noise.
+
 ## [3.12.0] — 2026-08-13
 
 Version-number alignment with the [Pi fork](https://github.com/w2ayz/openclaw-RealTimeTalk)
