@@ -42,6 +42,7 @@ import signal
 import subprocess
 import sys
 import threading
+import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -4321,6 +4322,20 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
         handler.end_headers()
         handler.wfile.write(data)
 
+    def _send_json(handler, code: int, obj) -> None:
+        # NOT named _json: dozens of other branches in do_GET below do
+        # `import json as _json` as a local module alias — since Python
+        # treats any name assigned anywhere in a function as local to the
+        # WHOLE function, a helper called _json here gets shadowed by
+        # those (unrelated, unreached) local imports and raises
+        # UnboundLocalError at call time. Confirmed live.
+        data = json.dumps(obj).encode()
+        handler.send_response(code)
+        handler.send_header("Content-Type",   "application/json")
+        handler.send_header("Content-Length", str(len(data)))
+        handler.end_headers()
+        handler.wfile.write(data)
+
     class _Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             log.debug("[http] %s", fmt % args)
@@ -6203,6 +6218,23 @@ Restart daemon after training to reload profiles.</p>
                 self.send_response(200); self.send_header("Content-Type","application/json")
                 self.send_header("Content-Length", str(len(resp))); self.end_headers()
                 self.wfile.write(resp)
+
+            elif self.path.startswith("/speak"):
+                host = self.client_address[0] if self.client_address else ""
+                if host not in ("127.0.0.1", "::1", "localhost"):
+                    _send_json(self, 403, {"ok": False, "error": "local callers only"})
+                    return
+                parsed = urllib.parse.urlparse(self.path)
+                params = urllib.parse.parse_qs(parsed.query)
+                text = (params.get("text") or [""])[0].strip()
+                if not text:
+                    _send_json(self, 400, {"ok": False, "error": "missing text"})
+                    return
+                alsa = sess.alsa_output if sess else ALSA_OUTPUT
+                _log_entry("zeebot", text)
+                threading.Thread(target=speak, args=(text, alsa), daemon=True).start()
+                log.info("HTTP speak — queued %d chars", len(text))
+                _send_json(self, 200, {"ok": True, "queued": True, "chars": len(text)})
 
             elif self.path == "/levels":
                 import time as _time
