@@ -373,6 +373,39 @@ bootout+bootstrap (§5):
 `--wake-phrase` is optional — omit it and the wake phrase defaults to `<name> wake up`.
 If specified, `<name> wake up` is also kept as an additional recognised phrase.
 
+### Wiring OpenClaw up to push text for readout
+
+RTT has a local-only `/speak?text=...` endpoint (see README.md's "Control"
+section for full detail) that any process on this Mac can call to have RTT
+read arbitrary text aloud — the piece that lets an OpenClaw agent finish a
+keyboard-typed task and deliver the result through RTT instead of just
+replying in text.
+
+OpenClaw won't discover this on its own — add a note to its `TOOLS.md`
+(`~/.openclaw/workspace/TOOLS.md`) so the agent knows the capability exists
+and when to use it:
+
+```markdown
+### RealTimeTalk — push text to be read aloud
+
+If <you> asks for something via keyboard/text (not voice) and wants the
+result spoken through RealTimeTalk once it's ready — e.g. "look into X and
+read me what you find" typed instead of said — call this instead of just
+replying in text:
+
+​```bash
+curl "http://localhost:19000/speak?text=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "YOUR TEXT HERE")"
+​```
+
+- Local-only, GET, URL-encode the text, keep it to a spoken-length summary.
+- Success looks like `{"ok": true, "queued": true, "chars": N}`.
+- Only use this when RTT is the actual delivery channel wanted — not as a
+  substitute for normal chat replies.
+```
+
+No daemon restart needed — OpenClaw's `AGENTS.md` convention re-reads the
+workspace fresh every session, so this takes effect on the next one.
+
 ---
 
 ## 9. Troubleshooting

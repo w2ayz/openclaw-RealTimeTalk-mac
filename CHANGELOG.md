@@ -1,5 +1,33 @@
 # Changelog
 
+## [3.15.0] — 2026-08-19
+
+### Fixed
+- **`/speak?text=...` crashed on every call.** This local-only endpoint —
+  lets any process on the machine (an OpenClaw agent, a script, etc.) push
+  arbitrary text through the normal `speak()` TTS pipeline on demand,
+  independent of the voice conversation flow — called an undefined
+  `_json(self, code, obj)` helper. The `speak()` call itself still fired
+  correctly (confirmed live: the text was actually spoken), but the
+  handler then crashed trying to send the JSON confirmation response, so
+  every caller saw a reset connection with no way to tell the call had
+  actually worked. Added the missing helper — named `_send_json`, not
+  `_json`: dozens of unrelated branches elsewhere in the same `do_GET`
+  method do `import json as _json` as a local module alias, and Python
+  treats any name assigned anywhere in a function as local to the whole
+  function, so a helper literally named `_json` gets shadowed by those
+  (unreached) local imports and hits the identical `UnboundLocalError` —
+  confirmed live this was the actual second failure mode.
+
+### Added
+- **README.md / DEPLOYMENT.md**: documented `/speak` under "Control" /
+  "Day-to-day control", including the exact `TOOLS.md` snippet to add to
+  an OpenClaw agent's workspace so it knows the capability exists and
+  reaches for it when a keyboard-typed request should be delivered back
+  through RTT's voice instead of as text — e.g. "look into X and read me
+  what you find." Verified live end-to-end: OpenClaw calling `/speak`
+  after finishing a text-triggered task, RTT speaking the result.
+
 ## [3.14.0] — 2026-08-18
 
 ### Fixed
