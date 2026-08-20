@@ -26,7 +26,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.15.0"
+__version__ = "3.17.0"
 
 import argparse
 import asyncio
@@ -289,10 +289,20 @@ _cal_mode_override = [None]
 _device_change_msg = [""]
 _audio_fingerprint = [""]
 _query_devices_fresh_cache: list = [None, 0.0]   # [cached device list, epoch cached] — see _query_devices_fresh
-_paused_speech: list = [None]   # (clean_text, alsa_output) saved on TTS interrupt; None otherwise
+_paused_speech: list = [None]   # {"remaining","full","alsa"} dict saved on TTS interrupt
+                                 # (resumable=True); None otherwise
 _post_busy_until:  list = [0.0] # timestamp; mic sends silence until this time after busy clears
 _http_interrupt:   list = [False]  # set by /interrupt HTTP route to cut TTS mid-playback
 _is_speaking:      list = [False]  # True while speak() is playing audio
+_speak_lock = threading.Lock()  # serializes speak() calls — two concurrent callers (e.g. two
+                                 # /speak requests) would otherwise race on _is_speaking/
+                                 # _http_interrupt and overlap audio. Also gates a new call from
+                                 # starting while a previous reading is paused awaiting a
+                                 # Continue/Replay/Cancel decision — see the acquire loop in speak().
+_speak_used_this_turn: list = [False]  # set by /speak; checked (and reset) when a voice turn's
+                                 # own reply is about to be spoken, so that reply doesn't get
+                                 # voiced a second time on top of whatever was already sent via
+                                 # /speak — see _handle_transcript
 _current_think_task: list = [None]  # asyncio.Task for current gw.ask(); cancelled by /interrupt
 _last_history_reply: list = [""]    # last text returned by the status-token history fallback
 _last_mic_cb:        list = [0.0]   # epoch of last _mic_cb invocation — used for hot-plug detection
@@ -2430,6 +2440,26 @@ def _split_by_script(text: str) -> list[tuple[str, str]]:
             segments.append((seg, current_lang or 'en'))
     return [(s, l) for s, l in segments if s]
 
+_SENTENCE_END_RE = re.compile(r'[.!?。！？]+[\'"’”)\]}】」』]?(?:\s+|$)')
+
+def _sentence_start_before(text: str, char_pos: int) -> int:
+    """Character offset of the start of the sentence containing char_pos.
+
+    Used to resume interrupted playback from the beginning of the sentence that was
+    cut off, rather than replaying the whole message from scratch or resuming mid-word.
+    Ported from the Pi fork's v3.16.0 Continue/Replay/Cancel feature.
+    """
+    start = 0
+    for m in _SENTENCE_END_RE.finditer(text):
+        pos = m.end()
+        if pos >= len(text):
+            break
+        if pos <= char_pos:
+            start = pos
+        else:
+            break
+    return start
+
 
 def _num_to_zh(n: int) -> str:
     """Convert a non-negative integer to Chinese character representation."""
@@ -2708,7 +2738,33 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
     temp_files: list[str] = []
     silence_samples = int(TTS_SAMPLE_RATE * silence_ms / 1000)
     _tx_radio = False   # set True below once TTS is ready, if Radio Mode is transmitting this reply
+    # Sample counts for the leading/trailing padding, so an interrupt mid-playback can subtract
+    # them back out and estimate how far into the actual *content* we got — see the sentence-
+    # resume calculation near the end of this function. Ported from the Pi fork's v3.16.0 feature.
+    _lead_pad_samples = silence_samples if silence_ms > 0 else 0
+    _tail_pad_added   = False
 
+    # Serialize playback: block here (not just around the audio itself) so a second caller's
+    # synthesis+playback never overlaps the first's — that overlap is what let two concurrent
+    # speak() calls stomp each other's _is_speaking/_http_interrupt state.
+    #
+    # Also hold off entirely while a previous reading is paused awaiting a Continue/Replay/
+    # Cancel decision, rather than auto-playing whatever's queued next: that unrelated next
+    # item finishing normally would otherwise hit the "not interrupted" branch below and clear
+    # _paused_speech — a single global slot — wiping out the still-unresolved pause and making
+    # the buttons vanish before anyone touched them. Re-checked after each lock acquisition (not
+    # just once up front) so a call that was already queued when the interrupt landed can't slip
+    # through the instant the lock frees up. /continue and /replay clear _paused_speech
+    # themselves before spawning their own speak() call, so a legitimate resume passes straight
+    # through; Cancel clears it without playing anything, which also releases anything waiting
+    # here. Ported from the Pi fork's v3.17.0 fix.
+    import time as _spk_wait_time
+    while True:
+        _speak_lock.acquire()
+        if _paused_speech[0] is None:
+            break
+        _speak_lock.release()
+        _spk_wait_time.sleep(0.2)
     try:
         if silence_ms > 0:
             pcm_parts.append(np.zeros(silence_samples, dtype=np.int16))
@@ -2751,6 +2807,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
 
         if silence_ms > 0 and len(pcm_parts) > 1:
             pcm_parts.append(np.zeros(silence_samples, dtype=np.int16))
+            _tail_pad_added = True
 
         if not pcm_parts:
             return
@@ -2762,6 +2819,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
             final = np.clip(final.astype(np.float32) * total_gain, -32768, 32767).astype(np.int16)
 
         _interrupted = [False]
+        _tick_at_break = 0   # tick_idx when interrupted — how far into `final` we got
         out_dev = _selected_output_device[0]
         # Radio Mode: route TTS out over the air instead of the local speaker,
         # keyed by PTT for the duration of playback. _ptt_alive() confirms the
@@ -2864,6 +2922,21 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                         else:
                             log.info("  no coupling data — using floor threshold=%d",
                                      interrupt_threshold)
+                    # The guard only gates the mic-based auto-barge-in calibration above —
+                    # an explicit Stop-button /interrupt must never wait on it. Without this
+                    # check here, the `continue` below skipped straight past the identical
+                    # check further down, so Stop silently did nothing for the first
+                    # INTERRUPT_GUARD_TICKS*50ms of every reply. Ported from the Pi fork's
+                    # v3.17.0 fix.
+                    if _http_interrupt[0]:
+                        log.info("HTTP interrupt — stopping TTS (during guard)")
+                        _http_interrupt[0] = False
+                        _interrupted[0] = True
+                        _tick_at_break = tick_idx
+                        _clear_audio_buffer[0] = True
+                        try: sd.stop()
+                        except Exception: pass
+                        break
                     continue
 
                 # Keep tracking coupling past the initial guard so a long or unevenly-
@@ -2894,10 +2967,8 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                     log.info("HTTP interrupt — stopping TTS")
                     _http_interrupt[0] = False
                     _interrupted[0] = True
+                    _tick_at_break = tick_idx
                     _clear_audio_buffer[0] = True  # flush OpenAI VAD buffer after interrupt
-                    if resumable:
-                        _paused_speech[0] = (clean, alsa_output)
-                        log.info("  Saved %d chars for resume", len(clean))
                     try:
                         sd.stop()
                     except Exception:
@@ -2910,10 +2981,8 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                         log.info("Speech interrupt — stopping TTS (peak=%d threshold=%d)",
                                  p, interrupt_threshold)
                         _interrupted[0] = True
+                        _tick_at_break = tick_idx
                         _clear_audio_buffer[0] = True  # flush OpenAI VAD buffer after interrupt
-                        if resumable:
-                            _paused_speech[0] = (clean, alsa_output)
-                            log.info("  Saved %d chars for resume", len(clean))
                         try:
                             sd.stop()
                         except Exception:
@@ -2930,7 +2999,29 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
             _t.sleep(_ptt_tail_s())
             _ptt_release()
 
-        if not _interrupted[0] and resumable:
+        # Save state for the Continue/Replay/Cancel buttons if interrupted mid-sentence;
+        # clear on normal finish. "full" is the whole message (Replay); "remaining" is
+        # estimated from how far into `final` playback got when it was cut off, rounded
+        # back to the start of whichever sentence was in progress (Continue) — see
+        # _sentence_start_before(). Falls back to the whole message when we have no usable
+        # position (e.g. interrupted during Radio TX, which skips the monitor loop
+        # entirely and so never breaks with a real _tick_at_break). Ported from the Pi
+        # fork's v3.16.0 Continue/Replay/Cancel feature.
+        if _interrupted[0] and resumable:
+            full_text = clean
+            remaining_text = full_text
+            if not _tx_radio:
+                content_total = len(final) - _lead_pad_samples - (_lead_pad_samples if _tail_pad_added else 0)
+                if content_total > 0 and full_text:
+                    played = _tick_at_break * TICK_SAMPLES - _lead_pad_samples
+                    played = max(0, min(played, content_total))
+                    char_est = int(played / content_total * len(full_text))
+                    start = _sentence_start_before(full_text, char_est)
+                    remaining_text = full_text[start:].strip() or full_text
+            _paused_speech[0] = {"remaining": remaining_text, "full": full_text, "alsa": alsa_output}
+            log.info("  Saved %d/%d chars remaining for /continue (/replay replays all)",
+                      len(remaining_text), len(full_text))
+        elif not _interrupted[0] and resumable:
             _paused_speech[0] = None   # finished normally — nothing to resume
 
     except Exception as e:
@@ -2946,6 +3037,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         for p in temp_files:
             try: os.unlink(p)
             except FileNotFoundError: pass
+        _speak_lock.release()
 
 # ── OpenClaw gateway client ───────────────────────────────────────────────────
 
@@ -3238,7 +3330,14 @@ class RealtimeSession:
         # transmitted audio; keep sending silence rather than a stream gap so
         # the OpenAI Realtime session's VAD stays continuous.
         import time as _tcb
-        if self._busy.is_set() or _tcb.time() < _post_busy_until[0] or _is_tx[0]:
+        if self._busy.is_set() or _is_speaking[0] or _tcb.time() < _post_busy_until[0] or _is_tx[0]:
+            # _is_speaking covers /speak, Continue, and Replay — those paths don't set
+            # self._busy the way a normal reply does, so without this check Zeebot's own
+            # voice from those kept getting streamed to OpenAI for transcription (wastefully,
+            # though harmlessly — a separate downstream _is_speaking check already discarded
+            # any resulting transcript before acting on it). Doesn't touch _mic_level_current
+            # above — that's already updated, so voice barge-in during any of these is
+            # unaffected. Ported from the Pi fork's v3.17.0 fix.
             silence = np.zeros_like(raw)
             self.loop.call_soon_threadsafe(self._enqueue_mic, silence.tobytes())
             return
@@ -3322,20 +3421,6 @@ class RealtimeSession:
             self._capture_consumed = True
             return b"".join(self._capture_buf)
         return None
-
-    async def _resume_from_http(self, text: str, alsa_output):
-        """Resume paused TTS playback triggered by the /continue HTTP button."""
-        import functools as _fct
-        if self._busy.is_set():
-            return
-        self._busy.set()
-        try:
-            _log_entry("system", "Resuming…")
-            await asyncio.get_running_loop().run_in_executor(
-                None, _fct.partial(speak, text, alsa_output, resumable=True)
-            )
-        finally:
-            self._busy.clear()
 
     async def _run_calibration(self):
         """Measure ambient noise via the live mic stream and update MIC_GATE_PEAK."""
@@ -3872,12 +3957,13 @@ class RealtimeSession:
             log.info("Short noise guard — dropped single word: %r", transcript)
             return
 
-        # Continue phrase — resume paused TTS without asking Zeebot
+        # Continue phrase — resume paused TTS (from where it was cut off) without asking Zeebot
         if _matches_phrase(normalized, CONTINUE_PHRASES):
             saved = _paused_speech[0]
             if saved:
-                saved_text, saved_dev = saved
-                _paused_speech[0] = (saved_text, saved_dev)  # keep in case resume is re-interrupted
+                _paused_speech[0] = None  # clear before speak() re-enters, or its own
+                                           # queue-hold wait-loop would deadlock on itself
+                saved_text, saved_dev = saved["remaining"], saved["alsa"]
                 log.info("Resume: replaying %d chars", len(saved_text))
                 _log_entry("system", "Resuming…")
                 self._busy.set()
@@ -3895,6 +3981,7 @@ class RealtimeSession:
 
         # New request — discard any paused speech
         _paused_speech[0] = None
+        _speak_used_this_turn[0] = False
 
         self._busy.set()
         try:
@@ -3949,10 +4036,17 @@ class RealtimeSession:
                     return
                 _last_history_reply[0] = reply
             log.info("Zeebot: %s", reply)
-            _log_entry("zeebot", reply)
-            await asyncio.get_running_loop().run_in_executor(
-                None, _ft.partial(speak, reply, self.alsa_output, resumable=True)
-            )
+            if _speak_used_this_turn[0]:
+                # This turn already read something aloud via /speak — don't also voice
+                # the reply on top of it. Show it as a de-emphasized status line instead,
+                # same styling as other system/meta log entries, so it's still visible on
+                # the dashboard without being spoken. Ported from the Pi fork's v3.17.0 fix.
+                _log_entry("system", f"{AGENT_NAME} (text only): {reply}")
+            else:
+                _log_entry("zeebot", reply)
+                await asyncio.get_running_loop().run_in_executor(
+                    None, _ft.partial(speak, reply, self.alsa_output, resumable=True)
+                )
         except asyncio.TimeoutError:
             log.error("OpenClaw agent timed out")
             await asyncio.get_running_loop().run_in_executor(
@@ -4285,7 +4379,9 @@ def _dashboard_dynamic(sess) -> dict:
         ' &nbsp;<a href="/interrupt" class="irupt">&#10005; Stop</a></div>'
         if speaking else
         '<div class="speaking">&#9646;&#9646; Paused'
-        ' &nbsp;<a href="/continue" class="cont">&#9654; Continue</a></div>'
+        ' &nbsp;<a href="/continue" class="cont">&#9654; Continue</a>'
+        ' &nbsp;<a href="/replay" class="rpl">&#8635; Replay</a>'
+        ' &nbsp;<a href="/cancel" class="cnl">&#10005; Cancel</a></div>'
         if paused else ""
     )
 
@@ -4342,18 +4438,43 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
 
         def do_GET(self):
             sess = session_ref[0]
-            if self.path == "/continue":
+            if self.path in ("/continue", "/replay"):
+                # /continue resumes from the sentence that was cut off; /replay plays the
+                # whole message again from the top. NOT named /restart — that path already
+                # exists (nav bar) for restarting the RealTimeTalk daemon itself via
+                # launchctl kickstart; reusing it here would silently shadow this branch,
+                # since do_GET's elif chain matches whichever handler is defined first.
+                #
+                # Spawns speak() directly (like /speak) instead of routing through
+                # sess._resume_from_http() — sess is None until the device has been woken
+                # at least once (session_ref starts as [None] and only gets a
+                # RealtimeSession after a wake event; RTT boots asleep by default), so
+                # requiring sess here silently no-op'd Continue/Replay whenever a /speak-
+                # triggered readout was interrupted while asleep — the common case.
+                #
+                # Clears _paused_speech immediately so a double-click (or the two buttons
+                # clicked in quick succession) can't both re-enter — speak() re-saves it
+                # if this playback is itself interrupted again. Ported from the Pi fork's
+                # v3.16.0 Continue/Replay/Cancel feature.
                 saved = _paused_speech[0]
-                if saved and sess and loop:
-                    import functools as _fct
-                    saved_text, saved_dev = saved
-                    def _resume():
-                        import asyncio as _asyncio
-                        _asyncio.run_coroutine_threadsafe(
-                            sess._resume_from_http(saved_text, saved_dev), loop
-                        )
-                    threading.Thread(target=_resume, daemon=True).start()
-                    log.info("HTTP continue — resuming %d chars", len(saved_text))
+                if saved:
+                    _paused_speech[0] = None
+                    key   = "full" if self.path == "/replay" else "remaining"
+                    saved_text, saved_dev = saved[key], saved["alsa"]
+                    _log_entry("system", "Replaying…" if self.path == "/replay" else "Resuming…")
+                    threading.Thread(target=speak, args=(saved_text, saved_dev, -1.0, 300, True),
+                                      daemon=True).start()
+                    log.info("HTTP %s — %d chars", self.path.lstrip("/"), len(saved_text))
+                self.send_response(302)
+                self.send_header("Location", "/dashboard")
+                self.end_headers()
+            elif self.path == "/cancel":
+                # Discard paused speech and go back to the pre-interrupt state — no replay.
+                # Ported from the Pi fork's v3.16.0 Continue/Replay/Cancel feature.
+                had = _paused_speech[0] is not None
+                _paused_speech[0] = None
+                _log_entry("system", "Reading cancelled.")
+                log.info("HTTP cancel — discarded paused speech" if had else "HTTP cancel — nothing paused")
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
@@ -6232,7 +6353,9 @@ Restart daemon after training to reload profiles.</p>
                     return
                 alsa = sess.alsa_output if sess else ALSA_OUTPUT
                 _log_entry("zeebot", text)
-                threading.Thread(target=speak, args=(text, alsa), daemon=True).start()
+                _speak_used_this_turn[0] = True
+                threading.Thread(target=speak, args=(text, alsa, -1.0, 300, True),
+                                  daemon=True).start()
                 log.info("HTTP speak — queued %d chars", len(text))
                 _send_json(self, 200, {"ok": True, "queued": True, "chars": len(text)})
 
@@ -6304,6 +6427,10 @@ a.irupt{{color:var(--rd);background:var(--rdb);border:1px solid var(--rd);border
 a.irupt:hover{{background:var(--rd);color:#fff;}}
 a.cont{{color:var(--gn);background:var(--gnb);border:1px solid var(--gn);border-radius:4px;padding:2px 8px;font-size:.82em;font-style:normal;text-decoration:none;margin-left:8px;}}
 a.cont:hover{{background:var(--gn);color:#000;}}
+a.rpl{{color:var(--you);background:var(--yb);border:1px solid var(--you);border-radius:4px;padding:2px 8px;font-size:.82em;font-style:normal;text-decoration:none;margin-left:8px;}}
+a.rpl:hover{{background:var(--you);color:#000;}}
+a.cnl{{color:var(--mu);background:var(--sf2);border:1px solid var(--mu);border-radius:4px;padding:2px 8px;font-size:.82em;font-style:normal;text-decoration:none;margin-left:8px;}}
+a.cnl:hover{{background:var(--mu);color:#000;}}
 @media(max-width:520px){{body{{font-size:15px;}}#top{{padding:10px 12px 8px;}}a.btn{{padding:5px 8px;font-size:11px;}}#dp{{font-size:12px;}}#log{{padding:8px 10px;}}}}
 @media(min-width:900px){{body{{font-size:17px;}}#top{{padding:14px 24px 10px;}}a.btn{{font-size:13px;padding:6px 12px;}}#dp{{font-size:13px;}}#log{{padding:14px 24px;}}}}
 </style></head><body>
