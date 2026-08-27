@@ -2007,6 +2007,14 @@ def _resolve_provider_api_key(cfg: dict, provider: str) -> str:
         for part in [p for p in key.get("id", "").split("/") if p]:
             secrets = secrets[part]
         key = secrets
+    if isinstance(key, str) and key.startswith("keychain:"):
+        parts   = key.split(":", 2)
+        service = parts[1] if len(parts) > 1 else ""
+        account = parts[2] if len(parts) > 2 else "default"
+        key = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
     # store SecretRef: the named secret may live in the environment, at the
     # top level of any configured file-based secrets provider, or under that
     # provider's providers.<name>.apiKey subtree.
