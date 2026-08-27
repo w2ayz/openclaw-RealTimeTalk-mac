@@ -6,7 +6,9 @@
 #   2. Verify Edge TTS skill is installed
 #   3. Create Python venv and install dependencies
 #   4. Verify openai.apiKey is configured in openclaw.json
-#   5. List audio devices and prompt user for input + output device indices
+#   5. List audio devices and prompt user for input + output device indices,
+#      agent name, and wake phrase; optionally download the Voice ID
+#      speaker-embedding model
 #   6. Render and install the LaunchAgent plist
 #   7. Load the agent
 
@@ -107,8 +109,46 @@ echo
 
 read -r -p "Input device index  [Enter for system default]: " IN_DEV
 read -r -p "Output device index [Enter for system default]: " OUT_DEV
-read -r -p "Agent name          [Enter for default 'Zeebot']: " AGENT_NAME_ARG
-read -r -p "Wake phrase         [Enter for '<name> wake up']: " WAKE_PHRASE_ARG
+while true; do
+    read -r -p "Agent name          [Enter for default 'Zeebot']: " AGENT_NAME_ARG
+    read -r -p "Wake phrase         [Enter for '<name> wake up']: " WAKE_PHRASE_ARG
+
+    echo "  Agent name:  ${AGENT_NAME_ARG:-Zeebot}"
+    echo "  Wake phrase: ${WAKE_PHRASE_ARG:-<name> wake up}"
+    read -r -p "Are you sure about Agent Name and Wake Phrase? [Y/n]: " CONFIRM_NAME_WAKE
+    if [[ ! "$CONFIRM_NAME_WAKE" =~ ^[Nn] ]]; then
+        break
+    fi
+    echo
+done
+echo
+
+# ── 5.5. Voice ID speaker-embedding model ────────────────────────────────────
+
+SPK_MODEL_DIR="$HOME/.local/share/rtt/speaker"
+SPK_MODEL_FILE="$SPK_MODEL_DIR/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+SPK_MODEL_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+
+if [[ -f "$SPK_MODEL_FILE" ]]; then
+    green "  ✓ Voice ID speaker model already present at $SPK_MODEL_FILE"
+else
+    echo
+    read -r -p "Download Voice ID speaker model now (~28 MB, enables owner voice recognition)? [Y/n]: " DL_SPK_MODEL
+    if [[ ! "$DL_SPK_MODEL" =~ ^[Nn] ]]; then
+        mkdir -p "$SPK_MODEL_DIR"
+        echo "Downloading speaker-embedding model..."
+        if curl -fL -o "$SPK_MODEL_FILE" "$SPK_MODEL_URL"; then
+            green "  ✓ Voice ID speaker model installed at $SPK_MODEL_FILE"
+        else
+            rm -f "$SPK_MODEL_FILE"
+            yellow "  ✗ Download failed — Voice ID will fail open (accept all speakers) until you retry."
+            yellow "    Manual retry: curl -fL -o \"$SPK_MODEL_FILE\" \"$SPK_MODEL_URL\""
+        fi
+    else
+        yellow "  → Skipped. Voice ID will fail open (accept all speakers) until you download the model — see README §Voice ID."
+    fi
+fi
+echo
 
 EXTRA_ARGS=()
 if [[ -n "$IN_DEV" ]];         then EXTRA_ARGS+=("--input-device"  "$IN_DEV");         fi
