@@ -40,6 +40,7 @@ import logging
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -125,7 +126,11 @@ EDGE_TTS_TIMEOUT  = 8.0
 # macOS `say` — offline fallback. Voices are pre-installed on macOS.
 SAY_VOICE_EN      = "Samantha"
 SAY_VOICE_ZH      = "Tingting"
-FFMPEG_CMD        = "/opt/homebrew/bin/ffmpeg"
+FFMPEG_CMD        = (
+    shutil.which("ffmpeg")
+    or next((p for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")
+             if os.path.exists(p)), "ffmpeg")
+)
 
 OPENAI_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
 OPENAI_WS_URL     = "wss://api.openai.com/v1/realtime?intent=transcription"
