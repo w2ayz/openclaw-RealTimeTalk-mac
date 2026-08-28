@@ -26,7 +26,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.17.0"
+__version__ = "3.18.0"
 
 import argparse
 import asyncio
@@ -4849,16 +4849,19 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
 <button onclick="recRadio(this,'3','mixed')">&#9210; Record 5s</button> <span id="rs3"></span></div>
 <div class="card">
 <button id="saveRadio" onclick="saveRadio()">&#128190; Save radio profile</button>
-<button onclick="clearDevice('{_radio_in_name}')" style="border-color:var(--rd)">&#10006; Clear radio profile</button>
-<div id="resultRadio" class="info"></div></div>""") if _show_radio_section else ""
+<div id="resultRadio" class="info"></div></div>
+<div class="card danger">
+<b class="bad">&#9888; Danger zone</b>
+<p class="info">Deletes the saved radio voice profile. Owner-Only mode still works over radio but will accept all speakers until you re-enroll.</p>
+<span class="clearwrap"><button onclick="confirmClear(this,'{_radio_in_name}')" style="border-color:var(--rd)">&#10006; Clear radio profile</button></span></div>""") if _show_radio_section else ""
 
                 other_devices = sorted(d for d in _owner_profiles
                                         if d != current_device and d != _radio_in_name)
                 other_rows = "".join(
                     f'<div class="card" style="display:flex;justify-content:space-between;'
                     f'align-items:center;"><span>{d}</span>'
-                    f'<button onclick="clearDevice(\'{d}\')" style="border-color:var(--rd)">'
-                    f'&#10006; Clear</button></div>'
+                    f'<span class="clearwrap"><button onclick="confirmClear(this,\'{d}\')" '
+                    f'style="border-color:var(--rd)">&#10006; Clear</button></span></div>'
                     for d in other_devices
                 )
                 other_section = (
@@ -4876,6 +4879,9 @@ h3{{margin:8px 0}} .info{{color:var(--mu);font-size:13px;margin:4px 0}}
 .card{{background:var(--sf);border:1px solid var(--bd);border-radius:var(--r);padding:12px;margin:10px 0}}
 button{{padding:8px 14px;border:1px solid var(--bd);border-radius:var(--r);background:#121925;color:var(--tx);font-size:14px;cursor:pointer}}
 button:disabled{{opacity:.4}} .ok{{color:var(--gn)}} .bad{{color:var(--rd)}}
+.card.danger{{border-color:#5a2230;background:#160d12}}
+.clearwrap{{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap}}
+.clearwrap .confirmtxt{{color:var(--rd);font-size:13px}}
 a{{color:var(--you)}} .meter{{height:8px;background:#121925;border-radius:4px;overflow:hidden;margin:8px 0}}
 .meter>div{{height:100%;width:0;background:var(--gn)}}
 </style></head><body>
@@ -4897,8 +4903,11 @@ Switch devices (Calibrate page) before recording to enroll a different one.</p>
 <div class="card">
 <button id="save" onclick="save()">&#128190; Save profile for {current_device}</button>
 <button onclick="test(this)">&#127897; Test my voice</button>
-<button onclick="clearDevice('{current_device}')" style="border-color:var(--rd)">&#10006; Clear this device's profile</button>
 <div id="result" class="info"></div></div>
+<div class="card danger">
+<b class="bad">&#9888; Danger zone</b>
+<p class="info">Deletes the saved voice profile for {current_device}. You&rsquo;ll have to re-record all three samples to enroll it again.</p>
+<span class="clearwrap"><button onclick="confirmClear(this,'{current_device}')" style="border-color:var(--rd)">&#10006; Clear this device&rsquo;s profile</button></span></div>
 {_radio_section}
 {other_section}
 <script>
@@ -4949,9 +4958,18 @@ async function test(btn) {{
       : `<span class="bad">${{j.error}}</span>`;
   }} finally {{ btn.disabled = false; }}
 }}
-async function clearDevice(device) {{
-  if (!confirm(`Delete the enrolled voice profile for "${{device}}"?`)) return;
-  await fetch(`/voice-enroll/clear?device=${{encodeURIComponent(device)}}`); location.reload();
+function confirmClear(btn, device) {{
+  const wrap = btn.closest('.clearwrap');
+  const restore = wrap.innerHTML;
+  wrap.innerHTML = `<span class="confirmtxt">Delete voice profile for &ldquo;${{device}}&rdquo;? This can&rsquo;t be undone.</span>`
+    + `<button class="doclear" style="border-color:var(--rd)">&#10006; Yes, clear</button>`
+    + `<button class="cancelclear">Cancel</button>`;
+  wrap.querySelector('.cancelclear').onclick = () => {{ wrap.innerHTML = restore; }};
+  wrap.querySelector('.doclear').onclick = async (e) => {{
+    e.target.disabled = true;
+    await fetch(`/voice-enroll/clear?device=${{encodeURIComponent(device)}}`);
+    location.reload();
+  }};
 }}
 </script></body></html>"""
                 _html(self, 200, body)

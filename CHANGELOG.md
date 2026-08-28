@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.18.0] — 2026-08-28
+
+Kept in lockstep with the [Pi fork](https://github.com/w2ayz/openclaw-RealTimeTalk)'s v3.18.0 — same change, released on both at once (Mac was on 3.17.0, Pi on 3.17.1; both land on 3.18.0).
+
+### Changed
+- **`/voice-enroll`: the "Clear this device's profile" button is now separated from Save/Test into its own red-bordered "Danger zone" card**, with a line explaining what clearing costs (re-recording all three samples). Previously it sat inline right next to Save, one slip away from wiping an enrolled profile.
+- **Clearing a profile now asks for confirmation inline instead of via a native `confirm()` dialog.** Clicking any Clear button (active device, radio profile, or a row under "Other enrolled devices") swaps it in place for a "Delete voice profile for …? This can't be undone." prompt with explicit **Yes, clear** / **Cancel** buttons; only "Yes, clear" issues the `/voice-enroll/clear` request. The native `confirm()` was replaced partly because it can wedge headless/automated browser sessions.
+
 ## [3.17.0] — 2026-08-20
 
 Jumps straight from 3.15.0 to 3.17.0 to match the [Pi fork](https://github.com/w2ayz/openclaw-RealTimeTalk)'s version number — same precedent as the 3.12.6→3.14.0 jump: no standalone 3.16.0 ever existed on this fork, this port brings across both Pi's v3.16.0 feature and its v3.17.0 fixes in one commit.
