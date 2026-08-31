@@ -110,7 +110,7 @@ PY
 ```
 
 > **Key format:** use a regular `sk-...` or `sk-proj-...` key. The OAuth
-> profile (`openai:victorzengyi@gmail.com` / `openai-codex`) is rejected
+> profile (`openai:<your-openai-account>` / `openai-codex`) is rejected
 > by the Realtime API. A project-scoped `sk-proj-...` key works fine.
 
 `elevenlabs` is optional — omit or leave blank and it falls back to
