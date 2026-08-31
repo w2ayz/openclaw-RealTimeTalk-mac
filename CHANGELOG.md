@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.19.0] — 2026-08-30
+
+### Added
+- **`RealTimeTalk-toggle.sh disable` / `enable`** — a persistent mic kill-switch. `disable` runs `launchctl bootout` + `launchctl disable` (so it stays off across reboots, not just until next login like `stop`), reaps the daemon directly if an older wrapper orphaned it, then verifies no RTT process is running and port 19000 is free before reporting success. `enable` runs `launchctl enable` (required before `bootstrap` — launchd silently refuses a disabled job) + `bootstrap` + `kickstart`, then polls `/status` until the daemon answers. `status` now also reports when the LaunchAgent is disabled. README's "Disabling RealTimeTalk" section leads with these; the raw `launchctl` sequence is kept as a collapsed reference.
+
+### Fixed
+- **DEPLOYMENT.md still said `toggle.sh restart` uses `kickstart -k` and "does NOT reload a changed plist".** Stale since 3.18.1 — `restart` switched to `bootout` + `bootstrap` and does reload the plist. Updated there and in the troubleshooting table.
+
 ## [3.18.1] — 2026-08-30
 
 Mac-only packaging/lifecycle changes — no daemon behavior change. (Groups in commit `3f924b7`, which shipped unversioned.)

@@ -164,9 +164,11 @@ Privacy & Security → Microphone if needed.
 
 ```bash
 bash RealTimeTalk-toggle.sh start     # load LaunchAgent
-bash RealTimeTalk-toggle.sh stop      # unload
-bash RealTimeTalk-toggle.sh restart   # bounce
-bash RealTimeTalk-toggle.sh status    # launchctl status
+bash RealTimeTalk-toggle.sh stop      # unload (comes back at next login)
+bash RealTimeTalk-toggle.sh restart   # bounce, re-reading the plist
+bash RealTimeTalk-toggle.sh disable   # stop + keep off across reboots (mic kill-switch); verifies mic released
+bash RealTimeTalk-toggle.sh enable    # undo disable, wait until the dashboard answers
+bash RealTimeTalk-toggle.sh status    # launchctl status (+ whether it's disabled)
 bash RealTimeTalk-toggle.sh log       # tail /tmp/openclaw/realtimetalk.log
 bash RealTimeTalk-toggle.sh devices   # list CoreAudio inputs/outputs
 ```
@@ -239,42 +241,47 @@ required.
 the LaunchAgent has `RunAtLoad`, so it comes back on reboot. To stop it
 **and** keep it from starting again (no mic capture, no OpenAI Realtime
 connection, no spoken output, dashboard down) without uninstalling
-anything:
+anything, use the `disable` / `enable` subcommands — this is the mic
+kill-switch:
 
 ```bash
-UID_VAL=$(id -u)
-launchctl bootout  "gui/$UID_VAL/ai.openclaw.realtimetalk" 2>/dev/null   # stop now
-launchctl disable  "gui/$UID_VAL/ai.openclaw.realtimetalk"               # persist across reboots
+bash RealTimeTalk-toggle.sh disable    # stop now, keep off across reboots, verify the mic is released
+bash RealTimeTalk-toggle.sh enable     # undo it and start again, waiting until the dashboard answers
+bash RealTimeTalk-toggle.sh status     # shows "DISABLED" when it's off
 ```
 
-Verify it's fully down:
-
-```bash
-pgrep -fl 'RealTimeTalk.app|RealTimeTalk-daemon.py'    # → no output
-lsof -iTCP:19000 -sTCP:LISTEN                          # → no output (dashboard gone)
-launchctl print-disabled "gui/$(id -u)" | grep realtimetalk   # → "...realtimetalk" => disabled
-```
+`disable` runs `launchctl bootout` then `launchctl disable`, reaps the
+daemon if an older wrapper orphaned it, and then confirms nothing is
+running and port 19000 is free. `enable` runs `launchctl enable` (required
+first — `bootstrap` silently refuses a disabled job) then `bootstrap`, and
+polls `/status` until the daemon is up.
 
 macOS shows an **orange dot** by the menu-bar clock whenever anything is
 using the mic — with RTT disabled you should never see it (unless another
-app is). For belt-and-suspenders, also switch **RealTimeTalk** off in
-System Settings → Privacy & Security → Microphone.
+app is). For belt-and-suspenders you can also switch **RealTimeTalk** off
+in System Settings → Privacy & Security → Microphone (re-grant it before
+`enable` if you do).
 
 This leaves the gateway (`ai.openclaw.gateway`) and everything else in
 OpenClaw untouched — it only uses the mic through this daemon.
 
-#### Re-enabling
+<details><summary>Equivalent raw <code>launchctl</code> commands</summary>
 
 ```bash
 UID_VAL=$(id -u)
+# disable
+launchctl bootout  "gui/$UID_VAL/ai.openclaw.realtimetalk" 2>/dev/null
+launchctl disable  "gui/$UID_VAL/ai.openclaw.realtimetalk"
+# verify: all three should show nothing / "=> disabled"
+pgrep -fl 'RealTimeTalk.app|RealTimeTalk-daemon.py'
+lsof -iTCP:19000 -sTCP:LISTEN
+launchctl print-disabled "gui/$UID_VAL" | grep realtimetalk
+# enable
 launchctl enable    "gui/$UID_VAL/ai.openclaw.realtimetalk"
 launchctl bootstrap "gui/$UID_VAL" ~/Library/LaunchAgents/ai.openclaw.realtimetalk.plist
 ```
 
-`launchctl enable` is required first — while a service is `disable`d,
-`bootstrap` silently refuses to load it. Confirm with
-`bash RealTimeTalk-toggle.sh status` and re-grant the Microphone
-permission if you revoked it.
+</details>
 
 ---
 

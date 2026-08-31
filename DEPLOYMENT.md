@@ -53,7 +53,7 @@ internals, see [SKILL.md](SKILL.md).
 ├── requirements.txt                # Python deps (installed into venv/)
 ├── RealTimeTalk-install-mac.sh     # installer — run once
 ├── RealTimeTalk-build-wrapper-mac.sh   # builds the mic-permission wrapper app — run once, optional but recommended
-├── RealTimeTalk-toggle.sh          # start/stop/restart/status/log/devices — day-to-day control
+├── RealTimeTalk-toggle.sh          # start/stop/restart/disable/enable/status/log/devices — day-to-day control
 ├── ai.openclaw.realtimetalk.plist  # LaunchAgent template — installer copies + fills this in
 ├── test_speak.py                   # standalone TTS smoke-test script
 ├── assets/RealTimeTalk-icon.svg    # wrapper app icon source — rendered to .icns at build time (§5)
@@ -260,16 +260,18 @@ available, rather than failing the whole build). Then:
        <string>19000</string>
    </array>
    ```
-2. Reload with a **full unload/reload, not a restart**:
+2. Reload with a **full unload/reload** — `RealTimeTalk-toggle.sh restart`
+   does this (`bootout` + `bootstrap`), or by hand:
    ```bash
    launchctl bootout gui/$(id -u)/ai.openclaw.realtimetalk
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.realtimetalk.plist
    ```
-   `launchctl kickstart -k` (what `RealTimeTalk-toggle.sh restart` uses)
-   restarts the *process* but does **not** reload a changed *plist file* —
-   confirmed live, a `DYLD_LIBRARY_PATH` addition silently didn't take
-   effect through over an hour of otherwise-successful `kickstart -k`
-   restarts, only a bootout+bootstrap picked it up.
+   A bare `launchctl kickstart -k` restarts the *process* but does **not**
+   reload a changed *plist file* — confirmed live, a `DYLD_LIBRARY_PATH`
+   addition silently didn't take effect through over an hour of
+   otherwise-successful `kickstart -k` restarts; only a bootout+bootstrap
+   picked it up. (`toggle.sh restart` switched to bootout+bootstrap in
+   3.18.1 for exactly this reason.)
 
 First launch prompts for microphone access. If the dialog doesn't appear
 (background/agent launches sometimes suppress it), run the app once via
@@ -347,9 +349,11 @@ docstring for what's and isn't supported (notably: no Digirig Mobile).
 ```bash
 cd ~/.openclaw/workspace/skills/realtimetalk
 ./RealTimeTalk-toggle.sh start      # load the LaunchAgent
-./RealTimeTalk-toggle.sh stop       # unload it
-./RealTimeTalk-toggle.sh restart    # bounce it (does NOT reload a changed plist — see §5)
-./RealTimeTalk-toggle.sh status     # launchctl status
+./RealTimeTalk-toggle.sh stop       # unload it (back at next login)
+./RealTimeTalk-toggle.sh restart    # bounce it, re-reading the plist (bootout + bootstrap)
+./RealTimeTalk-toggle.sh disable    # stop + keep off across reboots; reaps an orphan, verifies mic released
+./RealTimeTalk-toggle.sh enable     # undo disable, wait until the dashboard answers
+./RealTimeTalk-toggle.sh status     # launchctl status (+ whether it's disabled)
 ./RealTimeTalk-toggle.sh log        # tail -f the log
 ./RealTimeTalk-toggle.sh devices    # list CoreAudio devices the daemon can see
 ```
@@ -412,8 +416,8 @@ workspace fresh every session, so this takes effect on the next one.
 
 | Symptom | Likely cause / fix |
 |---|---|
-| `OSError: [Errno 48] Address already in use` on restart | A stale process is still holding port 19000 — `launchctl kickstart -k` doesn't reliably kill the previous child. Kill it first: `lsof -i:19000 -P \| grep LISTEN \| awk '{print $2}' \| xargs kill -TERM`, then do a full bootout+bootstrap. |
-| Plist edit doesn't seem to take effect | You used `kickstart -k` or `RealTimeTalk-toggle.sh restart` — neither reloads a changed plist file. Use `launchctl bootout` + `bootstrap` instead (§5). |
+| `OSError: [Errno 48] Address already in use` on restart | A stale daemon is still holding port 19000. Pre-3.18.1 wrappers orphaned it on `bootout`/`kickstart`; rebuild the wrapper (§5). To clear one now: `pkill -f RealTimeTalk-daemon.py` (or `RealTimeTalk-toggle.sh disable` then `enable`), then a full bootout+bootstrap. |
+| Plist edit doesn't seem to take effect | You used a bare `kickstart -k` — it doesn't reload a changed plist file. Use `RealTimeTalk-toggle.sh restart` (bootout + bootstrap, since 3.18.1) or run `launchctl bootout` + `bootstrap` by hand (§5). |
 | `EXTRA_ARGS[@]: unbound variable` during install | bash 3.2 `set -u` bug — fixed in v3.9.2. Update to the latest commit; or see the manual workaround in §4 if you're stuck on an older clone. |
 | Daemon exits immediately with code 2 after switching to RealTimeTalk | The daemon script path is still in `ProgramArguments` as the second element. RealTimeTalk bakes that path in at compile time — passing it again causes `unrecognized arguments`. Remove the `__DAEMON_PATH__` entry from the plist array (see §5). |
 | `argument --input-device: invalid int value` | `--input-device` takes an integer index (e.g. `1`), not a device name string. Use `./RealTimeTalk-toggle.sh devices` to get the index. |

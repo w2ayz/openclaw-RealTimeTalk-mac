@@ -164,8 +164,9 @@ and prints instructions if missing.
 - `ThrottleInterval: 10` — wait 10 s between restarts
 - `StandardOut/ErrorPath`: `/tmp/openclaw/realtimetalk.log`
 
-Toggle via `RealTimeTalk-toggle.sh {start|stop|restart|status|log|devices}`,
+Toggle via `RealTimeTalk-toggle.sh {start|stop|restart|disable|enable|status|log|devices}`,
 or `launchctl bootstrap/bootout/kickstart gui/$UID/ai.openclaw.realtimetalk`.
+`disable`/`enable` are the persistent-across-reboots mic kill-switch.
 
 ---
 
