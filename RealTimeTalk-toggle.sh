@@ -18,7 +18,16 @@ case "${1:-}" in
         launchctl bootout "gui/$UID_VAL/$LABEL" 2>/dev/null || true
         ;;
     restart)
-        launchctl kickstart -k "gui/$UID_VAL/$LABEL"
+        # Full unload/reload rather than `kickstart -k`: bootout+bootstrap
+        # also picks up any edits to the plist (device flags, --mic-gate
+        # the daemon persists, etc.), which kickstart does not. The retry
+        # loop rides out launchd's transient "Bootstrap failed: 5: Input/
+        # output error" during teardown.
+        launchctl bootout "gui/$UID_VAL/$LABEL" 2>/dev/null || true
+        for _ in 1 2 3 4 5; do
+            launchctl bootstrap "gui/$UID_VAL" "$PLIST" 2>/dev/null && break
+            sleep 2
+        done
         ;;
     status)
         if launchctl list | grep -q "$LABEL"; then

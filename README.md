@@ -233,6 +233,49 @@ Since OpenClaw's `AGENTS.md` convention is to read the workspace fresh each
 session, this takes effect on the next session with no daemon restart
 required.
 
+### Disabling RealTimeTalk (make it inert)
+
+`RealTimeTalk-toggle.sh stop` only unloads the agent until the next login —
+the LaunchAgent has `RunAtLoad`, so it comes back on reboot. To stop it
+**and** keep it from starting again (no mic capture, no OpenAI Realtime
+connection, no spoken output, dashboard down) without uninstalling
+anything:
+
+```bash
+UID_VAL=$(id -u)
+launchctl bootout  "gui/$UID_VAL/ai.openclaw.realtimetalk" 2>/dev/null   # stop now
+launchctl disable  "gui/$UID_VAL/ai.openclaw.realtimetalk"               # persist across reboots
+```
+
+Verify it's fully down:
+
+```bash
+pgrep -fl 'ZeebotTalk|RealTimeTalk-daemon.py'          # → no output
+lsof -iTCP:19000 -sTCP:LISTEN                          # → no output (dashboard gone)
+launchctl print-disabled "gui/$(id -u)" | grep realtimetalk   # → "...realtimetalk" => disabled
+```
+
+macOS shows an **orange dot** by the menu-bar clock whenever anything is
+using the mic — with RTT disabled you should never see it (unless another
+app is). For belt-and-suspenders, also switch **ZeebotTalk** off in
+System Settings → Privacy & Security → Microphone.
+
+This leaves the gateway (`ai.openclaw.gateway`) and everything else in
+OpenClaw untouched — it only uses the mic through this daemon.
+
+#### Re-enabling
+
+```bash
+UID_VAL=$(id -u)
+launchctl enable    "gui/$UID_VAL/ai.openclaw.realtimetalk"
+launchctl bootstrap "gui/$UID_VAL" ~/Library/LaunchAgents/ai.openclaw.realtimetalk.plist
+```
+
+`launchctl enable` is required first — while a service is `disable`d,
+`bootstrap` silently refuses to load it. Confirm with
+`bash RealTimeTalk-toggle.sh status` and re-grant the Microphone
+permission if you revoked it.
+
 ---
 
 ## Speaker verification (owner-only mode)

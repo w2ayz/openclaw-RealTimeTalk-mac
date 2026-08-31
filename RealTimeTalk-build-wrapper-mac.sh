@@ -53,10 +53,29 @@ if [[ ! -d "$VENV_SITE_PACKAGES" ]]; then
     red "    Run RealTimeTalk-install-mac.sh first."
     exit 1
 fi
-if [[ -f "$ICON_SVG" ]] && ! command -v rsvg-convert >/dev/null 2>&1; then
+# SVG rasteriser: prefer librsvg's rsvg-convert; otherwise fall back to
+# macOS `sips`, which gained native SVG decoding in macOS 13+. Only try to
+# install librsvg if neither is available (and don't fail the build if the
+# install can't complete — the icon is cosmetic).
+_have_svg_raster() { command -v rsvg-convert >/dev/null 2>&1 || command -v sips >/dev/null 2>&1; }
+if [[ -f "$ICON_SVG" ]] && ! _have_svg_raster; then
     echo "Installing librsvg (for icon rendering)..."
-    brew install librsvg
+    brew install librsvg || echo "  (librsvg install failed — will skip custom icon)"
 fi
+
+# Rasterise $1 (SVG) to a $2 x $2 PNG at $3, using whichever tool is present.
+_raster_png() {
+    local svg="$1" px="$2" out="$3"
+    if command -v rsvg-convert >/dev/null 2>&1; then
+        rsvg-convert -w "$px" -h "$px" "$svg" -o "$out"
+    else
+        # sips can't resize straight from SVG reliably; render once at
+        # native size to a temp PNG (cached across calls) then downscale.
+        local master="${TMPDIR:-/tmp}/.zbt-icon-master.png"
+        [[ -f "$master" ]] || sips -s format png "$svg" --out "$master" >/dev/null 2>&1
+        sips -z "$px" "$px" "$master" --out "$out" >/dev/null 2>&1
+    fi
+}
 
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 
@@ -81,14 +100,15 @@ trap 'rm -rf "$SWIFT_SRC_DIR"' EXIT
 # so this script still works for anyone who deletes/doesn't have it.
 
 ICON_PLIST_ENTRY=""
-if [[ -f "$ICON_SVG" ]] && command -v rsvg-convert >/dev/null 2>&1; then
+if [[ -f "$ICON_SVG" ]] && _have_svg_raster; then
     echo "Rendering app icon..."
+    rm -f "${TMPDIR:-/tmp}/.zbt-icon-master.png"
     ICONSET="$SWIFT_SRC_DIR/$APP_NAME.iconset"
     mkdir -p "$ICONSET"
     for size in 16 32 128 256 512; do
         double=$((size * 2))
-        rsvg-convert -w "$size" -h "$size" "$ICON_SVG" -o "$ICONSET/icon_${size}x${size}.png"
-        rsvg-convert -w "$double" -h "$double" "$ICON_SVG" -o "$ICONSET/icon_${size}x${size}@2x.png"
+        _raster_png "$ICON_SVG" "$size"   "$ICONSET/icon_${size}x${size}.png"
+        _raster_png "$ICON_SVG" "$double" "$ICONSET/icon_${size}x${size}@2x.png"
     done
     iconutil -c icns "$ICONSET" -o "$APP_DIR/Contents/Resources/$APP_NAME.icns"
     ICON_PLIST_ENTRY="    <key>CFBundleIconFile</key>
@@ -96,7 +116,7 @@ if [[ -f "$ICON_SVG" ]] && command -v rsvg-convert >/dev/null 2>&1; then
 "
     green "  ✓ icon rendered: $APP_DIR/Contents/Resources/$APP_NAME.icns"
 else
-    echo "  skipping custom icon (SVG or rsvg-convert not found)"
+    echo "  skipping custom icon (SVG or SVG rasteriser not found)"
 fi
 echo
 
@@ -187,9 +207,55 @@ proc.arguments = [script] + CommandLine.arguments.dropFirst()
 proc.environment = env
 proc.currentDirectoryURL = URL(fileURLWithPath: "$SKILL_DIR")
 
+// Tracks a signal-initiated shutdown so terminationHandler doesn't race
+// the signal path to exit with the wrong status.
+var _shutdownBySignal: Int32 = 0
+
+func _dieBySignal(_ sig: Int32) {
+    signal(sig, SIG_DFL)
+    raise(sig)
+}
+
 proc.terminationHandler = { p in
+    let s = _shutdownBySignal
+    if s != 0 {
+        // Child exited in response to our forwarded signal — re-raise now
+        // rather than waiting out the grace timer, so kickstart's respawn
+        // isn't blocked by us holding the port.
+        DispatchQueue.main.async { _dieBySignal(s) }
+        return
+    }
     log("Python exited \(p.terminationStatus) — exiting wrapper")
     exit(p.terminationStatus)
+}
+
+// Forward a graceful shutdown to the Python child, then terminate *by the
+// same signal* so the parent's exit status reflects it. Without forwarding,
+// the child is orphaned and keeps its HTTP port, and the next launch
+// crash-loops on "Address already in use". Re-raising (rather than exit(0))
+// matters for `launchctl kickstart -k` — which SIGTERMs then expects the
+// job to die by signal before it respawns; a clean exit(0) suppresses the
+// respawn. `launchctl bootout` removes the job either way.
+var _signalSources: [DispatchSourceSignal] = []
+for sig in [SIGTERM, SIGINT] {
+    signal(sig, SIG_IGN)
+    let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    src.setEventHandler {
+        if _shutdownBySignal != 0 { return }
+        _shutdownBySignal = sig
+        log("got signal \(sig) — terminating Python pid=\(proc.processIdentifier)")
+        if proc.isRunning { proc.terminate() }
+        // Fallback if the child ignores SIGTERM: give it a moment, hard-
+        // kill, then die by the signal anyway. The common path is
+        // terminationHandler above, which re-raises the instant the child
+        // actually exits.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
+            _dieBySignal(sig)
+        }
+    }
+    src.resume()
+    _signalSources.append(src)
 }
 
 do {
