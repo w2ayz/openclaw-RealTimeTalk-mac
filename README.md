@@ -134,7 +134,7 @@ A bare `python3` process launched by a LaunchAgent has no stable app
 identity for macOS's TCC (privacy) subsystem, so microphone access can be
 flaky — it may not prompt reliably, or the grant may not persist across
 restarts. `RealTimeTalk-build-wrapper-mac.sh` builds a tiny signed wrapper
-app (`~/Applications/ZeebotTalk.app`) that requests mic access via
+app (`~/Applications/RealTimeTalk.app`) that requests mic access via
 AVFoundation under its own stable bundle identity before launching the
 daemon as its child process:
 
@@ -143,7 +143,7 @@ bash ~/.openclaw/workspace/skills/realtimetalk/RealTimeTalk-build-wrapper-mac.sh
 ```
 
 Then point the LaunchAgent plist's `ProgramArguments` at the built app
-(`~/Applications/ZeebotTalk.app/Contents/MacOS/ZeebotTalk`) instead of the
+(`~/Applications/RealTimeTalk.app/Contents/MacOS/RealTimeTalk`) instead of the
 venv's `python3` directly — any extra args (`--mic-gate 64`, etc.) pass
 straight through. Reload with a full unload/reload, not just a restart:
 `launchctl kickstart -k` does **not** pick up a changed plist file —
@@ -250,14 +250,14 @@ launchctl disable  "gui/$UID_VAL/ai.openclaw.realtimetalk"               # persi
 Verify it's fully down:
 
 ```bash
-pgrep -fl 'ZeebotTalk|RealTimeTalk-daemon.py'          # → no output
+pgrep -fl 'RealTimeTalk.app|RealTimeTalk-daemon.py'    # → no output
 lsof -iTCP:19000 -sTCP:LISTEN                          # → no output (dashboard gone)
 launchctl print-disabled "gui/$(id -u)" | grep realtimetalk   # → "...realtimetalk" => disabled
 ```
 
 macOS shows an **orange dot** by the menu-bar clock whenever anything is
 using the mic — with RTT disabled you should never see it (unless another
-app is). For belt-and-suspenders, also switch **ZeebotTalk** off in
+app is). For belt-and-suspenders, also switch **RealTimeTalk** off in
 System Settings → Privacy & Security → Microphone.
 
 This leaves the gateway (`ai.openclaw.gateway`) and everything else in

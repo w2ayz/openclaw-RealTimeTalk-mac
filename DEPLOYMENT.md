@@ -27,7 +27,7 @@ internals, see [SKILL.md](SKILL.md).
 | Xcode Command Line Tools | `xcode-select --install` — provides the system Python 3.9 and `swiftc` (needed for the mic-permission wrapper, §5) |
 | `portaudio`, `ffmpeg`, `node` | `brew install portaudio ffmpeg node` (the installer does this for you) |
 | `hidapi` | `brew install hidapi` (installer does this too) — only needed for Radio Mode's AIOC hardware-revision detection; everything else works without it |
-| `librsvg` | `brew install librsvg` (the wrapper-build script does this too) — only needed to render `ZeebotTalk.app`'s icon; the wrapper still builds fine without it, just with the generic default icon |
+| `librsvg` | `brew install librsvg` (the wrapper-build script does this too) — only needed to render `RealTimeTalk.app`'s icon; the wrapper still builds fine without it, just with the generic default icon |
 | Python 3.9+ | System Python from Command Line Tools is fine |
 | Edge TTS skill | Must be installed at `~/.openclaw/workspace/skills/edge-tts/` before running the installer. See §3.5. |
 
@@ -56,7 +56,7 @@ internals, see [SKILL.md](SKILL.md).
 ├── RealTimeTalk-toggle.sh          # start/stop/restart/status/log/devices — day-to-day control
 ├── ai.openclaw.realtimetalk.plist  # LaunchAgent template — installer copies + fills this in
 ├── test_speak.py                   # standalone TTS smoke-test script
-├── assets/ZeebotTalk-icon.svg      # wrapper app icon source — rendered to .icns at build time (§5)
+├── assets/RealTimeTalk-icon.svg    # wrapper app icon source — rendered to .icns at build time (§5)
 ├── README.md, SKILL.md, CHANGELOG.md, DEPLOYMENT.md (this file)
 └── venv/                           # created by the installer, not in git
 ```
@@ -66,7 +66,7 @@ internals, see [SKILL.md](SKILL.md).
 | Path | Purpose |
 |---|---|
 | `~/Library/LaunchAgents/ai.openclaw.realtimetalk.plist` | The actual LaunchAgent — a filled-in copy of the template above |
-| `~/Applications/ZeebotTalk.app` | Mic-permission wrapper (§5), if you build it |
+| `~/Applications/RealTimeTalk.app` | Mic-permission wrapper (§5), if you build it |
 | `/tmp/openclaw/realtimetalk.log` | stdout+stderr log — `tail -f` this for everything |
 
 ### Runtime state (created by the daemon itself, first run)
@@ -233,9 +233,9 @@ as a child process.
 bash ~/.openclaw/workspace/skills/realtimetalk/RealTimeTalk-build-wrapper-mac.sh
 ```
 
-This builds `~/Applications/ZeebotTalk.app` (ad-hoc signed, no Apple
+This builds `~/Applications/RealTimeTalk.app` (ad-hoc signed, no Apple
 Developer account needed — requires `swiftc` from Xcode Command Line
-Tools) and renders its app icon from `assets/ZeebotTalk-icon.svg`
+Tools) and renders its app icon from `assets/RealTimeTalk-icon.svg`
 (auto-installs `librsvg` via Homebrew if missing; skips the icon and
 falls back to the generic default if the SVG or `rsvg-convert` isn't
 available, rather than failing the whole build). Then:
@@ -244,18 +244,18 @@ available, rather than failing the whole build). Then:
    **two changes** to `ProgramArguments`:
    - Replace the first `<string>` (the venv `python3` path) with the wrapper binary:
      ```
-     /Users/<you>/Applications/ZeebotTalk.app/Contents/MacOS/ZeebotTalk
+     /Users/<you>/Applications/RealTimeTalk.app/Contents/MacOS/RealTimeTalk
      ```
    - **Remove** the second `<string>` — the daemon script path (e.g.
      `/Users/<you>/.openclaw/workspace/skills/realtimetalk/RealTimeTalk-daemon.py`).
-     ZeebotTalk has this path baked in at compile time and launches Python
+     RealTimeTalk has this path baked in at compile time and launches Python
      itself; passing it again as an argument causes `unrecognized arguments`
      and the daemon exits immediately with code 2.
 
    The array should look like this afterwards (any extra device flags go here too):
    ```xml
    <array>
-       <string>/Users/<you>/Applications/ZeebotTalk.app/Contents/MacOS/ZeebotTalk</string>
+       <string>/Users/<you>/Applications/RealTimeTalk.app/Contents/MacOS/RealTimeTalk</string>
        <string>--http-port</string>
        <string>19000</string>
    </array>
@@ -273,7 +273,7 @@ available, rather than failing the whole build). Then:
 
 First launch prompts for microphone access. If the dialog doesn't appear
 (background/agent launches sometimes suppress it), run the app once via
-Finder (double-click `ZeebotTalk.app`) to trigger it, then check
+Finder (double-click `RealTimeTalk.app`) to trigger it, then check
 **System Settings → Privacy & Security → Microphone** and grant it there
 if it's listed but unchecked.
 
@@ -314,7 +314,7 @@ Voice ID is optional; omitting it leaves speaker verification disabled
    ```
 4. Confirm mic/speaker on the Calibrate page (`/calibration`) show real
    device names, not `device #N` or a device you've since disconnected
-5. If you built the wrapper: `ps -o ppid= -p $(pgrep -f RealTimeTalk-daemon.py)` should show `ZeebotTalk`'s PID as the parent, not `1` (launchd) directly
+5. If you built the wrapper: `ps -o ppid= -p $(pgrep -f RealTimeTalk-daemon.py)` should show `RealTimeTalk`'s PID as the parent, not `1` (launchd) directly
 
 ---
 
@@ -360,7 +360,7 @@ bootout+bootstrap (§5):
 ```xml
 <!-- ~/Library/LaunchAgents/ai.openclaw.realtimetalk.plist -->
 <array>
-    <string>/Users/<you>/Applications/ZeebotTalk.app/Contents/MacOS/ZeebotTalk</string>
+    <string>/Users/<you>/Applications/RealTimeTalk.app/Contents/MacOS/RealTimeTalk</string>
     <string>--agent-name</string>
     <string>Grogu</string>
     <string>--wake-phrase</string>
@@ -415,13 +415,13 @@ workspace fresh every session, so this takes effect on the next one.
 | `OSError: [Errno 48] Address already in use` on restart | A stale process is still holding port 19000 — `launchctl kickstart -k` doesn't reliably kill the previous child. Kill it first: `lsof -i:19000 -P \| grep LISTEN \| awk '{print $2}' \| xargs kill -TERM`, then do a full bootout+bootstrap. |
 | Plist edit doesn't seem to take effect | You used `kickstart -k` or `RealTimeTalk-toggle.sh restart` — neither reloads a changed plist file. Use `launchctl bootout` + `bootstrap` instead (§5). |
 | `EXTRA_ARGS[@]: unbound variable` during install | bash 3.2 `set -u` bug — fixed in v3.9.2. Update to the latest commit; or see the manual workaround in §4 if you're stuck on an older clone. |
-| Daemon exits immediately with code 2 after switching to ZeebotTalk | The daemon script path is still in `ProgramArguments` as the second element. ZeebotTalk bakes that path in at compile time — passing it again causes `unrecognized arguments`. Remove the `__DAEMON_PATH__` entry from the plist array (see §5). |
+| Daemon exits immediately with code 2 after switching to RealTimeTalk | The daemon script path is still in `ProgramArguments` as the second element. RealTimeTalk bakes that path in at compile time — passing it again causes `unrecognized arguments`. Remove the `__DAEMON_PATH__` entry from the plist array (see §5). |
 | `argument --input-device: invalid int value` | `--input-device` takes an integer index (e.g. `1`), not a device name string. Use `./RealTimeTalk-toggle.sh devices` to get the index. |
 | Voice ID page shows `sherpa-onnx or model unavailable` | The speaker-embedding model file is missing. Download it — see §5.5. |
 | Daemon exits with signal 11 (segfault), auto-restarts via launchd | Known failure class from concurrent PortAudio stream operations — should be fixed as of v3.9.1 (see CHANGELOG), but if you hit a new one, check `/tmp/openclaw/realtimetalk.log` around the crash for what else was happening (Monitor/EchoTest toggling, device hot-plug) and report it. |
 | `import hid` fails / AIOC shows generic name instead of "AIOC v1.2+" | `DYLD_LIBRARY_PATH` isn't reaching the process. Confirm `brew install hidapi` succeeded, confirm the plist's `EnvironmentVariables` includes `DYLD_LIBRARY_PATH`, and confirm you reloaded via bootout+bootstrap, not kickstart. Cosmetic only — nothing else depends on `hid`. |
 | Speaker/mic panel shows a device you disconnected | Should self-correct within ~2 seconds (the Calibrate page polls and re-resolves by name against a fresh device list as of v3.9.1). If it doesn't, restart the daemon. |
-| Mic never picks up audio | Check mic permission was actually granted (§5) — `tccutil reset Microphone ai.openclaw.zeebottalk` and re-launch if you're unsure, then check System Settings → Privacy & Security → Microphone. |
+| Mic never picks up audio | Check mic permission was actually granted (§5) — `tccutil reset Microphone ai.openclaw.realtimetalk` and re-launch if you're unsure, then check System Settings → Privacy & Security → Microphone. |
 | `sd.rec()`/enrollment records from the wrong device | Fixed as of v3.9.1 — update if you're on an older commit. |
 
 ---

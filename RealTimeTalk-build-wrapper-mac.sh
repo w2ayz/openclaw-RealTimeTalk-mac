@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RealTimeTalk-build-wrapper-mac.sh — Build ZeebotTalk.app, a tiny signed
+# RealTimeTalk-build-wrapper-mac.sh — Build RealTimeTalk.app, a tiny signed
 # wrapper around the RealTimeTalk daemon.
 #
 # Why this exists: a bare `python3` process launched by a launchd
@@ -19,11 +19,11 @@
 set -euo pipefail
 
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-APP_NAME="ZeebotTalk"
+APP_NAME="RealTimeTalk"
 APP_DIR="$HOME/Applications/$APP_NAME.app"
 VENV_SITE_PACKAGES="$SKILL_DIR/venv/lib/python3.9/site-packages"
 DAEMON_PY="$SKILL_DIR/RealTimeTalk-daemon.py"
-ICON_SVG="$SKILL_DIR/assets/ZeebotTalk-icon.svg"
+ICON_SVG="$SKILL_DIR/assets/RealTimeTalk-icon.svg"
 
 # The system Python that ships with Xcode Command Line Tools — same
 # interpreter the venv's own python3 is a symlink to, but invoking it
@@ -71,7 +71,7 @@ _raster_png() {
     else
         # sips can't resize straight from SVG reliably; render once at
         # native size to a temp PNG (cached across calls) then downscale.
-        local master="${TMPDIR:-/tmp}/.zbt-icon-master.png"
+        local master="${TMPDIR:-/tmp}/.rtt-icon-master.png"
         [[ -f "$master" ]] || sips -s format png "$svg" --out "$master" >/dev/null 2>&1
         sips -z "$px" "$px" "$master" --out "$out" >/dev/null 2>&1
     fi
@@ -93,7 +93,7 @@ SWIFT_SRC_DIR="$(mktemp -d)"
 trap 'rm -rf "$SWIFT_SRC_DIR"' EXIT
 
 # ── App icon ──────────────────────────────────────────────────────────────
-# Rendered from assets/ZeebotTalk-icon.svg at build time rather than
+# Rendered from assets/RealTimeTalk-icon.svg at build time rather than
 # committing a binary .icns — keeps the source diffable and the bundle
 # always in sync with the current design. Optional: falls back to no
 # custom icon (generic .app icon) if the SVG or rsvg-convert is missing,
@@ -102,7 +102,7 @@ trap 'rm -rf "$SWIFT_SRC_DIR"' EXIT
 ICON_PLIST_ENTRY=""
 if [[ -f "$ICON_SVG" ]] && _have_svg_raster; then
     echo "Rendering app icon..."
-    rm -f "${TMPDIR:-/tmp}/.zbt-icon-master.png"
+    rm -f "${TMPDIR:-/tmp}/.rtt-icon-master.png"
     ICONSET="$SWIFT_SRC_DIR/$APP_NAME.iconset"
     mkdir -p "$ICONSET"
     for size in 16 32 128 256 512; do
@@ -128,7 +128,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>ai.openclaw.zeebottalk</string>
+    <string>ai.openclaw.realtimetalk</string>
     <key>CFBundleName</key>
     <string>$APP_NAME</string>
     <key>CFBundleExecutable</key>
@@ -140,7 +140,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>ZeebotTalk needs microphone access to listen for voice commands.</string>
+    <string>RealTimeTalk needs microphone access to listen for voice commands.</string>
     <key>LSUIElement</key>
     <true/>
 $ICON_PLIST_ENTRY</dict>
@@ -179,7 +179,7 @@ import AVFoundation
 import Foundation
 
 func log(_ msg: String) {
-    fputs("[ZeebotTalk] \(msg)\n", stderr)
+    fputs("[RealTimeTalk] \(msg)\n", stderr)
     fflush(stderr)
 }
 
@@ -233,9 +233,9 @@ proc.terminationHandler = { p in
 // same signal* so the parent's exit status reflects it. Without forwarding,
 // the child is orphaned and keeps its HTTP port, and the next launch
 // crash-loops on "Address already in use". Re-raising (rather than exit(0))
-// matters for `launchctl kickstart -k` — which SIGTERMs then expects the
+// matters for 'launchctl kickstart -k' — which SIGTERMs then expects the
 // job to die by signal before it respawns; a clean exit(0) suppresses the
-// respawn. `launchctl bootout` removes the job either way.
+// respawn. 'launchctl bootout' removes the job either way.
 var _signalSources: [DispatchSourceSignal] = []
 for sig in [SIGTERM, SIGINT] {
     signal(sig, SIG_IGN)

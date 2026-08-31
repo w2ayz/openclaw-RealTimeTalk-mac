@@ -1,5 +1,21 @@
 # Changelog
 
+## [3.18.1] — 2026-08-30
+
+Mac-only packaging/lifecycle changes — no daemon behavior change. (Groups in commit `3f924b7`, which shipped unversioned.)
+
+### Changed
+- **The mic-permission wrapper app is renamed `ZeebotTalk.app` → `RealTimeTalk.app`**, bundle identifier `ai.openclaw.zeebottalk` → `ai.openclaw.realtimetalk`, to match the daemon / repo / LaunchAgent naming. **This is a new app identity to macOS:** after rebuilding and repointing the LaunchAgent's `ProgramArguments`, Microphone access must be re-granted once (System Settings → Privacy & Security → Microphone, or launch `RealTimeTalk.app` from Finder once to trigger the prompt) — voice input stays dead until then. The stale "ZeebotTalk" row in that list can be removed afterward (`tccutil reset Microphone ai.openclaw.zeebottalk`).
+
+### Fixed
+- **`ZeebotTalk.app` wrapper orphaned the daemon on `launchctl bootout`.** The Swift wrapper didn't forward `SIGTERM`/`SIGINT` to its Python child, so unloading the LaunchAgent left the daemon reparented to `launchd` (PID 1) — still holding port 19000 and the mic — and the next launch crash-looped on `Address already in use`. The wrapper now forwards a graceful terminate to the child (3s grace, then `SIGKILL`) and re-raises the original signal so `launchctl kickstart -k`'s respawn still works. Verified live: `bootout` now brings the daemon fully down within ~15–20s with no manual `pkill`.
+- **`RealTimeTalk-build-wrapper-mac.sh` icon step no longer hard-fails without librsvg.** Falls back to macOS `sips` (native SVG decode on macOS 13+) when `rsvg-convert` is absent, and a failed `brew install librsvg` just skips the custom icon instead of aborting the build.
+- **Build script executed backticked commands from its own Swift comments.** The `launcher.swift` heredoc is unquoted (needs `$SKILL_DIR` etc. expansion), and comments added in `3f924b7` contained `` `launchctl …` `` in backticks — the shell ran them (harmlessly, no args) at every build. Backticks removed from those comments.
+
+### Added
+- **README: "Disabling RealTimeTalk (make it inert)"** — `launchctl bootout` + `launchctl disable` to stop it now and across reboots without uninstalling, verification commands, and re-enabling (`launchctl enable` must precede `bootstrap`).
+- **`RealTimeTalk-toggle.sh restart`** now does `bootout` + `bootstrap` (with a retry loop for launchd's transient teardown error) instead of `kickstart -k`, so edits to the plist (device flags, persisted `--mic-gate`) are actually picked up.
+
 ## [3.18.0] — 2026-08-28
 
 Kept in lockstep with the [Pi fork](https://github.com/w2ayz/openclaw-RealTimeTalk)'s v3.18.0 — same change, released on both at once (Mac was on 3.17.0, Pi on 3.17.1; both land on 3.18.0).
