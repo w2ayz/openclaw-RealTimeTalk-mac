@@ -3,7 +3,7 @@
 #
 # Steps:
 #   1. Verify Homebrew dependencies (portaudio, ffmpeg, node)
-#   2. Verify Edge TTS skill is installed
+#   2. Resolve the Edge TTS skill (first TTS fallback) and prepare its node deps
 #   3. Create Python venv and install dependencies
 #   4. Verify openai.apiKey is configured in openclaw.json
 #   5. List audio devices and prompt user for input + output device indices,
@@ -22,7 +22,9 @@ PLIST_TEMPLATE="$SKILL_DIR/ai.openclaw.realtimetalk.plist"
 PLIST_DEST="$HOME/Library/LaunchAgents/ai.openclaw.realtimetalk.plist"
 LABEL="ai.openclaw.realtimetalk"
 OPENCLAW_JSON="$HOME/.openclaw/openclaw.json"
-EDGE_TTS="$HOME/.openclaw/workspace/skills/edge-tts/scripts/tts-converter.js"
+# Edge TTS skill — official location is ~/.openclaw/workspace/skills/edge-tts/
+# (published skill; `npm install` runs in scripts/ per its skill-info.json).
+EDGE_TTS_OFFICIAL="$HOME/.openclaw/workspace/skills/edge-tts/scripts/tts-converter.js"
 
 red()    { printf "\033[31m%s\033[0m\n" "$*"; }
 green()  { printf "\033[32m%s\033[0m\n" "$*"; }
@@ -45,14 +47,42 @@ for pkg in portaudio ffmpeg node hidapi; do
 done
 echo
 
-# ── 2. Edge TTS skill ────────────────────────────────────────────────────────
+# ── 2. Edge TTS skill (first TTS fallback after ElevenLabs) ──────────────────
+# Resolve sibling-first so a relocated OpenClaw workspace still works, then fall
+# back to the official location. A missing skill is a warning, not fatal —
+# ElevenLabs stays primary and OpenAI TTS + macOS `say` cover the fallback.
 
-if [[ ! -f "$EDGE_TTS" ]]; then
-    red "  ✗ Edge TTS skill not found at $EDGE_TTS"
-    red "    Install the openclaw edge-tts skill first."
-    exit 1
+EDGE_TTS_SCRIPT=""
+for cand in \
+    "$SKILL_DIR/../edge-tts/scripts/tts-converter.js" \
+    "${OPENCLAW_WORKSPACE:-}/skills/edge-tts/scripts/tts-converter.js" \
+    "$EDGE_TTS_OFFICIAL"; do
+    if [[ -n "$cand" && -f "$cand" ]]; then
+        EDGE_TTS_SCRIPT="$(cd "$(dirname "$cand")" && pwd)/$(basename "$cand")"
+        break
+    fi
+done
+
+if [[ -z "$EDGE_TTS_SCRIPT" ]]; then
+    yellow "  → Edge TTS skill not found (looked in skills/edge-tts/)."
+    yellow "    Install it at the official path, then re-run this installer:"
+    yellow "      clawhub install edge-tts"
+    yellow "      # or: git clone <edge-tts repo> ~/.openclaw/workspace/skills/edge-tts"
+    yellow "    Continuing without it — ElevenLabs stays primary; OpenAI TTS + 'say' cover fallback."
+    EDGE_TTS_SCRIPT="$EDGE_TTS_OFFICIAL"   # daemon re-checks this path at runtime
+else
+    EDGE_TTS_DIR="$(cd "$(dirname "$EDGE_TTS_SCRIPT")" && pwd)"
+    if [[ ! -d "$EDGE_TTS_DIR/node_modules" ]]; then
+        yellow "  → Installing Edge TTS node deps (npm install in $EDGE_TTS_DIR)"
+        ( cd "$EDGE_TTS_DIR" && npm install --omit=dev --silent ) \
+            || yellow "    npm install failed — Edge TTS falls back to OpenAI/say at runtime."
+    fi
+    if node "$EDGE_TTS_SCRIPT" --help >/dev/null 2>&1; then
+        green "  ✓ Edge TTS skill ready ($EDGE_TTS_SCRIPT)"
+    else
+        yellow "  → Edge TTS script present but not runnable — check 'node' and node_modules."
+    fi
 fi
-green "  ✓ Edge TTS skill present"
 echo
 
 # ── 3. Python venv ───────────────────────────────────────────────────────────
@@ -172,9 +202,10 @@ done
 "$VENV_PY" - <<PY
 import re
 src = open("$PLIST_TEMPLATE").read()
-src = src.replace("__VENV_PYTHON__", "$VENV_PY")
-src = src.replace("__DAEMON_PATH__", "$DAEMON_PY")
-src = src.replace("__SKILL_DIR__",   "$SKILL_DIR")
+src = src.replace("__VENV_PYTHON__",     "$VENV_PY")
+src = src.replace("__DAEMON_PATH__",      "$DAEMON_PY")
+src = src.replace("__SKILL_DIR__",        "$SKILL_DIR")
+src = src.replace("__EDGE_TTS_SCRIPT__",  "$EDGE_TTS_SCRIPT")
 
 extra = """$EXTRA_XML"""
 if extra.strip():

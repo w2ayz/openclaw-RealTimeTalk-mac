@@ -5,7 +5,7 @@ RealTimeTalk-daemon.py — OpenClaw RealTimeTalk daemon (Mac Mini / CoreAudio).
 Audio flow:
   Mic → OpenAI Realtime API (VAD + STT only) → transcript
   transcript → OpenClaw gateway (chat.send / agent.wait) → Zeebot's reply
-  Zeebot's reply → Edge TTS (primary) | macOS `say` (fallback) → speaker
+  Zeebot's reply → ElevenLabs → Edge TTS → OpenAI TTS → macOS `say` → speaker
 
 Stop via:
   http://localhost:19000/dashboard         — local browser
@@ -20,13 +20,15 @@ Usage:
 Requires:
   brew install portaudio ffmpeg
   pip install "websockets>=12" sounddevice numpy zhconv
-  Edge TTS skill at ~/.openclaw/workspace/skills/edge-tts/scripts/tts-converter.js
+  Edge TTS skill (first TTS fallback) — official location
+    ~/.openclaw/workspace/skills/edge-tts/ ; path is resolved at import by
+    _resolve_edge_tts_script() (env / sibling skill dir / workspace / official)
   OpenAI API key in openclaw.json at talk.providers.openai.apiKey
 """
 
 from __future__ import annotations
 
-__version__ = "3.19.0"
+__version__ = "3.20.0"
 
 import argparse
 import asyncio
@@ -87,10 +89,35 @@ ELEVENLABS_MODEL    = "eleven_v3"
 ELEVENLABS_TIMEOUT  = 15.0
 _elevenlabs_tts_key: list = [""]  # set from load_elevenlabs_key() in main()
 
-# Edge TTS skill — kept for reference but no longer primary
-EDGE_TTS_SCRIPT   = os.path.expanduser(
-    "~/.openclaw/workspace/skills/edge-tts/scripts/tts-converter.js"
-)
+# Edge TTS skill — first TTS fallback after ElevenLabs. Free, no API key, and
+# native zh-CN / en-US neural voices (best free option for bilingual replies).
+# The skill's official location is ~/.openclaw/workspace/skills/edge-tts/ with
+# `npm install` run in scripts/ (per its skill-info.json). The runnable script
+# path is resolved in this order, first hit wins:
+#   1. $RTT_EDGE_TTS_SCRIPT               — set by the installer in the plist
+#   2. <this-skill>/../edge-tts/scripts/tts-converter.js   — sibling skill dir
+#   3. $OPENCLAW_WORKSPACE/skills/edge-tts/scripts/tts-converter.js
+#   4. ~/.openclaw/workspace/skills/edge-tts/scripts/tts-converter.js  — official
+def _resolve_edge_tts_script() -> str:
+    official = os.path.expanduser(
+        "~/.openclaw/workspace/skills/edge-tts/scripts/tts-converter.js")
+    here = os.path.dirname(os.path.abspath(__file__))
+    ws = os.environ.get("OPENCLAW_WORKSPACE", "").strip()
+    candidates = [
+        os.environ.get("RTT_EDGE_TTS_SCRIPT", "").strip(),
+        os.path.join(here, os.pardir, "edge-tts", "scripts", "tts-converter.js"),
+        os.path.join(ws, "skills", "edge-tts", "scripts", "tts-converter.js") if ws else "",
+        official,
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        c = os.path.abspath(os.path.expanduser(c))
+        if os.path.isfile(c):
+            return c
+    return official
+
+EDGE_TTS_SCRIPT   = _resolve_edge_tts_script()
 EDGE_VOICE_EN     = "en-US-AriaNeural"
 EDGE_VOICE_ZH     = "zh-CN-XiaoxiaoNeural"
 EDGE_TTS_TIMEOUT  = 8.0
@@ -2662,11 +2689,47 @@ def _edge_tts_to_mp3(text: str, voice: str, out_path: str, timeout: float = EDGE
                     text[:30], result.returncode, result.stderr[:160])
         return False
     except subprocess.TimeoutExpired:
-        log.warning("Edge TTS timed out (%ss) for %r — falling back to say", timeout, text[:30])
+        log.warning("Edge TTS timed out (%ss) for %r", timeout, text[:30])
         return False
     except Exception as e:
         log.warning("Edge TTS error: %s", e)
         return False
+
+
+def _edge_tts_to_pcm(text: str) -> "np.ndarray":
+    """Render `text` via Edge TTS as one 24 kHz mono int16 PCM array.
+
+    Splits by script so each segment speaks in its native voice
+    (zh-CN-XiaoxiaoNeural / en-US-AriaNeural) — Edge voices are locale-bound and
+    read a foreign-script run poorly. Returns an empty array if the script is
+    missing or any segment fails, so the caller falls straight through to
+    OpenAI TTS rather than playing a half-rendered reply.
+    """
+    import tempfile
+    if not os.path.isfile(EDGE_TTS_SCRIPT):
+        log.info("  Edge TTS script not found at %s — skipping", EDGE_TTS_SCRIPT)
+        return np.zeros(0, dtype=np.int16)
+    parts: list[np.ndarray] = []
+    for seg_text, lang in _split_by_script(text):
+        if not seg_text.strip():
+            continue
+        voice = EDGE_VOICE_ZH if lang == "zh" else EDGE_VOICE_EN
+        seg_mp3 = tempfile.mktemp(suffix=".mp3")
+        try:
+            if not _edge_tts_to_mp3(seg_text, voice, seg_mp3):
+                return np.zeros(0, dtype=np.int16)
+            seg_pcm = _decode_to_pcm(seg_mp3)
+        finally:
+            try:
+                os.unlink(seg_mp3)
+            except OSError:
+                pass
+        if seg_pcm.size == 0:
+            return np.zeros(0, dtype=np.int16)
+        parts.append(seg_pcm)
+    if not parts:
+        return np.zeros(0, dtype=np.int16)
+    return np.concatenate(parts) if len(parts) > 1 else parts[0]
 
 
 def _say_fallback_to_aiff(text: str, lang: str, out_path: str, timeout: float = 15.0) -> bool:
@@ -2713,7 +2776,7 @@ def _decode_to_pcm(audio_path: str) -> "np.ndarray":
 
 def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silence_ms: int = 300,
           resumable: bool = False):
-    """Synthesise text via ElevenLabs TTS (with OpenAI/macOS fallback) and play via sounddevice.
+    """Synthesise text (ElevenLabs → Edge TTS → OpenAI TTS → macOS `say`) and play via sounddevice.
 
     Sends the full text in one call. Decodes to 24 kHz mono PCM int16,
     applies software volume, and plays via the selected CoreAudio output.
@@ -2773,14 +2836,25 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         temp_files.append(mp3_path)
         pcm = np.zeros(0, dtype=np.int16)
 
-        # Prefer ElevenLabs for the whole reply. OpenAI stays as the network/key
-        # fallback so voice responses continue working if ElevenLabs is down.
+        # TTS engine chain: ElevenLabs → Edge TTS → OpenAI TTS → macOS `say`.
+        # ElevenLabs is primary (most expressive, multilingual). Edge TTS is the
+        # first fallback — free, no API key, and native zh-CN / en-US neural
+        # voices make it the best bilingual option when ElevenLabs is down.
+        # OpenAI TTS is the paid network fallback; `say` is fully offline.
         if _elevenlabs_tts_to_mp3(clean, mp3_path):
             pcm = _decode_to_pcm(mp3_path)
             log.info("  ElevenLabs TTS OK — PCM decode: %d samples (%.1fs)",
                      pcm.size, pcm.size / TTS_SAMPLE_RATE)
         else:
-            log.info("  ElevenLabs TTS unavailable/failed — falling back to OpenAI TTS")
+            log.info("  ElevenLabs TTS unavailable/failed — trying Edge TTS")
+
+        if pcm.size == 0:
+            pcm = _edge_tts_to_pcm(clean)
+            if pcm.size:
+                log.info("  Edge TTS OK — PCM decode: %d samples (%.1fs)",
+                         pcm.size, pcm.size / TTS_SAMPLE_RATE)
+            else:
+                log.info("  Edge TTS unavailable/failed — falling back to OpenAI TTS")
 
         if pcm.size == 0:
             ok_oai = _openai_tts_to_mp3(clean, mp3_path)
@@ -3474,12 +3548,10 @@ class RealtimeSession:
                 self._monitoring = False
                 _persist_monitoring[0] = False
                 log.info("Auto-sleep: monitoring cleared")
+            # Text-only: show the banner in the dashboard log, no spoken
+            # announcement — auto-sleep fires during quiet time and a voice
+            # line there is more startling than useful.
             _log_entry("system", f"Auto-sleep after {mins} min idle. Press Wake to reconnect.")
-            await asyncio.get_running_loop().run_in_executor(
-                None, speak,
-                "Going to sleep. Press Wake to reconnect.",
-                self.alsa_output,
-            )
             _sleep_requested[0] = True
             _is_sleeping[0] = True
             _save_sleep_state(True)

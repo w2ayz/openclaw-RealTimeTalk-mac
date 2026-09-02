@@ -17,7 +17,7 @@ internals, see [SKILL.md](SKILL.md).
 |---|---|
 | [OpenClaw](https://openclaw.ai) gateway running | `openclaw gateway start`. RealTimeTalk talks to Zeebot through this — it won't start without it. |
 | OpenAI API key | Regular `sk-...` key in `~/.openclaw/openclaw.json`, **not** the `openai-codex` OAuth profile (the Realtime API rejects it). See §3. |
-| ElevenLabs API key (optional) | Only used for Chinese/mixed-language TTS. Falls back to OpenAI TTS if unset. |
+| ElevenLabs API key (optional) | Primary TTS voice for all replies. Falls back to Edge TTS → OpenAI TTS → `say` if unset. |
 
 ### System
 
@@ -29,7 +29,7 @@ internals, see [SKILL.md](SKILL.md).
 | `hidapi` | `brew install hidapi` (installer does this too) — only needed for Radio Mode's AIOC hardware-revision detection; everything else works without it |
 | `librsvg` | `brew install librsvg` (the wrapper-build script does this too) — only needed to render `RealTimeTalk.app`'s icon; the wrapper still builds fine without it, just with the generic default icon |
 | Python 3.9+ | System Python from Command Line Tools is fine |
-| Edge TTS skill | Must be installed at `~/.openclaw/workspace/skills/edge-tts/` before running the installer. See §3.5. |
+| Edge TTS skill (optional) | First TTS fallback after ElevenLabs. Install at the official path `~/.openclaw/workspace/skills/edge-tts/`. Optional — the installer warns and continues if it's absent. See §3.5. |
 
 ### Hardware
 
@@ -120,35 +120,43 @@ OpenAI TTS for Chinese/mixed content.
 
 ## 3.5. Installing the Edge TTS skill
 
-The installer checks for `~/.openclaw/workspace/skills/edge-tts/scripts/tts-converter.js`
-and exits if it's missing. The skill wraps `node-edge-tts` (npm). Set it up once:
+Edge TTS is the **first TTS fallback** after ElevenLabs — free, no API key,
+and it uses native `zh-CN` / `en-US` neural voices, which makes it the best
+option for bilingual (English + Chinese) replies when ElevenLabs is down.
+
+Install the published skill at its **official path**,
+`~/.openclaw/workspace/skills/edge-tts/`, the same convention as every other
+OpenClaw skill:
 
 ```bash
-mkdir -p ~/.openclaw/workspace/skills/edge-tts/scripts
+# via clawhub (preferred)
+clawhub install edge-tts
 
-# Create package.json
-cat > ~/.openclaw/workspace/skills/edge-tts/package.json <<'EOF'
-{
-  "name": "openclaw-edge-tts",
-  "version": "2.0.0",
-  "dependencies": {
-    "node-edge-tts": "^1.2.10",
-    "commander": "^12.0.0"
-  }
-}
-EOF
-
-npm install --prefix ~/.openclaw/workspace/skills/edge-tts
+# or clone the repo directly
+git clone https://github.com/w2ayz/openclaw-edge-tts \
+    ~/.openclaw/workspace/skills/edge-tts
 ```
 
-Then copy `tts-converter.js` from your `c2e-slack` repo (or any other
-source that exports the same CLI interface) into
-`~/.openclaw/workspace/skills/edge-tts/scripts/tts-converter.js`.
+Node deps go in `scripts/` (per the skill's `skill-info.json`,
+`install: { path: "scripts", command: "npm install" }`). **The RealTimeTalk
+installer runs this for you** — it resolves the skill (sibling dir →
+`$OPENCLAW_WORKSPACE` → official path), runs `npm install` in `scripts/` if
+`node_modules` is missing, verifies the script is runnable, and writes the
+resolved path into the LaunchAgent plist as `RTT_EDGE_TTS_SCRIPT` so the
+daemon and installer always agree on the location.
 
-> **Note:** edge-tts is a legacy fallback only — it's present in the
-> daemon's source but is never called by default (OpenAI TTS is primary).
-> The installer still gates on the file existing, so this step is required
-> even though the feature isn't in active use.
+To set it up by hand instead:
+
+```bash
+cd ~/.openclaw/workspace/skills/edge-tts/scripts
+npm install --omit=dev
+node tts-converter.js "test" --voice en-US-AriaNeural --output /tmp/t.mp3
+```
+
+> **Optional:** if the skill is absent the installer prints a warning and
+> continues — ElevenLabs stays primary and OpenAI TTS + macOS `say` cover the
+> fallback. The daemon re-resolves the path at startup, so installing Edge TTS
+> later and restarting the daemon is enough to pick it up.
 
 ---
 
@@ -168,14 +176,15 @@ expects, and what the rest of this guide assumes.
 
 The installer:
 1. `brew install`s `portaudio`, `ffmpeg`, `node`, `hidapi`
-2. Creates a Python venv at `venv/` and installs everything in `requirements.txt`
-3. Verifies `openai.apiKey` is set (exits with instructions if missing)
-4. Lists CoreAudio devices and prompts for:
+2. Resolves the Edge TTS skill (sibling → `$OPENCLAW_WORKSPACE` → official path), runs `npm install` in its `scripts/` if needed, and records the path for the plist — warns and continues if the skill is absent
+3. Creates a Python venv at `venv/` and installs everything in `requirements.txt`
+4. Verifies `openai.apiKey` is set (exits with instructions if missing)
+5. Lists CoreAudio devices and prompts for:
    - Input device index (Enter for system default)
    - Output device index (Enter for system default)
    - **Agent name** (Enter for `Zeebot`)
    - **Wake phrase** (Enter to derive from name: `<name> wake up`)
-5. Writes and loads the LaunchAgent plist with the chosen flags
+6. Writes and loads the LaunchAgent plist with the chosen flags
 
 > **Installer bug (fixed):** Earlier versions exited with
 > `EXTRA_ARGS[@]: unbound variable` when all prompts were left blank.

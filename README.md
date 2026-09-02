@@ -8,9 +8,9 @@ to run on a Mac Mini.
 Mic → OpenAI Realtime API (VAD + STT) → OpenClaw gateway → Zeebot → TTS → Speaker
 ```
 
-TTS chain: ElevenLabs multilingual v2 for Chinese/mixed replies → OpenAI TTS
-(`tts-1-hd`, all-English replies and ElevenLabs fallback) → macOS `say`
-(offline last resort).
+TTS chain: ElevenLabs (`eleven_v3`, primary) → Edge TTS (free, no key, native
+zh-CN / en-US neural voices — first fallback) → OpenAI TTS (`tts-1-hd`) → macOS
+`say` (offline last resort).
 
 A web dashboard on `http://localhost:19000/dashboard` exposes wake/sleep, a
 live conversation log, mic level meter, and basic device controls.
@@ -22,7 +22,7 @@ live conversation log, mic level meter, and basic device controls.
 | Concern              | Pi (origin)                       | Mac (this repo)                              |
 |----------------------|-----------------------------------|----------------------------------------------|
 | Audio framework      | PipeWire + ALSA                   | CoreAudio (via `sounddevice`)                |
-| TTS                  | Piper (offline binary)            | ElevenLabs (zh/mixed) → OpenAI TTS → `say`   |
+| TTS                  | Piper (offline binary)            | ElevenLabs → Edge TTS → OpenAI TTS → `say`   |
 | Service manager      | systemd user service              | launchd LaunchAgent                          |
 | Audio playback       | `aplay` subprocess                | `sounddevice` (PCM into CoreAudio)           |
 | Volume control       | `pactl set-sink-volume`           | `osascript -e 'set volume output volume N'`  |
@@ -57,7 +57,7 @@ verbatim from the Pi version.
 |-----------------------------|--------------------------------------------|
 | [OpenClaw](https://openclaw.ai) gateway running | platform requirement (`openclaw gateway start`) |
 | `openai.apiKey` in `~/.openclaw/openclaw.json` | regular OpenAI API key, **not** the openai-codex OAuth profile |
-| [Edge TTS skill](https://github.com/w2ayz/openclaw-edge-tts) | `~/.openclaw/workspace/skills/edge-tts/` |
+| [Edge TTS skill](https://github.com/w2ayz/openclaw-edge-tts) (first TTS fallback — optional) | install at the official path `~/.openclaw/workspace/skills/edge-tts/` (`npm install` in `scripts/`); the installer resolves it and prepares its deps |
 | Homebrew + portaudio + ffmpeg + node | `brew install portaudio ffmpeg node`     |
 | `hidapi` (only for Radio Mode's AIOC hardware-revision detection — cosmetic, everything else works without it) | `brew install hidapi` |
 | Python 3.9+                 | system Python or `brew install python`     |
@@ -424,8 +424,9 @@ Mic (CoreAudio)
                         └─ GatewayClient.ask()  (OpenClaw chat.send → agent.wait)
                             └─ Zeebot's reply text
                                 └─ speak()
-                                    ├─ ElevenLabs multilingual v2  (zh/mixed, full text)
-                                    ├─ OpenAI TTS tts-1-hd  (fallback / English)
+                                    ├─ ElevenLabs eleven_v3  (primary, full text)
+                                    ├─ Edge TTS  (per-segment, native zh/en voices — first fallback)
+                                    ├─ OpenAI TTS tts-1-hd  (paid network fallback)
                                     ├─ macOS `say`  (per-segment, offline last resort)
                                     ├─ ffmpeg → 24 kHz mono PCM int16
                                     ├─ software volume attenuation
@@ -443,8 +444,8 @@ and Zeebot's reasoning time.
 ## Limitations
 
 - **No built-in Mac Mini mic** — external input required
-- **ElevenLabs/OpenAI TTS need internet** — falls back to offline `say` on
-  failure/timeout or if no API key is configured
+- **ElevenLabs / Edge TTS / OpenAI TTS need internet** — falls back to offline
+  `say` on failure/timeout or if no API key is configured (Edge TTS needs no key)
 - **System-wide volume** — macOS scripting can only set the master output
   volume, not per-device
 - **No WebRTC AGC** — CoreAudio handles input gain at the driver level, but

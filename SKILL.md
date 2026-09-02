@@ -58,29 +58,36 @@ websockets + numpy:
 ## TTS pipeline
 
 ```python
-# In speak(text):
-1. if any CJK char in text: _elevenlabs_tts_to_mp3(text, /tmp/rtt_XXX.mp3)
-   └─ ElevenLabs multilingual v2, voice "Rachel" — whole text in one call
-2. on failure/no key/pure-English: _openai_tts_to_mp3(text, /tmp/rtt_XXX.mp3)
+# In speak(text) — engine chain, first success wins:
+1. _elevenlabs_tts_to_mp3(text, /tmp/rtt_XXX.mp3)
+   └─ ElevenLabs eleven_v3, voice "Lily" — whole text in one call
+2. _edge_tts_to_pcm(text)
+   └─ Edge TTS, per-segment over _split_by_script(text):
+      _edge_tts_to_mp3(seg, {zh-CN-XiaoxiaoNeural|en-US-AriaNeural}, out.mp3)
+      free, no API key, native zh/en neural voices — best bilingual fallback
+3. _openai_tts_to_mp3(text, /tmp/rtt_XXX.mp3)
    └─ OpenAI TTS tts-1-hd, voice nova — whole text in one call
-3. on failure: per-segment fallback over _split_by_script(text):
+4. per-segment over _split_by_script(text):
    _say_fallback_to_aiff(seg_text, lang, /tmp/rtt_XXX.aiff)
-   └─ macOS `say -v {Samantha|Tingting} -o <out>`
-4. _decode_to_pcm(<file>)
+   └─ macOS `say -v {Samantha|Tingting} -o <out>` (offline)
+5. _decode_to_pcm(<file>)
    └─ ffmpeg → 24 kHz mono int16 numpy array
-5. concatenate PCM segments, apply software volume
-6. sd.play(pcm, device=<output_device>, blocking=False)
-7. poll mic level every 50 ms → sd.stop() on speech-interrupt
+6. concatenate PCM segments, apply software volume
+7. sd.play(pcm, device=<output_device>, blocking=False)
+8. poll mic level every 50 ms → sd.stop() on speech-interrupt
 ```
 
 Voice choices:
-- ElevenLabs: voice ID `21m00Tcm4TlvDq8ikWAM` ("Rachel"), model `eleven_multilingual_v2`
+- ElevenLabs: voice ID `pFZP5JQG7iQjIQuC4Bku` ("Lily"), model `eleven_v3`
+- Edge TTS: `zh-CN-XiaoxiaoNeural` (zh), `en-US-AriaNeural` (en)
 - OpenAI TTS: model `tts-1-hd`, voice `nova`
 - say: `Samantha` (en), `Tingting` (zh)
 
-Edge TTS (`_edge_tts_to_mp3`) is still present in the file for reference but
-unused by default — kept in case ElevenLabs/OpenAI are both unreachable and
-someone wants to re-wire it in.
+Edge TTS script path is resolved at import by `_resolve_edge_tts_script()`:
+`$RTT_EDGE_TTS_SCRIPT` (set by the installer in the plist) → sibling
+`skills/edge-tts/scripts/tts-converter.js` → `$OPENCLAW_WORKSPACE/...` →
+official `~/.openclaw/workspace/skills/edge-tts/scripts/tts-converter.js`.
+If none exist, Edge is skipped and the chain drops to OpenAI TTS.
 
 ---
 

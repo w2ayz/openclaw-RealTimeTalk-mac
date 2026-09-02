@@ -1,5 +1,18 @@
 # Changelog
 
+## [3.20.0] — 2026-09-02
+
+### Changed
+- **Auto-sleep (10 min idle) is now text-only.** `_idle_watcher` no longer speaks "Going to sleep. Press Wake to reconnect." — it just writes the `Auto-sleep after N min idle. Press Wake to reconnect.` line to the dashboard log and flips the state pill to **SLEEPING**. The spoken line fired during quiet time (often an empty room) and was more startling than useful. The explicit "sleep phrase" voice command is unchanged and still speaks its confirmation.
+- **TTS engine chain is now ElevenLabs → Edge TTS → OpenAI TTS → macOS `say`.** Edge TTS moves from unused-legacy to the first fallback after ElevenLabs: it's free, needs no API key, and speaks Chinese with native `zh-CN-XiaoxiaoNeural` / English with `en-US-AriaNeural` — for a bilingual (EN + ZH) user that beats OpenAI's English-accented Mandarin. `speak()` calls the new `_edge_tts_to_pcm()`, which splits the reply by script (`_split_by_script`) so each run uses its native voice, and abandons the whole engine (falls through to OpenAI TTS) if any segment fails rather than playing a half-rendered reply. OpenAI TTS is now strictly the paid network fallback.
+
+### Fixed
+- **Edge TTS skill path was a fragile hardcode.** Both the daemon (`EDGE_TTS_SCRIPT`) and the installer hardcoded `~/.openclaw/workspace/skills/edge-tts/scripts/tts-converter.js` as two independent absolute strings, each keyed off `$HOME` — a relocated OpenClaw workspace broke them, and the installer's `-f` check only proved the `.js` existed, not that `npm install` had run. Now:
+  - The daemon resolves the path at import via `_resolve_edge_tts_script()`: `$RTT_EDGE_TTS_SCRIPT` → sibling `skills/edge-tts/scripts/tts-converter.js` (relative to the daemon file) → `$OPENCLAW_WORKSPACE/skills/edge-tts/...` → the official `~/.openclaw/workspace/skills/edge-tts/...`. First hit wins; missing Edge just drops the chain to OpenAI TTS.
+  - `RealTimeTalk-install-mac.sh` step 2 resolves the same way, runs `npm install --omit=dev` in the skill's `scripts/` if `node_modules` is absent, verifies the script runs, and — key change — **treats a missing skill as a warning, not a fatal `exit 1`** (it's a fallback engine, not a hard dependency).
+  - The installer writes the resolved path into the LaunchAgent plist as `RTT_EDGE_TTS_SCRIPT` (new `EnvironmentVariables` entry + `__EDGE_TTS_SCRIPT__` template placeholder), so the installer and the running daemon always agree on the location.
+- **DEPLOYMENT.md §3.5 documented a hand-rolled Edge TTS install** (hand-write `package.json`, `npm install --prefix` at the skill root, hand-copy `tts-converter.js` "from your c2e-slack repo") that put `node_modules` in the wrong directory and depended on an unrelated repo. Replaced with `clawhub install edge-tts` / a repo clone to the official path, matching the skill's own `skill-info.json` (`install: { path: "scripts" }`).
+
 ## [3.19.0] — 2026-08-30
 
 ### Added

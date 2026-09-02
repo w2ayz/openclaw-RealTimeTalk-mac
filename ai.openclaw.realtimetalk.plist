@@ -19,6 +19,8 @@
         <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/local/bin</string>
         <key>DYLD_LIBRARY_PATH</key>
         <string>/opt/homebrew/lib:/usr/local/lib</string>
+        <key>RTT_EDGE_TTS_SCRIPT</key>
+        <string>__EDGE_TTS_SCRIPT__</string>
     </dict>
 
     <key>RunAtLoad</key>
