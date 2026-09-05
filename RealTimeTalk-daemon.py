@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.20.0"
+__version__ = "3.20.1"
 
 import argparse
 import asyncio
@@ -398,6 +398,10 @@ _radio_monitor_buf_lock = _threading.Lock()
 _active_radio_iface:   list = [None]   # radio_interfaces.RadioInterface currently connected, or None
 _ptt_serial:          list = [None]   # open pyserial.Serial on the radio's PTT port, or None
 _is_tx:               list = [False]  # True while PTT is asserted — mutes mic capture (_mic_cb)
+_ptt_unavail_logged:  list = [False]  # True once _ptt_open() has logged a "PTT unavailable" reason;
+                                      # suppresses the identical warning on every subsequent 3s
+                                      # hotplug-watcher probe. Cleared when a port opens successfully,
+                                      # so a later disconnect logs exactly one fresh line.
 
 
 def _ptt_prekey_s() -> float:
@@ -413,14 +417,24 @@ def _ptt_tail_s() -> float:
 def _ptt_open() -> None:
     """Open the connected radio interface's serial port for PTT. Non-fatal —
     logs a warning if no registered interface (AIOC, ...) is found."""
+    def _unavail(msg: str, *args) -> None:
+        # Log the reason once per absent-streak, then stay quiet. The hotplug
+        # watcher calls this every 3s while no radio is connected, which
+        # otherwise floods the log with an identical line.
+        if not _ptt_unavail_logged[0]:
+            log.warning(msg, *args)
+            _ptt_unavail_logged[0] = True
+        else:
+            log.debug(msg, *args)
+
     if not _HAVE_PYSERIAL:
-        log.warning("Radio PTT unavailable (pyserial not installed) — PTT disabled")
+        _unavail("Radio PTT unavailable (pyserial not installed) — PTT disabled")
         _ptt_serial[0] = None
         _active_radio_iface[0] = None
         return
     found = _radio.find_radio_port()
     if not found:
-        log.warning("Radio PTT unavailable (no known radio interface found) — PTT disabled")
+        _unavail("Radio PTT unavailable (no known radio interface found) — PTT disabled")
         _ptt_serial[0] = None
         _active_radio_iface[0] = None
         return
@@ -431,10 +445,11 @@ def _ptt_open() -> None:
         s.rts = False
         _ptt_serial[0] = s
         _active_radio_iface[0] = iface
+        _ptt_unavail_logged[0] = False   # opened cleanly — re-arm the one-shot warning
         log.info("%s PTT ready on %s (%s line) — audio output will transmit over the air",
                  _radio.detect_hw_variant(iface), port, iface.ptt_line.upper())
     except Exception as exc:
-        log.warning("%s PTT unavailable (%s) — PTT disabled", iface.name, exc)
+        _unavail("%s PTT unavailable (%s) — PTT disabled", iface.name, exc)
         _ptt_serial[0] = None
         _active_radio_iface[0] = None
 

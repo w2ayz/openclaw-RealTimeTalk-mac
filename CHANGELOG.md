@@ -1,5 +1,10 @@
 # Changelog
 
+## [3.20.1] — 2026-09-05
+
+### Fixed
+- **`_ptt_open()` flooded the log with an identical warning every 3 seconds when no radio was attached.** `_radio_hotplug_watcher` polls on a 3s loop and calls `_ptt_open()` whenever no PTT port is live; each call unconditionally logged `Radio PTT unavailable (no known radio interface found) — PTT disabled` (or the pyserial-missing / port-open-failed variants). On a Mac with no AIOC that's ~1,200 lines/hour of pure noise. `_ptt_open()` now logs the unavailable reason at `warning` **once per absent streak** (new `_ptt_unavail_logged` flag, cleared on a successful port open) and at `debug` — suppressed by the daemon's `INFO` level — thereafter. A radio plug-in still logs its `PTT ready` line, and a later unplug logs exactly one fresh warning.
+
 ## [3.20.0] — 2026-09-02
 
 ### Changed
