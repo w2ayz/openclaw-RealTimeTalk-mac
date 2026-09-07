@@ -1,5 +1,11 @@
 # Changelog
 
+## [3.21.5] — 2026-09-07
+
+### Docs
+
+- **The OpenClaw wiring instructions pointed at the retired `TOOLS.md`.** `README.md` and `DEPLOYMENT.md` §8 both told the operator to add the `/speak` capability note to `~/.openclaw/workspace/TOOLS.md`. OpenClaw 2026.8 retired that file — the runtime no longer reads it — and local tool notes now live in the `## Tools` section of `AGENTS.md` (`openclaw doctor --fix` migrates an existing `TOOLS.md` in place). Both docs now say `AGENTS.md` → `## Tools`, with a short note for workspaces that still carry a legacy `TOOLS.md`. The installers were never affected — they don't write the snippet, the operator pastes it.
+
 ## [3.21.4] — 2026-09-07
 
 ### Fixed

@@ -394,9 +394,9 @@ can call to have RTT read arbitrary text aloud — the piece that lets an
 OpenClaw agent finish a keyboard-typed task and deliver the result through
 RTT instead of just replying in text.
 
-OpenClaw won't discover this on its own — add a note to its `TOOLS.md`
-(`~/.openclaw/workspace/TOOLS.md`) so the agent knows the capability exists
-and when to use it:
+OpenClaw won't discover this on its own — add a note to the **`## Tools`
+section of `~/.openclaw/workspace/AGENTS.md`** so the agent knows the
+capability exists and when to use it:
 
 ```markdown
 ### RealTimeTalk — push text to be read aloud
@@ -421,6 +421,13 @@ curl -s -X POST --data-urlencode "text=YOUR TEXT HERE" http://127.0.0.1:19000/sp
 
 No daemon restart needed — OpenClaw's `AGENTS.md` convention re-reads the
 workspace fresh every session, so this takes effect on the next one.
+
+> **Older OpenClaw / a workspace with a `TOOLS.md`:** OpenClaw 2026.8+ retired
+> the standalone `TOOLS.md` (and `HEARTBEAT.md`) — local tool notes now live in
+> `AGENTS.md`'s `## Tools` section. If your workspace still has a `TOOLS.md`,
+> run `openclaw doctor --fix` once; it archives the file and folds its content
+> into `AGENTS.md`. Putting the snippet above straight into `AGENTS.md` is
+> correct either way.
 
 ---
 

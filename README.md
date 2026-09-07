@@ -215,9 +215,10 @@ curl -s -X POST --data-urlencode "text=Your text here" http://127.0.0.1:19000/sp
   line is also logged into the dashboard's conversation history like any
   other reply.
 
-**Wiring it up in OpenClaw:** add a note to the agent's `TOOLS.md` (in
-`~/.openclaw/workspace/`) so it knows the capability exists and when to
-reach for it — it won't discover the endpoint on its own. Something like:
+**Wiring it up in OpenClaw:** add a note to the `## Tools` section of the
+agent's `AGENTS.md` (in `~/.openclaw/workspace/`) so it knows the capability
+exists and when to reach for it — it won't discover the endpoint on its own.
+Something like:
 
 ```markdown
 ### RealTimeTalk — push text to be read aloud
@@ -243,6 +244,10 @@ curl -s -X POST --data-urlencode "text=YOUR TEXT HERE" http://127.0.0.1:19000/sp
 Since OpenClaw's `AGENTS.md` convention is to read the workspace fresh each
 session, this takes effect on the next session with no daemon restart
 required.
+
+(OpenClaw 2026.8+ retired the standalone `TOOLS.md`; tool notes live in
+`AGENTS.md`'s `## Tools` section. If your workspace still has a `TOOLS.md`,
+`openclaw doctor --fix` folds it in.)
 
 ### Disabling RealTimeTalk (make it inert)
 
