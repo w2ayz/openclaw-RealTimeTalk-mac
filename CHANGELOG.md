@@ -1,5 +1,11 @@
 # Changelog
 
+## [3.21.3] — 2026-09-07
+
+### Fixed
+
+- **The read-along highlight ran progressively slower than the speech and finished seconds behind.** `_play_audio`'s monitor loop derived the playback position as `tick_idx * TICK_SAMPLES` (50 ms of audio per loop iteration), but each iteration is `sleep(0.05)` **plus** a mic read, an `np.max` over an echo-window slice, and the `on_tick` callback — real time per tick runs a few ms over 50 ms, so a tick-counted position drifts ~10-15% behind over a long reply. Position is now wall-clock: anchored at `sd.play()` start with the output-buffer latency backed out, so the highlight tracks what's actually being heard. The same value now feeds the echo-window slice (barge-in monitor) and the Continue/Replay resume point, so `_play_audio` returns a **sample count** at interrupt rather than a tick index (`_save_pause`'s third argument changed meaning accordingly). The Pi fork already switched to wall-clock in its own 3.21.x work — this brings the Mac fork in line.
+
 ## [3.21.2] — 2026-09-07
 
 ### Fixed

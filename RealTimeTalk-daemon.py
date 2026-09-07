@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.21.2"
+__version__ = "3.21.3"
 
 import argparse
 import asyncio
@@ -3001,7 +3001,7 @@ def _play_audio(final, sr: int, alsa_output: str,
                 ptt_keyed: bool = False, on_tick=None):
     """Play synthesized PCM via sounddevice with the barge-in interrupt monitor.
 
-    Returns (interrupted, tick_at_break, coupling_measured). This is the
+    Returns (interrupted, samples_played_at_break, coupling_measured). This is the
     playback half of the legacy speak(): PTT routing/keying, the auto-
     calibrating barge-in coupling monitor and Continue/Replay bookkeeping.
     Reused by both speak() and the streaming speaker's playback worker.
@@ -3024,7 +3024,7 @@ def _play_audio(final, sr: int, alsa_output: str,
         baseline_peak = _mic_level_current[0]
     mic_peaks_during: list[int] = []
     _interrupted   = [False]
-    _tick_at_break = [0]   # tick_idx when interrupted — how far into `final` we got
+    _tick_at_break = [0]   # samples into `final` played when interrupted (wall-clock, not tick count)
 
     out_dev = _selected_output_device[0]
     # Radio Mode: route TTS out over the air instead of the local speaker,
@@ -3084,6 +3084,24 @@ def _play_audio(final, sr: int, alsa_output: str,
             log.error("sd.play() failed: %s", e)
             return False, 0, coupling_now
 
+        # Read-along position is wall-clock, not tick_idx * TICK_SAMPLES: each
+        # monitor iteration is sleep(0.05) + mic read + np.max over a slice +
+        # the on_tick callback, so real time per tick runs a few ms over 50 ms
+        # and a tick-counted position falls progressively behind the audio
+        # (~10-15% by the end of a long reply). _play_t0 is anchored at
+        # playback start; out_latency backs out the output-buffer delay so the
+        # highlight tracks what's actually being heard, not what's been queued.
+        _play_t0 = _t.monotonic()
+        try:
+            _lat = sd.get_stream().latency
+            out_latency = float(_lat[1] if isinstance(_lat, (tuple, list)) else _lat)
+        except Exception:
+            out_latency = 0.0
+
+        def _played_samples() -> int:
+            n = int((_t.monotonic() - _play_t0 - out_latency) * sr)
+            return max(0, min(n, len(final)))
+
         if _tx_radio:
             # Radio TX: skip the self-interrupt monitor entirely. Mic capture
             # is already forced to silence while _is_tx is set (see _mic_cb),
@@ -3101,13 +3119,13 @@ def _play_audio(final, sr: int, alsa_output: str,
                     break
                 _t.sleep(0.05)
                 if on_tick is not None:
-                    on_tick(tick_idx * TICK_SAMPLES)
+                    on_tick(_played_samples())
                 tick_idx += 1
                 if _http_interrupt[0]:
                     log.info("HTTP interrupt — stopping TTS")
                     _http_interrupt[0] = False
                     _interrupted[0] = True
-                    _tick_at_break[0] = tick_idx
+                    _tick_at_break[0] = _played_samples()
                     _clear_audio_buffer[0] = True
                     try:
                         sd.stop()
@@ -3130,7 +3148,10 @@ def _play_audio(final, sr: int, alsa_output: str,
                     p = _mic_level_current[0]
                 mic_peaks_during.append(p)
 
-                s0 = tick_idx * TICK_SAMPLES
+                # Wall-clock position (see _played_samples above) — the echo
+                # window must line up with what's actually coming out of the
+                # speaker right now, and so must the read-along tick.
+                s0 = _played_samples()
                 s1 = s0 + TICK_SAMPLES
                 tick_out = (int(np.max(np.abs(final[s0:s1])))
                             if len(final) and s1 <= len(final) else 0)
@@ -3170,7 +3191,7 @@ def _play_audio(final, sr: int, alsa_output: str,
                         log.info("HTTP interrupt — stopping TTS (during guard)")
                         _http_interrupt[0] = False
                         _interrupted[0] = True
-                        _tick_at_break[0] = tick_idx
+                        _tick_at_break[0] = s0
                         _clear_audio_buffer[0] = True
                         try:
                             sd.stop()
@@ -3204,7 +3225,7 @@ def _play_audio(final, sr: int, alsa_output: str,
                     log.info("HTTP interrupt — stopping TTS")
                     _http_interrupt[0] = False
                     _interrupted[0] = True
-                    _tick_at_break[0] = tick_idx
+                    _tick_at_break[0] = s0
                     _clear_audio_buffer[0] = True  # flush OpenAI VAD buffer after interrupt
                     try:
                         sd.stop()
@@ -3218,7 +3239,7 @@ def _play_audio(final, sr: int, alsa_output: str,
                         log.info("Speech interrupt — stopping TTS (peak=%d threshold=%d)",
                                  p, interrupt_threshold)
                         _interrupted[0] = True
-                        _tick_at_break[0] = tick_idx
+                        _tick_at_break[0] = s0
                         _clear_audio_buffer[0] = True  # flush OpenAI VAD buffer after interrupt
                         try:
                             sd.stop()
@@ -3253,7 +3274,7 @@ def _play_audio(final, sr: int, alsa_output: str,
         if not _tx_radio:
             content_total = len(final) - lead_pad_samples - (lead_pad_samples if tail_pad_added else 0)
             if content_total > 0 and full_text2:
-                played = _tick_at_break[0] * TICK_SAMPLES - lead_pad_samples
+                played = _tick_at_break[0] - lead_pad_samples   # already a sample count
                 played = max(0, min(played, content_total))
                 char_est = int(played / content_total * len(full_text2))
                 start = _sentence_start_before(full_text2, char_est)
@@ -3636,7 +3657,7 @@ class StreamingSpeaker:
                     continue
                 pcm, sr, seg_text, seg_start, lead, tail = item
                 try:
-                    inter, tick_b, cp = _play_audio(
+                    inter, played_b, cp = _play_audio(
                         pcm, sr, self.alsa_output,
                         resumable=False, full_text=seg_text,
                         lead_pad_samples=lead, tail_pad_added=bool(tail),
@@ -3656,7 +3677,7 @@ class StreamingSpeaker:
                     # nobody will ever play.
                     self._gen_stop.set()
                     if gen == self._gen:
-                        self._save_pause(seg_text, seg_start, tick_b, lead, tail,
+                        self._save_pause(seg_text, seg_start, played_b, lead, tail,
                                          len(pcm), sr)
                     self._drain()
                     break
@@ -3688,12 +3709,12 @@ class StreamingSpeaker:
                     st["running"] = True
         return _tick
 
-    def _save_pause(self, seg_text: str, seg_start: int, tick_at_break: int,
+    def _save_pause(self, seg_text: str, seg_start: int, samples_at_break: int,
                     lead: int, tail: int, pcm_len: int, sr: int):
         content_total = pcm_len - lead - (lead if tail else 0)
         local_off = 0
         if content_total > 0:
-            played = tick_at_break * max(1, sr * 50 // 1000) - lead
+            played = samples_at_break - lead   # _play_audio returns a sample count now
             played = max(0, min(played, content_total))
             char_local = int(played / content_total * len(seg_text))
             local_off = _sentence_start_before(seg_text, char_local)
