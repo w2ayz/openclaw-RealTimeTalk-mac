@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.21.1] — 2026-09-07
+
+### Added
+
+- **POST `/speak` — OpenClaw can now push long text to the speaker reliably.** The local-only `/speak` endpoint previously accepted text only via the URL query string (`?text=...`), which mangles `&`, `#`, `+` and other characters that appear in real news copy, and was undocumented for the agent. It now also accepts the text in the request body — form-encoded `text=...` or raw UTF-8 — so an OpenClaw agent can read out a gathered news roundup with `curl -s -X POST --data-urlencode "text=<copy>" http://127.0.0.1:19000/speak`. GET still works unchanged. The endpoint works even while RTT is in auto-sleep.
+- **README.md / DEPLOYMENT.md readout sections updated to the POST syntax** — both still showed the old GET-only `?text=` + manual-URL-encode curl one-liner and a "keep it to a spoken-length summary" caveat; the embedded `TOOLS.md` snippet installers copy into the agent workspace now uses `--data-urlencode` and notes long text streams (reading starts within the first sentence or two).
+
+### Changed
+
+- **`/speak` now reads through `StreamingSpeaker`** (new `_queue_speak`, shared by GET and POST) instead of the monolithic `speak()` path, so a long pushed text starts being read after its first sentence is synthesised rather than after the whole text is processed. Kept in lockstep with the Pi fork's v3.21.1.
+
 ## [3.21.0] — 2026-09-06
 
 ### Added

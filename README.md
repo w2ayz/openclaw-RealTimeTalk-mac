@@ -179,7 +179,7 @@ Or via HTTP:
 - `GET http://localhost:19000/wake` — activate
 - `GET http://localhost:19000/sleep` — deactivate
 - `GET http://localhost:19000/restart` — restart daemon
-- `GET http://localhost:19000/speak?text=...` — speak arbitrary text (see below)
+- `POST http://127.0.0.1:19000/speak` — speak arbitrary text (see below)
 
 Or via voice: say "Zeebot wake up" while Silent or Monitoring — Zeebot asks
 "Yes?" and activates only on an affirmative reply ("yes", "ok", "wake up", "好",
@@ -196,14 +196,20 @@ Useful when the request was typed but the answer should come back spoken —
 away from the keyboard, on the radio, hands busy, etc.
 
 ```bash
-curl "http://localhost:19000/speak?text=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "Your text here")"
+curl -s -X POST --data-urlencode "text=Your text here" http://127.0.0.1:19000/speak
 # → {"ok": true, "queued": true, "chars": N}
 ```
 
 - **Local-only** — rejects anything not from `127.0.0.1`/`::1`/`localhost`.
-- **GET, URL-encoded query string** — fine for a spoken-length summary;
-  don't push a raw multi-page report through it, summarize first.
-- Text runs through the normal `speak()` pipeline (markdown stripped, TTS
+- **POST the text in the body** (form-encoded `text=...` or raw UTF-8) — this
+  survives `&`, `#`, `+` and other characters that appear in real copy. The
+  old `GET /speak?text=...` still works for simple one-liners, but mangles
+  those characters.
+- **Streaming** — reading starts as soon as the first sentence is
+  synthesised; the rest of a long text is processed while the earlier
+  sentences are already being spoken. No need to summarize first.
+- Works even while RTT is in auto-sleep.
+- Text runs through the normal TTS pipeline (markdown stripped, TTS
   engine as configured) and plays on whatever output device is currently
   selected — including transmitting on-air if Radio Mode is active. The
   line is also logged into the dashboard's conversation history like any
@@ -222,10 +228,13 @@ read me what you find" typed instead of said — call this instead of just
 replying in text:
 
 ​```bash
-curl "http://localhost:19000/speak?text=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "YOUR TEXT HERE")"
+curl -s -X POST --data-urlencode "text=YOUR TEXT HERE" http://127.0.0.1:19000/speak
 ​```
 
-- Local-only, GET, URL-encode the text, keep it to a spoken-length summary.
+- Local-only. Use POST (not `?text=` in the URL) so long copy with `&`,
+  `#`, `+` etc. survives intact.
+- Reading starts streaming within the first sentence or two — long text is
+  fine, no need to summarize first.
 - Success looks like `{"ok": true, "queued": true, "chars": N}`.
 - Only use this when RTT is the actual delivery channel wanted — not as a
   substitute for normal chat replies.

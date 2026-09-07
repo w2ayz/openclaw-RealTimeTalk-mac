@@ -388,11 +388,11 @@ If specified, `<name> wake up` is also kept as an additional recognised phrase.
 
 ### Wiring OpenClaw up to push text for readout
 
-RTT has a local-only `/speak?text=...` endpoint (see README.md's "Control"
-section for full detail) that any process on this Mac can call to have RTT
-read arbitrary text aloud — the piece that lets an OpenClaw agent finish a
-keyboard-typed task and deliver the result through RTT instead of just
-replying in text.
+RTT has a local-only `POST http://127.0.0.1:19000/speak` endpoint (see
+README.md's "Control" section for full detail) that any process on this Mac
+can call to have RTT read arbitrary text aloud — the piece that lets an
+OpenClaw agent finish a keyboard-typed task and deliver the result through
+RTT instead of just replying in text.
 
 OpenClaw won't discover this on its own — add a note to its `TOOLS.md`
 (`~/.openclaw/workspace/TOOLS.md`) so the agent knows the capability exists
@@ -407,10 +407,13 @@ read me what you find" typed instead of said — call this instead of just
 replying in text:
 
 ​```bash
-curl "http://localhost:19000/speak?text=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "YOUR TEXT HERE")"
+curl -s -X POST --data-urlencode "text=YOUR TEXT HERE" http://127.0.0.1:19000/speak
 ​```
 
-- Local-only, GET, URL-encode the text, keep it to a spoken-length summary.
+- Local-only. Use POST (not `?text=` in the URL) so long copy with `&`,
+  `#`, `+` etc. survives intact.
+- Reading starts streaming within the first sentence or two — long text is
+  fine, no need to summarize first.
 - Success looks like `{"ok": true, "queued": true, "chars": N}`.
 - Only use this when RTT is the actual delivery channel wanted — not as a
   substitute for normal chat replies.
