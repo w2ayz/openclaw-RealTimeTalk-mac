@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.21.1"
+__version__ = "3.21.2"
 
 import argparse
 import asyncio
@@ -3056,6 +3056,14 @@ def _play_audio(final, sr: int, alsa_output: str,
     interrupt_threshold: int = SPEAK_INTERRUPT_PEAK   # updated after guard, then tracked continuously
     guard_floor = SPEAK_INTERRUPT_PEAK   # threshold floor set by the guard measurement — see below
     coupling_now: float | None = init_coupling   # continuously-tracked echo/coupling ratio
+    # Floor for coupling_now: the honest guard measurement. The per-tick EMA
+    # below may only drift coupling_now UP (louder passages) — never below what
+    # the guard actually measured. Without this, a long or quiet reply's EMA
+    # ratchets coupling_now (and the value handed to the next streamed sentence
+    # as its skip-guard basis) toward zero, so each sentence starts with a lower
+    # barge-in threshold than the last and the reply eventually interrupts
+    # itself on its own echo.
+    coupling_floor: float | None = init_coupling
     if init_coupling is not None:
         interrupt_threshold = max(
             int(_output_peak * init_coupling * INTERRUPT_SAFETY), SPEAK_INTERRUPT_PEAK)
@@ -3142,6 +3150,7 @@ def _play_audio(final, sr: int, alsa_output: str,
                     if guard == 0:
                         if guard_max_out > 200:
                             coupling_now = guard_max_mic / guard_max_out
+                            coupling_floor = coupling_now
                             interrupt_threshold = max(
                                 int(_output_peak * coupling_now * INTERRUPT_SAFETY),
                                 SPEAK_INTERRUPT_PEAK,
@@ -3181,6 +3190,8 @@ def _play_audio(final, sr: int, alsa_output: str,
                     local = p / tick_out
                     coupling_now = local if coupling_now is None else (
                         coupling_now * (1 - SPEAK_COUPLING_EMA) + local * SPEAK_COUPLING_EMA)
+                    if coupling_floor is not None and coupling_now < coupling_floor:
+                        coupling_now = coupling_floor   # never drift below the guard measurement
                     # guard_floor never shrinks below the guard's own measurement: the
                     # guard takes a MAX over a full second, which is statistically always
                     # ≥ any single later EMA sample, so unclamped tracking only ever
@@ -3292,6 +3303,11 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         _speak_lock.release()
         _t_spk.sleep(0.2)
     _interrupted_out = False
+    _held_speak_lock = True   # released in the finally below — WITHOUT this, a
+                              # second speak() (e.g. a /continue after another
+                              # /continue was itself interrupted) deadlocks on
+                              # the acquire above forever. The pre-3.21.0 speak()
+                              # released here; the streaming refactor dropped it.
     try:
         pcm, sr, lead_samp, tail_pad = _synthesize(
             text, alsa_output, volume, silence_ms)
@@ -3338,6 +3354,11 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         # Short gate when interrupted (speaker stops instantly, no echo tail).
         # Full 600 ms gate when TTS completes normally (speaker rings down).
         _post_busy_until[0] = _t_spk.time() + (0.15 if _interrupted_out else 0.6)
+        if _held_speak_lock:
+            try:
+                _speak_lock.release()
+            except RuntimeError:
+                pass
 
 class StreamingSpeaker:
     """Streams an OpenClaw reply to TTS while OpenClaw is still generating it.
@@ -3605,7 +3626,8 @@ class StreamingSpeaker:
                     item = wq.get(timeout=0.2)
                 except queue.Empty:
                     continue
-                if isinstance(item, tuple) and item and item[0] == "end":
+                if (isinstance(item, tuple) and item
+                        and isinstance(item[0], str) and item[0] == "end"):
                     break                                 # normal end of stream
                 if gen != self._gen:
                     # reset() happened — this generation is defunct
@@ -3627,9 +3649,16 @@ class StreamingSpeaker:
                     break
                 played_any = True
                 if inter:
+                    # Barge-in mid-reply. Stop the synthesis worker too — without
+                    # this it keeps running _synthesize() on every remaining
+                    # sentence (each a 10-15s network call, real ElevenLabs
+                    # quota) long after playback has stopped, queuing audio
+                    # nobody will ever play.
+                    self._gen_stop.set()
                     if gen == self._gen:
                         self._save_pause(seg_text, seg_start, tick_b, lead, tail,
                                          len(pcm), sr)
+                    self._drain()
                     break
         finally:
             _is_speaking[0] = False
@@ -3686,9 +3715,9 @@ class StreamingSpeaker:
             except queue.Empty:
                 break
             if isinstance(item, tuple) and item:
-                if item[0] == "end":
+                if isinstance(item[0], str) and item[0] == "end":
                     continue
-                if resume_char is None:
+                if resume_char is None and len(item) == 6:
                     resume_char = item[3]        # seg_start of next unplayed sentence
         full = self._known_full or ""
         if resume_char is None:
@@ -5344,6 +5373,8 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                     threading.Thread(target=speak, args=(saved_text, saved_dev, -1.0, 300, True),
                                       daemon=True).start()
                     log.info("HTTP %s — %d chars", self.path.lstrip("/"), len(saved_text))
+                else:
+                    log.info("HTTP %s — nothing paused to resume", self.path.lstrip("/"))
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()

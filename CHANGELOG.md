@@ -1,5 +1,14 @@
 # Changelog
 
+## [3.21.2] — 2026-09-07
+
+### Fixed
+
+- **`/continue` after an interrupted `/continue` hung silently — you couldn't resume a reading.** The 3.21.0 streaming refactor split `speak()` into `speak()` + `_synthesize()` + `_play_audio()` and **dropped the `_speak_lock.release()` from `speak()`'s `finally`**. The first `speak()` call (any `/continue`, `/replay`, wake confirmation, or one-off readout) acquired `_speak_lock` and never let go; the *next* `speak()` blocked forever on the acquire — no synthesis, no playback, no log line. Streamed replies (`StreamingSpeaker._playback_worker`) were unaffected because they release the lock correctly, which is why it only showed up on the second consecutive resume. `speak()` now releases the lock in its `finally` (guarded, so it can't double-release).
+- **Barge-in during a streamed reply left the synthesis worker running.** A mid-reply interrupt stopped playback but never signalled `StreamingSpeaker`'s synth worker, so it kept calling `_synthesize()` on every remaining sentence — each a 10–15 s ElevenLabs request billing real quota — queuing audio nobody would play, for 20+ seconds after the reading stopped. The playback worker's interrupt path now sets `_gen_stop` and drains the queues; at most one already-in-flight sentence completes.
+- **A long or quiet streamed reply could interrupt itself on its own echo.** `_play_audio`'s per-tick coupling EMA was allowed to drift *downward* unbounded, and the streaming pipeline hands each sentence's ending `coupling_now` to the next sentence as its skip-guard threshold basis — so the barge-in threshold ratcheted down sentence over sentence (observed: 1191 → 626 in two sentences) until the speaker's own output tripped it (`peak=708 threshold=626`). `coupling_now` is now floored at the guard's honest measurement: the EMA may still rise for genuinely louder passages but never falls below what the 1 s guard actually measured.
+- **`/continue` and `/replay` with nothing paused now log the no-op** instead of silently redirecting to the dashboard.
+
 ## [3.21.1] — 2026-09-07
 
 ### Added
