@@ -1,5 +1,26 @@
 # Changelog
 
+## [3.21.0] — 2026-09-06
+
+### Added
+
+- **Streaming TTS — the reply starts being spoken while OpenClaw is still writing it.** The daemon no longer waits for the complete reply (chat-final) before synthesizing: a new `StreamingSpeaker` consumes the gateway's incremental `assistant` stream events and starts voicing the reply as soon as a configurable start threshold is met, overlapping generation with speech. The pipeline reuses the existing synthesis and playback machinery, refactored into two shared halves — `_synthesize()` and `_play_audio()` — so `speak()` keeps its exact previous behavior for `/speak`, `/continue`, `/replay`, wake confirmations, and one-off readouts.
+  - New `GatewayClient.ask_stream()` async generator: races the gateway's stream queue against the reply future and yields `("delta", data)` events, then `("final", text)` resolved with the exact same fallbacks as `ask()` (chat-final → assistant stream → status-token → chat.history → stale-reply rejection). Codex `message`-tool turns (no streaming) fall through to today's whole-reply path automatically.
+  - `TTS_MAX_SENTENCE` (env `RTT_TTS_MAX_SENTENCE`, default 500 chars) caps how long a single long sentence can stall the pipeline — the buffer flushes at the last clause boundary.
+  - `replace` stream events (model rewrites its answer) reset the speaker mid-turn and re-arm it for the new text.
+
+### Changed
+
+- **New `RTT_TTS_START` environment variable** controls when TTS first starts on a reply (parsed once at startup):
+  - `sentence` (default) — wait for one complete sentence before starting speech.
+  - `time:N` — start after N seconds of streamed text.
+  - `chars:N` — start once N characters have accumulated.
+  - `words:N` — start once N words have accumulated.
+  After the first release, the pipeline flushes on sentence boundaries as they complete, so a long reply keeps flowing.
+- **Live "now reading" cue on the dashboard.** A `#nowreading` panel (outside the 3s-polled `#log`) streams the current speaking position from a new `/speech` SSE endpoint: the sentence being read with the in-progress word highlighted, plus a progress bar (`pos/tot`) that trails the live reply text by however long synthesis+playback takes. Shown for streamed replies and manual readouts (`/speak`, `/continue`, `/replay`) alike.
+- **Voice barge-in still works across streamed sentences.** The playback worker measures the mic↔speaker coupling on the first sentence's guard and passes it to subsequent parts (`skip_guard`), so barge-in is never deaf for a full guard at the start of each sentence, and an `on_tick` callback reports read-along position.
+- **`speak()` refactored** into `_synthesize()` (markdown strip → per-script split → TTS chain → concatenation → volume) + `_play_audio()` (sounddevice playback, PTT routing/keying, coupling monitor, Continue/Replay bookkeeping, auto-reduce) with no behavior change; the streaming pipeline reuses both. `_synthesize` gained `pad_lead`/`pad_tail` so streamed sentences don't get a silence gap between them — only the first sentence is lead-padded and the last tail-padded. Radio mode keys PTT once for the whole streamed turn.
+
 ## [3.20.1] — 2026-09-05
 
 ### Fixed
