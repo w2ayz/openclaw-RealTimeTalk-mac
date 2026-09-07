@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.21.3"
+__version__ = "3.21.4"
 
 import argparse
 import asyncio
@@ -44,6 +44,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer

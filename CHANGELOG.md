@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.21.4] — 2026-09-07
+
+### Fixed
+
+- **Every streamed gateway reply crashed with `name 'time' is not defined`.** The 3.21.0 streaming code (`StreamingSpeaker.feed()`, `_release_point()`, `_playback_worker`) calls bare `time.monotonic()` / `time.sleep()`, but this module never imported `time` at top level — the rest of the file uses function-local `import time as _alias`. So the first `assistant` stream delta from OpenClaw hit `speaker.feed()` → `time.monotonic()` → `NameError`, logged as `Error routing transcript: name 'time' is not defined`, and the whole turn aborted. Replies only got spoken when the agent separately called `/speak` (e.g. the news-reading skill), which routes through `_queue_speak`/`final()` and never touches `feed()`. Added `import time` at module scope. (The Pi fork already had it — Mac-only.)
+  - Note this also means the spoken "Reading it to you now…" style acknowledgment never played, so the several seconds while the agent researches the answer were pure silence.
+
 ## [3.21.3] — 2026-09-07
 
 ### Fixed
