@@ -1,5 +1,11 @@
 # Changelog
 
+## [3.21.8] — 2026-09-08
+
+### Fixed
+
+- **`_resolve_provider_api_key()` returned an unresolvable SecretRef as the API key itself.** A config rewritten to `{"source":"store","provider":"default","id":"OPENAI_API_KEY"}` (no such store provider exists) fell through the `source=="file"` branch and came back as a dict — which became the bearer token, so every OpenAI Realtime STT connect died with `3000 invalid_request_error.invalid_api_key` and the agent could not hear anything. The helper now also resolves `store` refs — trying the environment variable named by `id`, then the top level of every configured file-based secrets provider — and any unrecognized SecretRef shape resolves to `""` (raising a clear "no key" error) instead of being returned as the key. Fixes both the OpenAI and ElevenLabs loaders. The underlying key was verified valid; only the reference was broken. **Pi fork: same fix in its `load_openai_key()` (v3.21.8 lockstep).**
+
 ## [3.21.7] — 2026-09-08
 
 ### Changed
