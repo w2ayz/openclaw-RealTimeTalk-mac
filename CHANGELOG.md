@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.21.6] — 2026-09-07
+
+### Fixed
+
+- **A `/speak` readout queued while the agent's reply was still streaming was never read aloud — and every later player deadlocked.** The `/speak` handler sets `_speak_used_this_turn`, which makes `_consume_stream()` skip `speaker.final(reply)` at chat-final so the reply isn't double-spoken — but nothing ever told the turn's `StreamingSpeaker` it was finished. Its synth worker only breaks on an empty queue once `_final_given` is set, and its playback worker never receives the `"end"` item — so both spin forever, and the playback worker holds `_speak_lock` for the rest of the process's life. The queued `/speak` text waits on that lock forever (observed live on the Pi fork: a 3116-char news roundup queued at 21:42 was still silent 10+ minutes later, `_is_speaking` stuck true with the dashboard's "agent is speaking…" banner up). `StreamingSpeaker` gained `abandon()` — sets `_final_given` so the workers drain what's already queued (the text streamed before the `/speak` arrived still plays) and exit cleanly — and `_consume_stream()` calls it in the `_speak_used_this_turn` branch at chat-final. The timeout branch already had the equivalent via `reset()`. Ported from the Pi fork's v3.21.6 (shared core is byte-identical in both regions).
+- **Versioned here for the record: the punctuation-only Edge TTS fragment skip from PR #1** (merged after `[3.21.5]` with no changelog entry) — `_edge_tts_to_pcm` now skips `_split_by_script` fragments with no CJK/alphanumeric character, so fragments like `":"` or `"、"` no longer become standalone Edge requests that can return rc=0 with no audio and trip the slow full-reply fallback.
+
 ## [3.21.5] — 2026-09-07
 
 ### Docs

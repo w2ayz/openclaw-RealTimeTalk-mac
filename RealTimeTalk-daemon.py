@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.21.5"
+__version__ = "3.21.6"
 
 import argparse
 import asyncio
@@ -3463,6 +3463,21 @@ class StreamingSpeaker:
             self._dispatch(region)
         self._ensure_workers()
 
+    def abandon(self):
+        """The reply was pushed to the speaker via /speak instead — mark the
+        generation finished so the workers drain what's already queued and
+        exit, but never play the remaining text.
+
+        Without this (final() is skipped when _speak_used_this_turn is set),
+        the synth worker only breaks on an empty queue when `_final_given` and
+        the playback worker never receives the "end" item — both spin forever,
+        and the playback worker holds _speak_lock for life, deadlocking every
+        later player (including the /speak readout that caused this)."""
+
+        with self._lock:
+            self._final_given = True
+        log.info("Streaming speaker abandoned — /speak is reading this turn")
+
     def reset(self):
         """Model restarted its answer (``replace`` event) — stop and discard the
         current generation; a fresh pipeline starts on the next feed()."""
@@ -4921,6 +4936,11 @@ class RealtimeSession:
                     if reply:
                         if _speak_used_this_turn[0]:
                             _log_entry("system", f"{AGENT_NAME} (text only): {reply}")
+                            # The reply is being read via /speak — release the
+                            # streaming speaker's workers (they'd otherwise wait
+                            # for an "end" that never comes and hold _speak_lock
+                            # forever, deadlocking the queued readout).
+                            speaker.abandon()
                         else:
                             _log_entry("zeebot", reply)
                             with _live_speech_lock:
