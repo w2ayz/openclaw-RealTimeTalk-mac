@@ -1,5 +1,11 @@
 # Changelog
 
+## [3.21.7] — 2026-09-08
+
+### Changed
+
+- **The dashboard `#dp` device panel's trailing slot now shows the live TTS engine instead of a redundant Owner-only/Everyone label.** The `👤 Owner Only` / `Everyone` nav button directly above the panel already signals that state (and highlights green when owner-only is active), so the panel's `👤 Owner-only` text was duplicating it. That slot now reads `🗣 TTS: <engine>` — whichever of the ElevenLabs → Edge → OpenAI → `say` chain actually produced the audio, brightened (teal, bold) while speaking and dimmed to the last-used engine when idle. `_synthesize()` records the winning engine in a new module global `_last_tts_engine`; `_dashboard_dynamic()` renders it, so it updates live over the existing 3 s `/dashboard-frag` poll. No layout change beyond the swapped slot. **Pi fork: parallel change needed to keep the v3.21.7 lockstep** — the Pi dashboard has the same `#dp` panel but its own `_synthesize`/TTS chain (Piper for English), so adapt rather than cherry-pick.
+
 ## [3.21.6] — 2026-09-07
 
 ### Fixed

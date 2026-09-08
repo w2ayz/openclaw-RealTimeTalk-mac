@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.21.6"
+__version__ = "3.21.7"
 
 import argparse
 import asyncio
@@ -339,6 +339,9 @@ _paused_speech: list = [None]   # {"remaining","full","alsa"} dict saved on TTS 
 _post_busy_until:  list = [0.0] # timestamp; mic sends silence until this time after busy clears
 _http_interrupt:   list = [False]  # set by /interrupt HTTP route to cut TTS mid-playback
 _is_speaking:      list = [False]  # True while speak() is playing audio
+_last_tts_engine:  list = [""]     # human label ("ElevenLabs"/"Edge"/"OpenAI"/"say") of the
+                                 # engine that produced the most recent audio — shown in the
+                                 # dashboard #dp panel, live during playback, last-used when idle
 _speak_lock = threading.Lock()  # serializes speak() calls — two concurrent callers (e.g. two
                                  # /speak requests) would otherwise race on _is_speaking/
                                  # _http_interrupt and overlap audio. Also gates a new call from
@@ -2942,18 +2945,22 @@ def _synthesize(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0,
     temp_files.append(mp3_path)
     try:
         pcm = np.zeros(0, dtype=np.int16)
+        _eng = ""   # which engine actually produced usable audio this call
 
         # TTS engine chain: ElevenLabs → Edge TTS → OpenAI TTS → macOS `say`.
         if _elevenlabs_tts_to_mp3(clean, mp3_path):
             pcm = _decode_to_pcm(mp3_path)
             log.info("  ElevenLabs TTS OK — PCM decode: %d samples (%.1fs)",
                      pcm.size, pcm.size / TTS_SAMPLE_RATE)
+            if pcm.size:
+                _eng = "ElevenLabs"
         else:
             log.info("  ElevenLabs TTS unavailable/failed — trying Edge TTS")
 
         if pcm.size == 0:
             pcm = _edge_tts_to_pcm(clean)
             if pcm.size:
+                _eng = "Edge"
                 log.info("  Edge TTS OK — PCM decode: %d samples (%.1fs)",
                          pcm.size, pcm.size / TTS_SAMPLE_RATE)
             else:
@@ -2966,6 +2973,8 @@ def _synthesize(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0,
                 pcm = _decode_to_pcm(mp3_path)
                 log.info("  PCM decode: %d samples (%.1fs)",
                          pcm.size, pcm.size / TTS_SAMPLE_RATE)
+                if pcm.size:
+                    _eng = "OpenAI"
 
         if pcm.size == 0:
             # Fall back to macOS `say` — split by script for correct voice selection
@@ -2979,9 +2988,13 @@ def _synthesize(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0,
                 if ok_say:
                     seg_pcm = _decode_to_pcm(aiff_path)
                     if seg_pcm.size:
+                        _eng = "say"
                         pcm_parts.append(seg_pcm)
         else:
             pcm_parts.append(pcm)
+
+        if _eng:
+            _last_tts_engine[0] = _eng
 
         if pad_tail and silence_ms > 0 and len(pcm_parts) > 1:
             pcm_parts.append(np.zeros(silence_samples, dtype=np.int16))
@@ -5265,14 +5278,19 @@ def _dashboard_dynamic(sess) -> dict:
             rows += f'<div class="sys">{ts_span}{e["text"]}</div>'
 
     _ds = _get_device_status()
-    _voice_lbl = ("Owner-only" if owner_only else "Everyone") + \
-                 ("" if enrolled else " (not enrolled)")
+    # Owner-only / Everyone state lives on the highlighted nav button now — the
+    # #dp panel's trailing slot instead shows the live TTS engine: whichever of
+    # the ElevenLabs → Edge → OpenAI → say chain produced the audio, brightened
+    # while actually speaking, dimmed to the last-used engine when idle.
+    _tts_eng = _last_tts_engine[0] or "&mdash;"
+    _tts_seg = (f'<span style="color:#2dd4bf;font-weight:600;">{_tts_eng}</span>'
+                if _is_speaking[0] else _tts_eng)
     device_panel = (
         f'<div id="dp">'
         f'&#127908; {_ds["mic"]} &ensp;'
         f'&#128266; {_ds["speaker_name"]} &middot; Vol {_ds["spk_vol"]} &middot; SW {_ds["sw_pct"]}% &ensp;'
         f'Gate {_ds["gate"]} &middot; Gain {_ds["gain"]}x'
-        f' &ensp;&#128100; {_voice_lbl}'
+        f' &ensp;&#128483; TTS: {_tts_seg}'
         f'</div>'
     )
 
