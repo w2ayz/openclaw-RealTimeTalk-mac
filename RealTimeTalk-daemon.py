@@ -2832,6 +2832,13 @@ def _edge_tts_to_pcm(text: str) -> "np.ndarray":
     for seg_text, lang in _split_by_script(text):
         if not seg_text.strip():
             continue
+        # _split_by_script preserves punctuation/Markdown runs for text
+        # processing, but they must not become standalone TTS requests.
+        # node-edge-tts can return rc=0 without audio for fragments such as
+        # ":", "**", "," or "、", which triggers a slow full-reply fallback
+        # and makes streamed speech appear to skip words.
+        if not any(("\u4e00" <= c <= "\u9fff") or c.isalnum() for c in seg_text):
+            continue
         voice = EDGE_VOICE_ZH if lang == "zh" else EDGE_VOICE_EN
         seg_mp3 = tempfile.mktemp(suffix=".mp3")
         try:
