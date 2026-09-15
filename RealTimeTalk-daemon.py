@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.21.8"
+__version__ = "3.22.0"
 
 import argparse
 import asyncio
@@ -132,6 +132,29 @@ OPENAI_WS_URL     = "wss://api.openai.com/v1/realtime?intent=transcription"
 SAMPLE_RATE       = 24000        # OpenAI Realtime API rate
 DEVICE_RATE       = 24000        # capture at 24 kHz — CoreAudio resamples from native
 RESAMPLE_RATIO    = 1            # no decimation needed — DEVICE_RATE == SAMPLE_RATE
+# Gemini live transcription — alternative / fallback STT engine.
+# Uses the raw v1alpha WebSocket protocol because google-genai SDK 1.47.0's
+# typed LiveConnectConfig cannot represent the live-transcription setup fields
+# and sends response_modalities, which the model rejects.
+GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe-live"
+GEMINI_API_VERSION       = "v1alpha"
+GEMINI_SAMPLE_RATE       = 16000        # raw 16-bit PCM mono, little-endian
+GEMINI_BLOCKSIZE         = 1600         # 100 ms at 16 kHz
+GEMINI_SESSION_RESET_SECS = 9 * 60       # proactive reconnect before 10-min cap
+GEMINI_WS_URL = (
+    "wss://generativelanguage.googleapis.com/ws/"
+    "google.ai.generativelanguage." + GEMINI_API_VERSION + "."
+    "GenerativeService.BidiGenerateContent"
+)
+GEMINI_TRANSCRIPTION_MODE = "VERBATIM"  # or "SMART"; VERBATIM is better for commands
+GEMINI_LANGUAGE_CODES     = ["en-US", "zh-CN", "zh-TW", "ko-KR", "ja-JP", "es-ES", "ms-MY"]
+GEMINI_CUSTOM_VOCABULARY: list = []       # populated at startup with agent name + config terms
+
+# STT engine selection. CLI --stt-engine overrides talk.stt.provider/fallback.
+STT_ENGINE_OPENAI  = "openai"
+STT_ENGINE_GEMINI  = "gemini"
+DEFAULT_STT_ENGINE = STT_ENGINE_OPENAI
+
 CHANNELS          = 1
 BLOCKSIZE         = 2400         # 100 ms at 24 kHz
 DEVICE_BLOCKSIZE  = BLOCKSIZE    # same as BLOCKSIZE when RESAMPLE_RATIO == 1
@@ -374,6 +397,7 @@ _sleep_requested:    list = [False] # watchdog sets this; main() waits for /wake
 _wake_event:         list = [None]  # asyncio.Event created in main(); HTTP /wake sets it to reconnect
 _event_loop:         list = [None]  # asyncio loop from main(); lets background threads (hotplug watcher)
                                      # call loop.call_soon_threadsafe(...) to trigger a wake cross-thread
+_cli_stt_engine:     list = [None]  # --stt-engine override from CLI
 _is_sleeping:        list = [False] # True while OpenAI is intentionally disconnected (auto-sleep)
 _wake_activate:      list = [False] # HTTP /wake while sleeping — next session starts active immediately
 _pending_monitor_wake: list = [False]  # Monitor button pressed while sleeping — pre-arms monitoring on wake
@@ -2031,12 +2055,21 @@ def _resolve_provider_api_key(cfg: dict, provider: str) -> str:
     return key or ""
 
 def load_openai_key() -> str:
-    key = _resolve_provider_api_key(_load_json(OPENCLAW_CONFIG), "openai")
-    if not key:
-        raise RuntimeError(
-            "No OpenAI API key at talk.providers.openai.apiKey in openclaw.json"
-        )
-    return key
+    """Returns the OpenAI API key if present, else "". STT can fall back to
+    Gemini when no OpenAI key is configured."""
+    try:
+        return _resolve_provider_api_key(_load_json(OPENCLAW_CONFIG), "openai")
+    except Exception as e:
+        log.warning("Could not load OpenAI key: %s", e)
+        return ""
+
+def load_gemini_key() -> str:
+    """Returns the Gemini API key if present, else ""."""
+    try:
+        return _resolve_provider_api_key(_load_json(OPENCLAW_CONFIG), "gemini")
+    except Exception as e:
+        log.warning("Could not load Gemini key: %s", e)
+        return ""
 
 def load_elevenlabs_key() -> str:
     """Returns "" (not an error) if unset — ElevenLabs TTS is optional; speak()
@@ -4165,10 +4198,11 @@ class GatewayClient:
 
 # ── OpenAI Realtime session (VAD + STT only) ──────────────────────────────────
 
-class RealtimeSession:
+class BaseVoiceSession:
     """
-    Connects to OpenAI Realtime API solely for voice activity detection and
-    speech-to-text. Does not generate AI responses (create_response: false).
+    Engine-agnostic voice session: mic capture, speaker verification, wake/sleep
+    phrase handling, and routing transcripts to Zeebot. Subclasses implement the
+    actual STT WebSocket protocol (OpenAI Realtime or Gemini Transcribe Live).
     """
 
     def __init__(self, api_key: str, loop: asyncio.AbstractEventLoop,
@@ -4500,7 +4534,7 @@ class RealtimeSession:
                 _is_sleeping[0] = True
                 _save_sleep_state(True)
                 log.info("DTMF deep-sleep — closing WebSocket")
-                await ws.close()   # closes OpenAI WS; run()'s async-with exits cleanly
+                await ws.close()   # closes STT WebSocket; run() exits cleanly
                 return
             if _dtmf_force_silent[0]:
                 _dtmf_force_silent[0] = False
@@ -4513,19 +4547,24 @@ class RealtimeSession:
                 continue
             if self._busy.is_set():
                 continue
-            # After TTS interrupt, clear OpenAI's audio buffer so stale VAD data
-            # doesn't generate a spurious transcript of the interrupted echo.
+            # After TTS interrupt, clear the engine's audio buffer so stale VAD
+            # data doesn't generate a spurious transcript of the interrupted echo.
             if _clear_audio_buffer[0]:
                 _clear_audio_buffer[0] = False
-                await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                await self._clear_audio_buffer(ws)
                 # Mirror the server-side discard in the verification capture,
                 # or the segment FIFO desyncs from the transcript stream.
                 self._pending_segments.clear()
                 self._capture_buf = None
-            await ws.send(json.dumps({
-                "type":  "input_audio_buffer.append",
-                "audio": base64.b64encode(chunk).decode(),
-            }))
+            await self._send_audio_chunk(ws, chunk)
+
+    async def _send_audio_chunk(self, ws, chunk: bytes):
+        """Send one mic chunk in the engine's wire format."""
+        raise NotImplementedError
+
+    async def _clear_audio_buffer(self, ws):
+        """Engine-specific audio-buffer reset after TTS interrupt."""
+        raise NotImplementedError
 
     async def _verify_speaker(self, transcript: str) -> bool:
         """Owner-only gate. Pops the matching audio segment (always — mode
@@ -5016,56 +5055,83 @@ class RealtimeSession:
         async for raw in ws:
             if self.stop_event.is_set():
                 break
-            msg = json.loads(raw)
-            t   = msg.get("type", "")
+            await self._handle_engine_message(ws, raw)
 
-            if t in ("conversation.item.done", "conversation.item.input_audio_transcription.completed"):
-                # transcription endpoint: transcript in item.content[].transcript
-                # old realtime endpoint: transcript in top-level .transcript
-                transcript = msg.get("transcript", "")
-                if not transcript:
-                    for chunk in msg.get("item", {}).get("content", []):
-                        if chunk.get("type") == "input_audio" and chunk.get("transcript"):
-                            transcript = chunk["transcript"]
-                            break
-                transcript = transcript.strip()
-                if transcript and not self._busy.is_set():
-                    log.info("You: %s", transcript)
-                    asyncio.create_task(self._handle_transcript(transcript))
+    async def _handle_engine_message(self, ws, raw: bytes):
+        """Engine-specific subclasses parse a raw WebSocket frame and call
+        self._on_transcript(text) / self._on_speech_started() /
+        self._on_speech_stopped() as appropriate. Base class provides those
+        helpers below."""
+        raise NotImplementedError
 
-            elif t == "error":
-                log.error("OpenAI error: %s", msg.get("error", msg))
+    def _on_speech_started(self):
+        self._capture_buf = list(self._preroll)
+        self._capture_consumed = False
 
-            elif t == "input_audio_buffer.speech_started":
-                self._capture_buf = list(self._preroll)
-                self._capture_consumed = False
+    def _on_speech_stopped(self):
+        if self._capture_buf is not None and not self._capture_consumed:
+            import time as _tss
+            self._pending_segments.append(
+                (_tss.time(), b"".join(self._capture_buf)))
+        self._capture_buf = None
 
-            elif t == "input_audio_buffer.speech_stopped":
-                if self._capture_buf is not None and not self._capture_consumed:
-                    import time as _tss
-                    self._pending_segments.append(
-                        (_tss.time(), b"".join(self._capture_buf)))
-                self._capture_buf = None
+    def _on_transcript(self, transcript: str):
+        transcript = transcript.strip()
+        if transcript and not self._busy.is_set():
+            log.info("You: %s", transcript)
+            asyncio.create_task(self._handle_transcript(transcript))
 
-            elif t not in (
-                "input_audio_buffer.committed",
-                "conversation.item.created",
-                "conversation.item.added",
-                "conversation.item.done",
-                "conversation.item.input_audio_transcription.delta",
-                "transcription_session.updated",
-                "session.updated",
-                "session.created",
-            ):
-                log.debug("OpenAI event: %s", t)
+    async def _open_mic_stream(self):
+        """Start the sounddevice InputStream shared by all engines."""
+        import time as _rt
+        with _audio_open_lock:
+            in_stream = sd.InputStream(
+                samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
+                blocksize=DEVICE_BLOCKSIZE, callback=self._mic_cb,
+                device=self.input_device,
+            )
+            in_stream.start()
+        self._mic_stream_ref[0] = in_stream
+        _last_mic_cb[0] = _rt.time()   # seed so watchdog doesn't fire immediately
+
+    def _close_mic_stream(self):
+        s = self._mic_stream_ref[0]
+        if s:
+            try: s.stop(); s.close()
+            except Exception: pass
+        self._mic_stream_ref[0] = None
 
     async def run(self):
-        log.info("Connecting to OpenAI Realtime API (STT mode)…")
+        """Generic session runner: connect, start mic, run tasks, teardown."""
+        log.info("Connecting to %s STT service…", self.engine_name())
+        await self._open_mic_stream()
+        try:
+            await self._connect_and_run()
+        finally:
+            self._close_mic_stream()
+
+    def engine_name(self) -> str:
+        raise NotImplementedError
+
+    async def _connect_and_run(self):
+        raise NotImplementedError
+
+
+# ── OpenAI Realtime session ───────────────────────────────────────────────────
+
+class OpenAIRealtimeSession(BaseVoiceSession):
+    """OpenAI Realtime API in transcription-only mode."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def engine_name(self) -> str:
+        return "OpenAI Realtime"
+
+    async def _connect_and_run(self):
         async with websockets.connect(
             OPENAI_WS_URL,
-            additional_headers={
-                "Authorization": f"Bearer {self.api_key}",
-            },
+            additional_headers={"Authorization": f"Bearer {self.api_key}"},
             ping_interval=20,
             ping_timeout=10,
         ) as ws:
@@ -5077,12 +5143,12 @@ class RealtimeSession:
                         "input": {
                             "transcription": {
                                 "model": OPENAI_TRANSCRIBE_MODEL,
-                                **( {"prompt": TRANSCRIPTION_PROMPT} if TRANSCRIPTION_PROMPT else {} ),
+                                **({"prompt": TRANSCRIPTION_PROMPT} if TRANSCRIPTION_PROMPT else {}),
                             },
                             "turn_detection": {
-                                "type":                "server_vad",
-                                "threshold":           0.35,
-                                "prefix_padding_ms":   500,
+                                "type": "server_vad",
+                                "threshold": 0.35,
+                                "prefix_padding_ms": 500,
                                 "silence_duration_ms": 700,
                             },
                         },
@@ -5090,37 +5156,238 @@ class RealtimeSession:
                 },
             }))
             log.info("Session active — speak now (routed through %s / OpenClaw)", AGENT_NAME)
+            tasks = [
+                asyncio.create_task(self._send_mic(ws)),
+                asyncio.create_task(self._recv_ws(ws)),
+                asyncio.create_task(self.stop_event.wait()),
+                asyncio.create_task(self._watch_mic_stream()),
+                asyncio.create_task(self._idle_watcher(ws)),
+            ]
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
 
-            import time as _rt
-            with _audio_open_lock:
-                in_stream = sd.InputStream(
-                    samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
-                    blocksize=DEVICE_BLOCKSIZE, callback=self._mic_cb,
-                    device=self.input_device,
-                )
-                in_stream.start()
-            self._mic_stream_ref[0] = in_stream
-            _last_mic_cb[0] = _rt.time()   # seed so watchdog doesn't fire immediately
+    async def _send_audio_chunk(self, ws, chunk: bytes):
+        await ws.send(json.dumps({
+            "type": "input_audio_buffer.append",
+            "audio": base64.b64encode(chunk).decode(),
+        }))
 
+    async def _clear_audio_buffer(self, ws):
+        await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+
+    async def _handle_engine_message(self, ws, raw: bytes):
+        msg = json.loads(raw)
+        t = msg.get("type", "")
+
+        if t in ("conversation.item.done", "conversation.item.input_audio_transcription.completed"):
+            transcript = msg.get("transcript", "")
+            if not transcript:
+                for chunk in msg.get("item", {}).get("content", []):
+                    if chunk.get("type") == "input_audio" and chunk.get("transcript"):
+                        transcript = chunk["transcript"]
+                        break
+            self._on_transcript(transcript)
+
+        elif t == "error":
+            log.error("OpenAI error: %s", msg.get("error", msg))
+
+        elif t == "input_audio_buffer.speech_started":
+            self._on_speech_started()
+
+        elif t == "input_audio_buffer.speech_stopped":
+            self._on_speech_stopped()
+
+        elif t not in (
+            "input_audio_buffer.committed",
+            "conversation.item.created",
+            "conversation.item.added",
+            "conversation.item.done",
+            "conversation.item.input_audio_transcription.delta",
+            "transcription_session.updated",
+            "session.updated",
+            "session.created",
+        ):
+            log.debug("OpenAI event: %s", t)
+
+
+# ── Gemini Transcribe Live session ────────────────────────────────────────────
+
+class GeminiTranscribeSession(BaseVoiceSession):
+    """Google Gemini 3.5 Transcribe Live raw WebSocket session.
+
+    Captures at 24 kHz (shared with OpenAI leg) but downsamples each chunk to
+    16 kHz before sending, matching Gemini's required input rate.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._session_no = 0
+        self._shutdown = asyncio.Event()
+
+    def engine_name(self) -> str:
+        return "Gemini Transcribe Live"
+
+    def _downsample_24k_to_16k(self, raw: bytes) -> bytes:
+        """24 kHz int16 → 16 kHz int16 via linear interpolation."""
+        arr = np.frombuffer(raw, np.int16)
+        n_16k = len(arr) * 2 // 3
+        idx_src = np.linspace(0, len(arr) - 1, n_16k)
+        s16 = np.interp(idx_src, np.arange(len(arr)),
+                        arr.astype(np.float32)).astype(np.int16)
+        return s16.tobytes()
+
+    def _setup_payload(self) -> dict:
+        vocab = [v.strip() for v in GEMINI_CUSTOM_VOCABULARY if v.strip()]
+        setup = {
+            "setup": {
+                "model": f"models/{GEMINI_TRANSCRIBE_MODEL}",
+                "input_audio_transcription": {
+                    "language_codes": GEMINI_LANGUAGE_CODES,
+                    "mode": GEMINI_TRANSCRIPTION_MODE,
+                },
+            }
+        }
+        if vocab:
+            setup["setup"]["input_audio_transcription"]["custom_vocabulary"] = vocab
+        return setup
+
+    async def _connect_and_run(self):
+        self._shutdown.clear()
+        api_key = self.api_key
+        while not self.stop_event.is_set() and not self._shutdown.is_set():
+            self._session_no += 1
+            log.info("Gemini session %d connecting (model=%s, reset every %d min)",
+                     self._session_no, GEMINI_TRANSCRIBE_MODEL,
+                     GEMINI_SESSION_RESET_SECS // 60)
             try:
-                tasks = [
-                    asyncio.create_task(self._send_mic(ws)),
-                    asyncio.create_task(self._recv_ws(ws)),
-                    asyncio.create_task(self.stop_event.wait()),
-                    asyncio.create_task(self._watch_mic_stream()),
-                    asyncio.create_task(self._idle_watcher(ws)),
-                ]
-                done, pending = await asyncio.wait(
-                    tasks, return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in pending:
-                    task.cancel()
-            finally:
-                s = self._mic_stream_ref[0]
-                if s:
-                    try: s.stop(); s.close()
-                    except Exception: pass
-                self._mic_stream_ref[0] = None
+                uri = f"{GEMINI_WS_URL}?key={api_key}"
+                async with websockets.connect(uri) as ws:
+                    await ws.send(json.dumps(self._setup_payload()))
+                    tasks = [
+                        asyncio.create_task(self._gemini_sender(ws)),
+                        asyncio.create_task(self._gemini_receiver(ws)),
+                        asyncio.create_task(self._watch_mic_stream()),
+                        asyncio.create_task(self._idle_watcher(ws)),
+                    ]
+                    done, pending = await asyncio.wait(
+                        tasks, return_when=asyncio.FIRST_COMPLETED)
+                    for task in pending:
+                        task.cancel()
+            except websockets.exceptions.InvalidStatusCode as e:
+                log.error("Gemini connect failed: %s", e)
+                raise
+            except Exception as e:
+                log.error("Gemini session error: %s", e)
+                raise
+
+            # If we got here because of the proactive reset, drain stale audio
+            # so the fresh session doesn't receive a burst.
+            while not self._mic_q.empty():
+                try:
+                    self._mic_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+    async def _gemini_sender(self, ws):
+        started = time.monotonic()
+        last_send = time.monotonic()
+        while not self.stop_event.is_set() and not self._shutdown.is_set():
+            try:
+                chunk = await asyncio.wait_for(self._mic_q.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                now = time.monotonic()
+                if self.stop_event.is_set():
+                    try:
+                        await ws.send(json.dumps({"realtime_input": {"audio_stream_end": True}}))
+                    except websockets.exceptions.ConnectionClosed:
+                        pass
+                    return
+                if now - started > GEMINI_SESSION_RESET_SECS:
+                    await ws.send(json.dumps({"realtime_input": {"audio_stream_end": True}}))
+                    log.info("Gemini proactive session reset (before 10-min cap)")
+                    return
+                # Keepalive for idle sessions
+                if now - last_send > 0.5:
+                    try:
+                        await ws.send(json.dumps({
+                            "realtime_input": {
+                                "audio": {
+                                    "data": base64.b64encode(b"\x00" * GEMINI_BLOCKSIZE * 2).decode(),
+                                    "mime_type": "audio/pcm;rate=16000",
+                                }
+                            }
+                        }))
+                    except websockets.exceptions.ConnectionClosed:
+                        return
+                    last_send = now
+                continue
+            if chunk is None:
+                try:
+                    await ws.send(json.dumps({"realtime_input": {"audio_stream_end": True}}))
+                except websockets.exceptions.ConnectionClosed:
+                    pass
+                return
+            chunk16 = self._downsample_24k_to_16k(chunk)
+            try:
+                await ws.send(json.dumps({
+                    "realtime_input": {
+                        "audio": {
+                            "data": base64.b64encode(chunk16).decode(),
+                            "mime_type": "audio/pcm;rate=16000",
+                        }
+                    }
+                }))
+            except websockets.exceptions.ConnectionClosed:
+                return
+            last_send = time.monotonic()
+
+    async def _gemini_receiver(self, ws):
+        while not self.stop_event.is_set() and not self._shutdown.is_set():
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
+            except asyncio.TimeoutError:
+                continue
+            except websockets.exceptions.ConnectionClosed as e:
+                log.info("Gemini receiver closed: %s", e)
+                return
+            await self._handle_engine_message(ws, raw)
+
+    async def _send_audio_chunk(self, ws, chunk: bytes):
+        # Gemini sender consumes the queue directly so it can manage the
+        # 10-minute proactive reset; _send_mic is not used for Gemini.
+        pass
+
+    async def _clear_audio_buffer(self, ws):
+        # Gemini has no explicit buffer-clear message; stream-end + reconnect is
+        # the closest equivalent. For TTS-interrupt echoes we rely on the existing
+        # transcript-level _busy / _is_speaking discard and the pending-segment
+        # reset in _send_mic's clear branch (which calls this no-op for Gemini).
+        pass
+
+    async def _handle_engine_message(self, ws, raw: bytes):
+        msg = json.loads(raw)
+
+        if msg.get("setupComplete"):
+            log.info("Gemini session active — speak now (routed through %s / OpenClaw)", AGENT_NAME)
+            return
+
+        sc = msg.get("serverContent") or msg.get("server_content")
+        if sc is None:
+            return
+
+        final = sc.get("inputTranscription") or sc.get("input_transcription")
+        if final and final.get("text"):
+            self._on_transcript(final["text"])
+
+        va = msg.get("voiceActivity") or msg.get("voice_activity")
+        if va:
+            vtype = va.get("type") or va.get("type")
+            if vtype == "ACTIVITY_START":
+                self._on_speech_started()
+            elif vtype == "ACTIVITY_END":
+                self._on_speech_stopped()
 
 # ── HTTP toggle server ────────────────────────────────────────────────────────
 
@@ -5307,12 +5574,14 @@ def _dashboard_dynamic(sess) -> dict:
     _tts_eng = _last_tts_engine[0] or "&mdash;"
     _tts_seg = (f'<span style="color:#2dd4bf;font-weight:600;">{_tts_eng}</span>'
                 if _is_speaking[0] else _tts_eng)
+    _stt_eng = _cli_stt_engine[0] or "openai"
     device_panel = (
         f'<div id="dp">'
         f'&#127908; {_ds["mic"]} &ensp;'
         f'&#128266; {_ds["speaker_name"]} &middot; Vol {_ds["spk_vol"]} &middot; SW {_ds["sw_pct"]}% &ensp;'
         f'Gate {_ds["gate"]} &middot; Gain {_ds["gain"]}x'
         f' &ensp;&#128483; TTS: {_tts_seg}'
+        f' &ensp;&#127897; STT: {_stt_eng}'
         f'</div>'
     )
 
@@ -7649,8 +7918,47 @@ setInterval(function(){{
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _resolve_stt_engine(openai_key: str, gemini_key: str) -> str:
+    """Pick the active STT engine from CLI arg, config, or key availability."""
+    cfg = {}
+    try:
+        cfg = _load_json(OPENCLAW_CONFIG)
+    except Exception:
+        pass
+    stt_cfg = cfg.get("talk", {}).get("stt", {})
+    configured = stt_cfg.get("provider", "").strip().lower()
+    fallback = stt_cfg.get("fallback", "").strip().lower()
+
+    # CLI override wins
+    if _cli_stt_engine[0]:
+        return _cli_stt_engine[0]
+
+    # Configured primary, if key exists
+    if configured:
+        if configured == STT_ENGINE_GEMINI and gemini_key:
+            return STT_ENGINE_GEMINI
+        if configured == STT_ENGINE_OPENAI and openai_key:
+            return STT_ENGINE_OPENAI
+        # If primary key missing but fallback key exists, use fallback
+        if fallback:
+            if fallback == STT_ENGINE_GEMINI and gemini_key:
+                return STT_ENGINE_GEMINI
+            if fallback == STT_ENGINE_OPENAI and openai_key:
+                return STT_ENGINE_OPENAI
+
+    # Auto: use the only available key
+    if openai_key and not gemini_key:
+        return STT_ENGINE_OPENAI
+    if gemini_key and not openai_key:
+        return STT_ENGINE_GEMINI
+
+    # Both present or neither: default to OpenAI for backward compatibility
+    return DEFAULT_STT_ENGINE
+
+
 async def main(http_port: int, input_device=None, output_device=None,
-               session_key: str = OPENCLAW_SESSION):
+               session_key: str = OPENCLAW_SESSION,
+               stt_engine: str = None):
     # `output_device` is a sounddevice index (or None for system default).
     # The legacy `alsa_output` label is passed through for compatibility with
     # the HTTP handlers and RealtimeSession; speak() reads the actual device
@@ -7662,9 +7970,10 @@ async def main(http_port: int, input_device=None, output_device=None,
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop_event.set)
 
+    openai_key = load_openai_key()
+    gemini_key = load_gemini_key()
     try:
-        openai_key = load_openai_key()
-        gw_token   = load_gateway_token()
+        gw_token = load_gateway_token()
     except Exception as e:
         log.error(str(e))
         sys.exit(1)
@@ -7687,6 +7996,7 @@ async def main(http_port: int, input_device=None, output_device=None,
 
     _wake_event[0] = asyncio.Event()
     _event_loop[0] = loop
+    _cli_stt_engine[0] = (stt_engine or "").strip().lower()
     _last_interaction[0] = __import__("time").time()   # seed idle clock before first session
 
     session_ref: list = [None]
@@ -7737,12 +8047,27 @@ async def main(http_port: int, input_device=None, output_device=None,
             log.info("Wake received — reconnecting to OpenAI…")
             _log_entry("system", "Reconnecting…")
 
-        session = RealtimeSession(
-            api_key=openai_key, loop=loop, gw=gw,
-            stop_event=stop_event,
-            input_device=_selected_input_device[0], alsa_output=alsa_output,
-            session_key=session_key,
-        )
+        engine_name = _resolve_stt_engine(openai_key, gemini_key)
+        if engine_name == STT_ENGINE_GEMINI:
+            if not gemini_key:
+                log.error("Gemini STT requested but no Gemini API key configured")
+                sys.exit(1)
+            session = GeminiTranscribeSession(
+                api_key=gemini_key, loop=loop, gw=gw,
+                stop_event=stop_event,
+                input_device=_selected_input_device[0], alsa_output=alsa_output,
+                session_key=session_key,
+            )
+        else:
+            if not openai_key:
+                log.error("OpenAI STT requested but no OpenAI API key configured")
+                sys.exit(1)
+            session = OpenAIRealtimeSession(
+                api_key=openai_key, loop=loop, gw=gw,
+                stop_event=stop_event,
+                input_device=_selected_input_device[0], alsa_output=alsa_output,
+                session_key=session_key,
+            )
         if _wake_activate[0]:
             session._active = True
             _persist_active[0] = True
@@ -7820,6 +8145,8 @@ if __name__ == "__main__":
                    help="Print available CoreAudio devices and exit")
     p.add_argument("--calibrate",       action="store_true",
                    help="Measure ambient noise and print recommended --mic-gate value, then exit")
+    p.add_argument("--stt-engine",      type=str, default=None,
+                   help="STT engine: openai, gemini, openai,gemini, gemini,openai, or auto")
     args = p.parse_args()
 
     # --- Agent name / wake phrase configuration ---
@@ -7847,6 +8174,18 @@ if __name__ == "__main__":
     CONTINUE_PHRASES       = {p for p in CONTINUE_PHRASES       if p != "zeebot continue"}       | {f"{_n} continue"}
     OWNER_ONLY_ON_PHRASES  = {p for p in OWNER_ONLY_ON_PHRASES  if p != "zeebot only listen to me"}  | {f"{_n} only listen to me"}
     OWNER_ONLY_OFF_PHRASES = {p for p in OWNER_ONLY_OFF_PHRASES if p != "zeebot listen to everyone"} | {f"{_n} listen to everyone"}
+
+    # Build Gemini custom vocabulary from agent name + configured terms.
+    # This biases the live model toward proper nouns that are otherwise
+    # misheard (e.g. "Zeebot" → "Zebit").
+    try:
+        _cfg = _load_json(OPENCLAW_CONFIG)
+        _stt_vocab = _cfg.get("talk", {}).get("stt", {}).get("vocabulary", [])
+    except Exception:
+        _stt_vocab = []
+    GEMINI_CUSTOM_VOCABULARY.clear()
+    for _term in {_agent_name, "OpenClaw"} | set(str(t).strip() for t in _stt_vocab if str(t).strip()):
+        GEMINI_CUSTOM_VOCABULARY.append(_term)
 
     if args.list_devices:
         devs = _list_audio_devices()
@@ -7947,4 +8286,5 @@ if __name__ == "__main__":
         args.input_device,
         args.output_device,
         args.session_key,
+        stt_engine=args.stt_engine,
     ))
