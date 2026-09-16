@@ -5,7 +5,9 @@ Real-time voice conversations with the OpenClaw agent (Zeebot), adapted from
 to run on a Mac Mini.
 
 ```
-Mic → OpenAI Realtime API (VAD + STT) → OpenClaw gateway → Zeebot → TTS → Speaker
+Mic → OpenAI Realtime API or Gemini 3.5 Transcribe Live (VAD + STT)
+       ↓
+    OpenClaw gateway → Zeebot → TTS → Speaker
 ```
 
 TTS chain: ElevenLabs (`eleven_v3`, primary) → Edge TTS (free, no key, native
@@ -63,19 +65,29 @@ verbatim from the Pi version.
 | Python 3.9+                 | system Python or `brew install python`     |
 | A microphone                | USB mic, Bluetooth headset, or iPhone via Continuity Camera |
 
-### Adding the OpenAI API key
+### Adding the STT API key(s)
 
-The daemon reads the key from `talk.providers.openai.apiKey` in
-`~/.openclaw/openclaw.json`. Add this block (or merge it into your existing
-`talk` block):
+The daemon reads the STT key(s) from `talk.providers.openai.apiKey` and/or
+`talk.providers.gemini.apiKey` in `~/.openclaw/openclaw.json`. Add this block
+(or merge it into your existing `talk` block):
 
 ```json
 "talk": {
   "providers": {
-    "openai": { "apiKey": "sk-..." }
+    "openai": { "apiKey": "sk-..." },
+    "gemini": { "apiKey": "..." }
+  },
+  "stt": {
+    "provider": "openai",
+    "fallback": "gemini",
+    "vocabulary": ["Zeebot", "OpenClaw"]
   }
 }
 ```
+
+The default engine is OpenAI Realtime. To make Gemini the default, set
+`talk.stt.provider` to `"gemini"` (and optionally `fallback` to `"openai"`).
+You can also pass `--stt-engine gemini` to override at startup.
 
 The Realtime API requires the standard OpenAI provider with `api_key` mode.
 The `openai-codex` OAuth profile shipped by OpenClaw will NOT work for this

@@ -1,5 +1,79 @@
 # Changelog
 
+## [3.22.3] — 2026-09-15
+
+### Fixed
+
+- **Auto-sleep log line named the actual STT engine.** It hardcoded
+  "disconnecting OpenAI" (predates the Gemini engine), so a Gemini session
+  auto-sleeping logged a false "disconnecting OpenAI". Now reports the
+  resolved engine (`_active_stt_engine`).
+
+## [3.22.2] — 2026-09-15
+
+### Fixed
+
+- **Dashboard `#dp` STT label now shows the resolved engine.** It rendered
+  `_cli_stt_engine or "openai"`, so a session started via config
+  (`talk.stt.provider`, no CLI flag) displayed `STT: openai` while actually
+  running Gemini. `main()` now records the engine it actually resolved into
+  `_active_stt_engine` each session and the label prefers it. (Pi fork ports
+  the same fix in v3.22.2.)
+
+## [3.22.1] — 2026-09-15
+
+### Fixed
+
+- **Gemini engine auto-sleep reconnect loop (dashboard spam + zombie sessions).**
+  `GeminiTranscribeSession._connect_and_run` has an internal reconnect loop for
+  the 10-min proactive reset, but it never checked sleep state: when auto-sleep
+  fired, `_idle_watcher` closed the socket and returned, and the loop immediately
+  reconnected — re-firing the idle watcher ~every 30 s while asleep ("Auto-sleep
+  after N min idle" spamming the dashboard, idle counter climbing forever).
+  Worse, `/wake` could not recover it: `main()` stays blocked inside
+  `session.run()`, so the wake event it waits on is never reached. The loop now
+  returns to `main()` when `_sleep_requested` is set, holding at the /wake gate
+  like the OpenAI engine. (Pi fork ports the equivalent `_idle_disconnected`
+  check in v3.22.1.)
+
+## [3.22.0] — 2026-09-15
+
+### Added
+
+- **Gemini 3.5 Transcribe Live as an alternative / fallback STT engine.**
+  - New `BaseVoiceSession` abstraction, with engine-specific `OpenAIRealtimeSession`
+    and `GeminiTranscribeSession` subclasses.
+  - Mic capture, wake/sleep phrase handling, owner-only speaker verification, and
+    Zeebot routing are shared across both engines.
+  - Engine selection priority: CLI `--stt-engine` > `talk.stt.provider/fallback`
+    in `~/.openclaw/openclaw.json` > whichever API key is available > default OpenAI.
+  - Gemini uses the raw v1alpha WebSocket protocol: 16 kHz PCM16 mono,
+    `realtime_input` audio chunks, `audio_stream_end` for graceful shutdown,
+    `voiceActivity` ACTIVITY_START/ACTIVITY_END events for owner-only segment
+    capture, and `inputTranscription` finals. Captures at the same 24 kHz rate
+    as OpenAI, then downsamples 24 kHz → 16 kHz per chunk before sending.
+  - Proactive reconnect every 9 minutes to stay ahead of Gemini's ~10-minute
+    session cap.
+  - Custom vocabulary is populated at startup from the agent name (`Zeebot`),
+    `OpenClaw`, and any terms in `talk.stt.vocabulary` in `openclaw.json`.
+  - Dashboard `#dp` device panel now also shows the active STT engine alongside
+    the existing TTS engine indicator.
+  - Supports Gemini-only users: if only a Gemini API key is configured, the
+    daemon defaults to Gemini without requiring an OpenAI key.
+
+### Changed
+
+- `load_openai_key()` is now permissive: it logs a warning and returns `""` if
+  no OpenAI key is configured, allowing the engine-resolution logic to fall
+  back to Gemini. A missing key for the *selected* engine is still a fatal error.
+
+### Pi Fork
+
+- Ported the same `BaseVoiceSession` refactor to
+  `https://github.com/w2ayz/openclaw-RealTimeTalk` (v3.22.0 lockstep), with
+  Pi-specific adaptations for PipeWire/ALSA capture, Piper TTS, OpenWakeWord,
+  and DTMF/HTTP controls.
+
 ## [3.21.8] — 2026-09-08
 
 ### Fixed
