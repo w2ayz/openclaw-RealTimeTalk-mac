@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.22.2"
+__version__ = "3.22.3"
 
 import argparse
 import asyncio
@@ -4373,7 +4373,7 @@ class BaseVoiceSession:
         )
 
     async def _idle_watcher(self, ws):
-        """Disconnect from OpenAI after AUTO_SLEEP_SECS of inactivity.
+        """Disconnect from the STT engine after AUTO_SLEEP_SECS of inactivity.
 
         Runs regardless of active/monitoring/silent state. Disabled while
         multilang != 'off' (non-English sessions should never auto-sleep).
@@ -4389,7 +4389,8 @@ class BaseVoiceSession:
             if idle < AUTO_SLEEP_SECS:
                 continue
             mins = int(idle / 60)
-            log.info("Auto-sleep: idle %d min — disconnecting OpenAI", mins)
+            log.info("Auto-sleep: idle %d min — disconnecting %s", mins,
+                     (_active_stt_engine[0] or _cli_stt_engine[0] or "openai").upper())
             self._active = False
             _persist_active[0] = False
             if self._monitoring:

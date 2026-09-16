@@ -27,6 +27,22 @@ Two modes:
                 payload as the production daemon) and Gemini (24 kHz
                 chunks downsampled to 16 kHz). Finals print labeled with
                 timestamps so latency/accuracy are visually comparable.
+                At shutdown a scored summary prints: per-utterance
+                end-of-speech→final latency, time-to-first-partial, and
+                (with --reference) WER against a known transcript.
+
+Scoring (compare mode):
+  latency       end→final: VAD end (speech_stopped / ACTIVITY_END) to
+                final transcript arrival — what the daemon pays before
+                routing to the LLM. start→partial: speech start to first
+                interim/delta — perceived responsiveness.
+  WER           word error rate vs --reference (pure-python Levenshtein;
+                no new deps). File tests are the repeatable case.
+  --no-prompt   drop the production "Zeebot." prompt on the OpenAI leg —
+                the prompt biases toward wake-word-only transcripts on
+                non-wake audio (observed 2026-09-14/15), so run both ways
+                to separate prompt bias from engine accuracy.
+  --json PATH   dump per-utterance records + metrics for further analysis.
 
 Both modes deliberately skip RTT's AGC / noise-gate / WebRTC front-end —
 raw mic passthrough, so noisy-room tests measure the engines' own
@@ -41,6 +57,10 @@ Usage:
     ./venv/bin/python test-gemini-transcribe.py --smart               # SMART vs VERBATIM
     ./venv/bin/python test-gemini-transcribe.py --vocab "OpenClaw,Zeebot,sherpa-onnx"
     ./venv/bin/python test-gemini-transcribe.py --input-device 2
+    # Scored A/B: latency + WER vs a reference transcript
+    ./venv/bin/python test-gemini-transcribe.py --compare --file /tmp/x.wav \
+        --reference "the quick brown fox" --vocab "OpenClaw,Zeebot" --json /tmp/ab.json
+    ./venv/bin/python test-gemini-transcribe.py --compare --duration 300 --no-prompt
 
 Requires (eval-only deps; intentionally NOT in requirements.txt):
     ./venv/bin/pip install numpy sounddevice websockets
@@ -84,7 +104,120 @@ OPENAI_WS_URL          = "wss://api.openai.com/v1/realtime?intent=transcription"
 OPENAI_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
 TRANSCRIPTION_PROMPT   = "Zeebot."
 OPENAI_SAMPLE_RATE     = 24000
+OPENAI_TAIL_GRACE      = 5.0   # secs to keep the socket open after EOF so
+                               # transcription.completed (trails item.done) lands
 OPENAI_BLOCKSIZE       = 2400        # 100 ms at 24 kHz
+
+# Compare-mode scoring. Records are appended per utterance by the two legs;
+# print_summary() turns them into the latency/WER table at shutdown.
+RESULTS = {"Gemini": [], "OpenAI": []}
+
+
+def _wer(ref: str, hyp: str) -> float:
+    """Word error rate via Levenshtein distance on word tokens (no deps)."""
+    import re as _re
+    rw = _re.findall(r"\w+", ref.lower(), _re.UNICODE)
+    hw = _re.findall(r"\w+", hyp.lower(), _re.UNICODE)
+    if not rw:
+        return 0.0 if not hw else 1.0
+    prev = list(range(len(hw) + 1))
+    for i, r in enumerate(rw, 1):
+        cur = [i] + [0] * len(hw)
+        for j, h in enumerate(hw, 1):
+            cur[j] = min(prev[j] + 1,          # deletion
+                         cur[j - 1] + 1,       # insertion
+                         prev[j - 1] + (r != h))  # substitution
+        prev = cur
+    return prev[-1] / len(rw)
+
+
+def _pct(vals):
+    """Median and p95 of a list of floats (seconds), or (None, None) if empty."""
+    if not vals:
+        return None, None
+    s = sorted(vals)
+    n = len(s)
+    med = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+    p95 = s[min(n - 1, int(round(0.95 * (n - 1))))]
+    return med, p95
+
+
+def _pair_utterances(g_rec, o_rec, max_gap: float = 2.5):
+    """Greedy-match Gemini and OpenAI utterances by speech-start time so the
+    table can show both engines' output for the same spoken utterance."""
+    pairs, used_o = [], set()
+    for g in sorted(g_rec, key=lambda r: r["t_start"] if r["t_start"] is not None else 1e18):
+        best, best_dt = None, max_gap
+        for j, o in enumerate(o_rec):
+            if j in used_o or o["t_start"] is None or g["t_start"] is None:
+                continue
+            dt = abs(o["t_start"] - g["t_start"])
+            if dt < best_dt:
+                best, best_dt = j, dt
+        used_o.add(best if best is not None else -1)
+        pairs.append((g, o_rec[best] if best is not None else None))
+    for j, o in enumerate(o_rec):
+        if j not in used_o:
+            pairs.append((None, o))
+    return pairs
+
+
+def print_summary(results, args):
+    """Scored end-of-run table: latency percentiles + optional WER."""
+    print(f"\n{_ts()} ── Compare summary " + "─" * 40)
+    ref = (args.reference or "").strip()
+    wer_by_engine = {}
+    for eng in ("Gemini", "OpenAI"):
+        recs = results.get(eng, [])
+        if not recs:
+            print(f"{eng:>7}: no finals captured")
+            continue
+        # start→final is the primary cross-engine latency: Gemini's final
+        # typically arrives BEFORE its ACTIVITY_END (near-synchronous
+        # transcription), so end→final is not comparable across engines.
+        lag_final = [r["lag_start_to_final"] for r in recs
+                     if r["lag_start_to_final"] is not None]
+        lag_partial = [r["lag_start_to_partial"] for r in recs
+                       if r["lag_start_to_partial"] is not None]
+        med_f, p95_f = _pct(lag_final)
+        med_p, p95_p = _pct(lag_partial)
+        line = (f"{eng:>7}: {len(recs)} final(s) | "
+                f"start→final  median {med_f:.2f}s / p95 {p95_f:.2f}s"
+                if med_f is not None else
+                f"{eng:>7}: {len(recs)} final(s) | start→final n/a (no VAD-start)")
+        if med_p is not None:
+            line += f" | start→partial median {med_p:.2f}s"
+        print(line)
+        if ref:
+            joined = " ".join(r["text"] for r in recs).strip()
+            w = _wer(ref, joined)
+            wer_by_engine[eng] = w
+            print(f"{'':>7}  WER vs reference: {w * 100:.1f}%   "
+                  f"got: {joined[:90]!r}")
+    if ref and not wer_by_engine:
+        pass
+    # Side-by-side rows (paired by speech-start proximity).
+    pairs = _pair_utterances(results.get("Gemini", []), results.get("OpenAI", []))
+    if pairs:
+        print(f"\n{'':>7}  per-utterance (start→final lag in s):")
+        for i, (g, o) in enumerate(pairs, 1):
+            g_txt = (g or {}).get("text", "—")
+            o_txt = (o or {}).get("text", "—")
+            g_lag = (f"{g['lag_start_to_final']:.2f}" if g and g["lag_start_to_final"] is not None else "n/a")
+            o_lag = (f"{o['lag_start_to_final']:.2f}" if o and o["lag_start_to_final"] is not None else "n/a")
+            print(f"{'':>7}   #{i}  Gemini [{g_lag}] {g_txt}")
+            print(f"{'':>7}       OpenAI [{o_lag}] {o_txt}")
+    if getattr(args, "json", None):
+        out = {"gemini": results.get("Gemini", []),
+               "openai": results.get("OpenAI", []),
+               "reference": ref or None,
+               "wer": {k: v for k, v in wer_by_engine.items()}}
+        try:
+            with open(args.json, "w") as f:
+                json.dump(out, f, indent=1, ensure_ascii=False)
+            print(f"{_ts()} wrote {args.json}")
+        except OSError as e:
+            print(f"{_ts()} could not write {args.json}: {e}")
 
 
 def _ts() -> str:
@@ -191,12 +324,19 @@ def resample_int16(raw: np.ndarray, src_rate: int, dst_rate: int) -> bytes:
 
 class FileFeeder:
     """Read a mono 16-bit WAV file and feed realtime PCM chunks into an
-    asyncio queue, optionally resampling to the target rate."""
+    asyncio queue, optionally resampling to the target rate.
 
-    def __init__(self, path: str, samplerate: int, blocksize: int):
+    tail_secs of silence is appended after the file: OpenAI's server VAD
+    only evaluates on incoming audio, so a file that ends at speech end
+    never yields speech_stopped → no commit → no transcript. Real mics
+    always have ambient tail; synthetic files don't."""
+
+    def __init__(self, path: str, samplerate: int, blocksize: int,
+                 tail_secs: float = 1.0):
         self.path = path
         self.samplerate = samplerate
         self.blocksize = blocksize
+        self.tail_secs = tail_secs
         self.queues = []
 
     def add_queue(self):
@@ -229,6 +369,17 @@ class FileFeeder:
                 except asyncio.QueueFull:
                     pass
             await asyncio.sleep(sleep_per_chunk)
+        # Trailing silence: lets server-side VAD close the final utterance
+        # (evaluates on input only — see class docstring).
+        if self.tail_secs > 0:
+            silence = b"\x00" * chunk_size
+            for _ in range(int(self.tail_secs / sleep_per_chunk)):
+                for q in self.queues:
+                    try:
+                        q.put_nowait(silence)
+                    except asyncio.QueueFull:
+                        pass
+                await asyncio.sleep(sleep_per_chunk)
         # End-of-stream sentinel for each queue
         for q in self.queues:
             try:
@@ -330,9 +481,17 @@ async def gemini_sender(ws, q: asyncio.Queue, reset_after: float,
         last_send = time.monotonic()
 
 
-async def gemini_receiver(ws, label: str, show_interim: bool):
-    """Print interim (overwritten in place) and final transcripts."""
+async def gemini_receiver(ws, label: str, show_interim: bool,
+                          records: list = None, ready: asyncio.Event = None):
+    """Print interim (overwritten in place) and final transcripts.
+
+    With `records`, also timestamps each utterance for the compare summary:
+    t_start/t_end from voiceActivity ACTIVITY_START/END, t_first_partial from
+    the first interim, t_final + lag_start_to_final from inputTranscription.
+    `ready` is set when setupComplete arrives.
+    """
     last_interim = ""
+    cur = {"t_start": None, "t_end": None, "t_first_partial": None}
     while True:
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
@@ -352,36 +511,62 @@ async def gemini_receiver(ws, label: str, show_interim: bool):
             # setupComplete and other top-level messages
             if msg.get("setupComplete"):
                 print(f"{_ts()} -- {label}: setup complete")
+                if ready is not None:
+                    ready.set()
             continue
 
         if show_interim:
             interim = sc.get("interimInputTranscription") or sc.get("interim_input_transcription")
             if interim and interim.get("text"):
                 txt = interim["text"]
+                if cur["t_first_partial"] is None:
+                    cur["t_first_partial"] = time.monotonic()
                 sys.stdout.write("\r\x1b[2K\x1b[2m" + f"[{label} ·] {txt}" + "\x1b[0m")
                 sys.stdout.flush()
                 last_interim = txt
 
         final = sc.get("inputTranscription") or sc.get("input_transcription")
         if final and final.get("text"):
+            now = time.monotonic()
             if show_interim and last_interim:
                 sys.stdout.write("\r\x1b[2K")
+            lag = (now - cur["t_end"]) if cur["t_end"] is not None else None
+            sp = ((cur["t_first_partial"] - cur["t_start"])
+                  if cur["t_first_partial"] is not None and cur["t_start"] is not None else None)
+            sf = ((now - cur["t_start"])
+                  if cur["t_start"] is not None else None)
             print(f"{_ts()} [{label}] {final['text']}")
             sys.stdout.flush()
             last_interim = ""
+            if records is not None:
+                records.append({"t_start": cur["t_start"], "t_end": cur["t_end"],
+                                "t_first_partial": cur["t_first_partial"],
+                                "t_final": now, "text": final["text"],
+                                "lag_end_to_final": lag,
+                                "lag_start_to_partial": sp,
+                                "lag_start_to_final": sf})
+            cur = {"t_start": None, "t_end": None, "t_first_partial": None}
 
         # Voice activity is interesting for production integration later.
         va = msg.get("voiceActivity") or msg.get("voice_activity")
         if va:
-            print(f"{_ts()} [{label}] VAD {va.get('type')} @ {va.get('audioOffset') or va.get('audio_offset')}")
+            vtype = va.get("type")
+            if vtype == "ACTIVITY_START":
+                cur["t_start"] = time.monotonic()
+                cur["t_first_partial"] = None   # partials belong to this utterance
+            elif vtype == "ACTIVITY_END":
+                cur["t_end"] = time.monotonic()
+            print(f"{_ts()} [{label}] VAD {vtype} @ {va.get('audioOffset') or va.get('audio_offset')}")
 
 
 async def gemini_leg(api_key: str, args, q: asyncio.Queue,
                      label: str = "Gemini", show_interim: bool = True,
-                     shutdown: asyncio.Event = None):
+                     shutdown: asyncio.Event = None,
+                     records: list = None, ready: asyncio.Event = None):
     """Reconnecting Gemini session loop over one shared mic queue.
     If shutdown event is set, the loop exits cleanly after the current
-    session ends instead of reconnecting."""
+    session ends instead of reconnecting. `ready` is set when setupComplete
+    arrives (the session can actually transcribe)."""
     shutdown = shutdown or asyncio.Event()
     session_no = 0
     while True:
@@ -395,9 +580,25 @@ async def gemini_leg(api_key: str, args, q: asyncio.Queue,
                 sender = asyncio.create_task(
                     gemini_sender(ws, q, SESSION_RESET_SECS, shutdown))
                 receiver = asyncio.create_task(
-                    gemini_receiver(ws, label, show_interim))
+                    gemini_receiver(ws, label, show_interim,
+                                    records=records, ready=ready))
+                fallback = None
+                if ready is not None:
+                    # setupComplete is unreliable for the transcription model
+                    # (observed missing for >15 s on 2026-09-15 while the
+                    # session transcribed fine) — treat connect+setup as
+                    # ready after 2 s regardless.
+                    async def _ready_fallback():
+                        await asyncio.sleep(2.0)
+                        if not ready.is_set():
+                            print(f"{_ts()} -- {label}: setupComplete not "
+                                  f"received; assuming ready")
+                            ready.set()
+                    fallback = asyncio.create_task(_ready_fallback())
                 done, pending = await asyncio.wait(
                     [sender, receiver], return_when=asyncio.FIRST_COMPLETED)
+                if fallback is not None:
+                    fallback.cancel()
                 reset_fired = (sender in done and not sender.cancelled()
                                and sender.exception() is None
                                and sender.result() is True)
@@ -442,7 +643,10 @@ async def gemini_leg(api_key: str, args, q: asyncio.Queue,
 # extraction (daemon lines 5022-5030). This IS the baseline being compared.
 
 async def openai_leg(api_key: str, q: asyncio.Queue,
-                     shutdown: asyncio.Event, label: str = "OpenAI"):
+                     shutdown: asyncio.Event, label: str = "OpenAI",
+                     prompt: str = TRANSCRIPTION_PROMPT,
+                     records: list = None, ready: asyncio.Event = None,
+                     debug: bool = False):
     while True:
         print(f"{_ts()} -- {label}: session connecting")
         try:
@@ -460,8 +664,7 @@ async def openai_leg(api_key: str, q: asyncio.Queue,
                             "input": {
                                 "transcription": {
                                     "model": OPENAI_TRANSCRIBE_MODEL,
-                                    **({"prompt": TRANSCRIPTION_PROMPT}
-                                       if TRANSCRIPTION_PROMPT else {}),
+                                    **({"prompt": prompt} if prompt else {}),
                                 },
                                 "turn_detection": {
                                     "type": "server_vad",
@@ -473,7 +676,10 @@ async def openai_leg(api_key: str, q: asyncio.Queue,
                         },
                     },
                 }))
-                print(f"{_ts()} -- {label}: session active")
+                print(f"{_ts()} -- {label}: session active"
+                      + (f" (prompt: {prompt!r})" if prompt else " (no prompt)"))
+                if ready is not None:
+                    ready.set()
 
                 async def sender():
                     while not shutdown.is_set():
@@ -482,6 +688,10 @@ async def openai_leg(api_key: str, q: asyncio.Queue,
                         except asyncio.TimeoutError:
                             continue
                         if chunk is None:
+                            # EOF: keep the socket open a few seconds so the
+                            # trailing transcription.completed (arrives after
+                            # item.done) can land before teardown.
+                            await asyncio.sleep(OPENAI_TAIL_GRACE)
                             return
                         await ws.send(json.dumps({
                             "type": "input_audio_buffer.append",
@@ -489,12 +699,17 @@ async def openai_leg(api_key: str, q: asyncio.Queue,
                         }))
 
                 async def receiver():
+                    cur = {"t_start": None, "t_end": None, "t_first_partial": None}
                     try:
                         async for raw in ws:
                             msg = json.loads(raw)
                             t = msg.get("type", "")
+                            if debug:
+                                print(f"{_ts()} [{label}] event: {t}")
                             if t in ("conversation.item.done",
                                      "conversation.item.input_audio_transcription.completed"):
+                                if debug:
+                                    print(f"{_ts()} [{label}] raw: {raw[:400]}")
                                 transcript = msg.get("transcript", "")
                                 if not transcript:
                                     for c in msg.get("item", {}).get("content", []):
@@ -503,7 +718,33 @@ async def openai_leg(api_key: str, q: asyncio.Queue,
                                             break
                                 transcript = transcript.strip()
                                 if transcript:
+                                    now = time.monotonic()
+                                    lag = ((now - cur["t_end"])
+                                           if cur["t_end"] is not None else None)
+                                    sp = ((cur["t_first_partial"] - cur["t_start"])
+                                          if cur["t_first_partial"] is not None
+                                          and cur["t_start"] is not None else None)
+                                    sf = ((now - cur["t_start"])
+                                          if cur["t_start"] is not None else None)
                                     print(f"{_ts()} [{label}] {transcript}")
+                                    if records is not None:
+                                        records.append({"t_start": cur["t_start"],
+                                                        "t_end": cur["t_end"],
+                                                        "t_first_partial": cur["t_first_partial"],
+                                                        "t_final": now, "text": transcript,
+                                                        "lag_end_to_final": lag,
+                                                        "lag_start_to_partial": sp,
+                                                        "lag_start_to_final": sf})
+                                    cur = {"t_start": None, "t_end": None,
+                                           "t_first_partial": None}
+                            elif t == "input_audio_buffer.speech_started":
+                                cur["t_start"] = time.monotonic()
+                                cur["t_first_partial"] = None
+                            elif t == "input_audio_buffer.speech_stopped":
+                                cur["t_end"] = time.monotonic()
+                            elif (t == "conversation.item.input_audio_transcription.delta"
+                                  and cur["t_first_partial"] is None):
+                                cur["t_first_partial"] = time.monotonic()
                             elif t == "error":
                                 print(f"{_ts()} [{label}] error: {msg.get('error', msg)}")
                     except websockets.exceptions.ConnectionClosed as e:
@@ -577,21 +818,16 @@ async def run_compare(args):
     openai_key = load_provider_key("openai")
     loop = asyncio.get_running_loop()
     shutdown = asyncio.Event()
-    feeder_task = None
+    feeder = None
+    mic = None
     if args.file:
         # Compare mode needs 24 kHz source; FileFeeder produces 24 kHz chunks
-        # and we resample to 16 kHz for Gemini.
+        # and we resample to 16 kHz for Gemini. Created now, started only
+        # after both engines are ready (else OpenAI's ~2.5 s connect eats
+        # the first file utterance).
         feeder = FileFeeder(args.file, OPENAI_SAMPLE_RATE, OPENAI_BLOCKSIZE)
         q_openai = feeder.add_queue()
         q_gemini = feeder.add_queue()
-        async def _feeder_done():
-            try:
-                await feeder.run()
-            except asyncio.CancelledError:
-                pass
-            finally:
-                shutdown.set()
-        feeder_task = asyncio.create_task(_feeder_done())
         print(f"{_ts()} Compare mode — file={args.file}, 24 kHz fanned to "
               f"OpenAI ({OPENAI_TRANSCRIBE_MODEL}) and Gemini ({GEMINI_MODEL}, "
               f"downsampled 24k→16k). Finals only, labeled.")
@@ -599,7 +835,6 @@ async def run_compare(args):
         mic = MicFanout(loop, OPENAI_SAMPLE_RATE, OPENAI_BLOCKSIZE, args.input_device)
         q_openai = mic.add_queue()
         q_gemini = mic.add_queue()
-        mic.start()
         print(f"{_ts()} Compare mode — one mic @ {OPENAI_SAMPLE_RATE} Hz fanned to "
               f"OpenAI ({OPENAI_TRANSCRIBE_MODEL}) and Gemini ({GEMINI_MODEL}, "
               f"downsampled 24k→16k). Finals only, labeled. Ctrl-C to stop.")
@@ -622,16 +857,58 @@ async def run_compare(args):
         return out, asyncio.create_task(pump())
 
     q_gemini16, pump_task = await gemini_resampled_q(q_gemini)
+    feeder_task = None
+
+    def _make_feeder_done():
+        """Feeder wrapper: EOF → keep sessions open a few seconds so in-flight
+        finals (OpenAI's transcription.completed trails item.done) can land,
+        then flip shutdown."""
+        async def _feeder_done():
+            try:
+                await feeder.run()
+                await asyncio.sleep(4.0)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                shutdown.set()
+        return asyncio.create_task(_feeder_done())
+
+    ready_openai, ready_gemini = asyncio.Event(), asyncio.Event()
+    legs = [
+        asyncio.create_task(openai_leg(
+            openai_key, q_openai, shutdown,
+            prompt="" if args.no_prompt else TRANSCRIPTION_PROMPT,
+            records=RESULTS["OpenAI"], ready=ready_openai,
+            debug=args.debug)),
+        asyncio.create_task(gemini_leg(gemini_key, args, q_gemini16,
+                                       show_interim=False, shutdown=shutdown,
+                                       records=RESULTS["Gemini"],
+                                       ready=ready_gemini)),
+    ]
+    # Hold audio until both engines can actually transcribe — the scored
+    # comparison is unfair otherwise (engine that connects late misses audio).
+    async def _both_ready():
+        await asyncio.gather(ready_openai.wait(), ready_gemini.wait())
     try:
-        legs = [
-            asyncio.create_task(openai_leg(openai_key, q_openai, shutdown)),
-            asyncio.create_task(gemini_leg(gemini_key, args, q_gemini16,
-                                           show_interim=False, shutdown=shutdown)),
-        ]
+        await asyncio.wait_for(_both_ready(), timeout=15.0)
+        if feeder is not None:
+            feeder_task = _make_feeder_done()
+        else:
+            mic.start()
+            print(f"{_ts()} both engines ready — speak now")
         if stop_at:
             await asyncio.sleep(max(0.0, stop_at - time.monotonic()))
         else:
             await asyncio.gather(*legs)
+    except asyncio.TimeoutError:
+        print(f"{_ts()} WARN: engine(s) not ready after 15 s "
+              f"(openai={ready_openai.is_set()} gemini={ready_gemini.is_set()}) — "
+              f"feeding audio anyway")
+        if feeder is not None:
+            feeder_task = _make_feeder_done()
+        elif mic is not None:
+            mic.start()
+        await asyncio.gather(*legs, return_exceptions=True)
     except KeyboardInterrupt:
         pass
     finally:
@@ -643,8 +920,9 @@ async def run_compare(args):
         await asyncio.gather(*legs, pump_task, return_exceptions=True)
         if feeder_task:
             await asyncio.gather(feeder_task, return_exceptions=True)
-        if not args.file:
+        if mic is not None:
             mic.stop()
+        print_summary(RESULTS, args)
         print(f"\n{_ts()} stopped.")
 
 
@@ -678,6 +956,16 @@ def main():
     parser.add_argument("--file", default=None,
                         help="Stream a mono 16-bit WAV file instead of mic "
                              "(useful for repeatable tests)")
+    parser.add_argument("--reference", default=None,
+                        help="Known transcript for WER scoring in compare mode "
+                             "(typically with --file)")
+    parser.add_argument("--no-prompt", action="store_true",
+                        help="Drop the production 'Zeebot.' prompt on the OpenAI "
+                             "leg (it biases toward wake-word-only transcripts)")
+    parser.add_argument("--json", default=None, metavar="PATH",
+                        help="Write per-utterance records + metrics JSON to PATH")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print every OpenAI-leg event type (diagnose silent legs)")
     args = parser.parse_args()
 
     if args.list_devices:

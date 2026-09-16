@@ -1,5 +1,14 @@
 # Changelog
 
+## [3.22.3] — 2026-09-15
+
+### Fixed
+
+- **Auto-sleep log line named the actual STT engine.** It hardcoded
+  "disconnecting OpenAI" (predates the Gemini engine), so a Gemini session
+  auto-sleeping logged a false "disconnecting OpenAI". Now reports the
+  resolved engine (`_active_stt_engine`).
+
 ## [3.22.2] — 2026-09-15
 
 ### Fixed
