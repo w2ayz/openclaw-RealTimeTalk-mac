@@ -1,5 +1,32 @@
 # Changelog
 
+## [3.22.5] — 2026-09-16
+
+### Changed
+
+- **Installer + Deployment.md now support Gemini-only, OpenAI-only, or both
+  STT providers.** The installer's step 4 is an interactive choice menu —
+  `[1] OpenAI Realtime / [2] Gemini Transcribe Live / [3] Both / [4] keep
+  existing` — instead of a hard OpenAI requirement:
+  - Each key is prompted with hidden input, checked against the expected
+    format (`sk-...` / `AIza...`, override confirm on mismatch) and
+    **verified against the provider API** (best-effort — offline installs
+    continue with a warning; `401`/`403` keys are refused and not saved).
+  - With both keys you pick the default engine; the other provider is written
+    as the fallback. With one key the engine is chosen automatically. Choice
+    `[4]` leaves everything untouched.
+  - Existing keys prompt "Enter to keep, or paste a replacement", so re-running
+    the installer never forces a re-entry.
+  - The engine choice goes to `~/.openclaw/workspace/rtt_stt_config.json`
+    (v3.22.4's daemon-owned file); the installer never writes `talk.stt` to
+    `openclaw.json`. Exits with dual-provider instructions if neither key ends
+    up configured.
+- Deployment.md: §1 prerequisite now lists "OpenAI **and/or** Gemini";
+  §2 runtime-state table gained the `rtt_stt_config.json` row; §3 restructured
+  into 3.1 (provider keys — either or both) and 3.2 (engine selection +
+  resolution order + fallback semantics: boot-time, not live failover);
+  §4 installer step list matches the new prompt flow.
+
 ## [3.22.4] — 2026-09-15
 
 ### Changed

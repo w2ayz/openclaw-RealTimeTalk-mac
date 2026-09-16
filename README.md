@@ -58,7 +58,7 @@ verbatim from the Pi version.
 | Dependency                  | Install                                    |
 |-----------------------------|--------------------------------------------|
 | [OpenClaw](https://openclaw.ai) gateway running | platform requirement (`openclaw gateway start`) |
-| `openai.apiKey` in `~/.openclaw/openclaw.json` | regular OpenAI API key, **not** the openai-codex OAuth profile |
+| STT provider key(s) in `~/.openclaw/openclaw.json` | OpenAI (`talk.providers.openai.apiKey`, regular `sk-...` key, **not** the openai-codex OAuth profile) and/or Gemini (`talk.providers.gemini.apiKey`, `AIza...` from AI Studio) — either one works on its own |
 | [Edge TTS skill](https://github.com/w2ayz/openclaw-edge-tts) (first TTS fallback — optional) | install at the official path `~/.openclaw/workspace/skills/edge-tts/` (`npm install` in `scripts/`); the installer resolves it and prepares its deps |
 | Homebrew + portaudio + ffmpeg + node | `brew install portaudio ffmpeg node`     |
 | `hidapi` (only for Radio Mode's AIOC hardware-revision detection — cosmetic, everything else works without it) | `brew install hidapi` |
@@ -146,7 +146,7 @@ setup expects.)
 The installer:
 1. `brew install`s portaudio, ffmpeg, node (skipped if already present)
 2. Creates a Python venv at `./venv` and installs `sounddevice`, `websockets`, `numpy`, `zhconv`
-3. Verifies `openai.apiKey` is set in `openclaw.json` (exits with instructions if missing)
+3. Prompts for STT provider keys (choice menu: OpenAI / Gemini / both / keep existing) — hidden input, each key verified against its provider API; writes the engine choice to `~/.openclaw/workspace/rtt_stt_config.json`. Exits with instructions if neither key is configured
 4. Lists CoreAudio devices and prompts you for input + output device indices
 5. Writes the LaunchAgent plist to `~/Library/LaunchAgents/ai.openclaw.realtimetalk.plist`
 6. Loads the agent (boots at every login)
