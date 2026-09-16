@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.22.1"
+__version__ = "3.22.2"
 
 import argparse
 import asyncio
@@ -398,6 +398,7 @@ _wake_event:         list = [None]  # asyncio.Event created in main(); HTTP /wak
 _event_loop:         list = [None]  # asyncio loop from main(); lets background threads (hotplug watcher)
                                      # call loop.call_soon_threadsafe(...) to trigger a wake cross-thread
 _cli_stt_engine:     list = [None]  # --stt-engine override from CLI
+_active_stt_engine:  list = [None]  # engine actually in use (resolved each session); drives the dashboard #dp label
 _is_sleeping:        list = [False] # True while OpenAI is intentionally disconnected (auto-sleep)
 _wake_activate:      list = [False] # HTTP /wake while sleeping — next session starts active immediately
 _pending_monitor_wake: list = [False]  # Monitor button pressed while sleeping — pre-arms monitoring on wake
@@ -5582,7 +5583,7 @@ def _dashboard_dynamic(sess) -> dict:
     _tts_eng = _last_tts_engine[0] or "&mdash;"
     _tts_seg = (f'<span style="color:#2dd4bf;font-weight:600;">{_tts_eng}</span>'
                 if _is_speaking[0] else _tts_eng)
-    _stt_eng = _cli_stt_engine[0] or "openai"
+    _stt_eng = _active_stt_engine[0] or _cli_stt_engine[0] or "openai"
     device_panel = (
         f'<div id="dp">'
         f'&#127908; {_ds["mic"]} &ensp;'
@@ -8056,6 +8057,7 @@ async def main(http_port: int, input_device=None, output_device=None,
             _log_entry("system", "Reconnecting…")
 
         engine_name = _resolve_stt_engine(openai_key, gemini_key)
+        _active_stt_engine[0] = engine_name   # dashboard #dp shows the real engine, not just the CLI flag
         if engine_name == STT_ENGINE_GEMINI:
             if not gemini_key:
                 log.error("Gemini STT requested but no Gemini API key configured")

@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.22.2] — 2026-09-15
+
+### Fixed
+
+- **Dashboard `#dp` STT label now shows the resolved engine.** It rendered
+  `_cli_stt_engine or "openai"`, so a session started via config
+  (`talk.stt.provider`, no CLI flag) displayed `STT: openai` while actually
+  running Gemini. `main()` now records the engine it actually resolved into
+  `_active_stt_engine` each session and the label prefers it. (Pi fork ports
+  the same fix in v3.22.2.)
+
 ## [3.22.1] — 2026-09-15
 
 ### Fixed
