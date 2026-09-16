@@ -1,5 +1,21 @@
 # Changelog
 
+## [3.22.1] — 2026-09-15
+
+### Fixed
+
+- **Gemini engine auto-sleep reconnect loop (dashboard spam + zombie sessions).**
+  `GeminiTranscribeSession._connect_and_run` has an internal reconnect loop for
+  the 10-min proactive reset, but it never checked sleep state: when auto-sleep
+  fired, `_idle_watcher` closed the socket and returned, and the loop immediately
+  reconnected — re-firing the idle watcher ~every 30 s while asleep ("Auto-sleep
+  after N min idle" spamming the dashboard, idle counter climbing forever).
+  Worse, `/wake` could not recover it: `main()` stays blocked inside
+  `session.run()`, so the wake event it waits on is never reached. The loop now
+  returns to `main()` when `_sleep_requested` is set, holding at the /wake gate
+  like the OpenAI engine. (Pi fork ports the equivalent `_idle_disconnected`
+  check in v3.22.1.)
+
 ## [3.22.0] — 2026-09-15
 
 ### Added

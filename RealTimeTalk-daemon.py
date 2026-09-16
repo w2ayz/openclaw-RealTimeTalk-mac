@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.22.0"
+__version__ = "3.22.1"
 
 import argparse
 import asyncio
@@ -5275,6 +5275,14 @@ class GeminiTranscribeSession(BaseVoiceSession):
                         tasks, return_when=asyncio.FIRST_COMPLETED)
                     for task in pending:
                         task.cancel()
+
+                    # Auto-sleep closed the socket from _idle_watcher, which
+                    # expects main() to hold at the /wake gate. Without this
+                    # break the loop reconnected ~every 30 s while asleep,
+                    # re-firing the idle watcher and spamming the dashboard.
+                    if _sleep_requested[0]:
+                        return
+
             except websockets.exceptions.InvalidStatusCode as e:
                 log.error("Gemini connect failed: %s", e)
                 raise
