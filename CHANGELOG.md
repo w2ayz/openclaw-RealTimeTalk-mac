@@ -1,5 +1,23 @@
 # Changelog
 
+## [3.22.4] — 2026-09-15
+
+### Changed
+
+- **STT engine settings moved out of `openclaw.json` into the daemon's own
+  config file: `~/.openclaw/workspace/rtt_stt_config.json`**
+  (`{"provider": "...", "fallback": "...", "vocabulary": [...]}` — same shape
+  the old `talk.stt` block used). OpenClaw's TalkSchema has no `stt` key, so
+  keeping the block in `openclaw.json` caused a recurring mess: the gateway
+  **stripped it on every config rewrite** (silent revert to OpenAI STT on next
+  daemon restart), **blocked config hot-reloads** while it was present
+  ("config reload skipped (invalid config)"), and `openclaw models status` /
+  `config validate` **hard-failed** with "Unrecognized key: stt".
+- Resolution priority is unchanged: CLI `--stt-engine` > daemon config file >
+  legacy `openclaw.json` `talk.stt` (still read for unmigrated configs) >
+  key-availability auto > openai. The custom-vocabulary loader uses the same
+  source chain. (Pi fork ports the same change in v3.22.4.)
+
 ## [3.22.3] — 2026-09-15
 
 ### Fixed

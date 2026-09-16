@@ -69,25 +69,38 @@ verbatim from the Pi version.
 
 The daemon reads the STT key(s) from `talk.providers.openai.apiKey` and/or
 `talk.providers.gemini.apiKey` in `~/.openclaw/openclaw.json`. Add this block
-(or merge it into your existing `talk` block):
+(or merge it into your existing `talk` block) — **the `providers` part only;
+STT engine selection lives in the daemon's own config file (next section)**:
 
 ```json
 "talk": {
   "providers": {
     "openai": { "apiKey": "sk-..." },
     "gemini": { "apiKey": "..." }
-  },
-  "stt": {
-    "provider": "openai",
-    "fallback": "gemini",
-    "vocabulary": ["Zeebot", "OpenClaw"]
   }
 }
 ```
 
+### STT engine selection (`~/.openclaw/workspace/rtt_stt_config.json`)
+
+The engine is configured in the daemon's own config file, NOT in
+`openclaw.json` — OpenClaw's TalkSchema has no `stt` key, so a `talk.stt`
+block there gets stripped by every OpenClaw config rewrite, blocks config
+hot-reloads, and fails `openclaw config validate`:
+
+```json
+{
+  "provider": "openai",
+  "fallback": "gemini",
+  "vocabulary": ["Zeebot", "OpenClaw"]
+}
+```
+
 The default engine is OpenAI Realtime. To make Gemini the default, set
-`talk.stt.provider` to `"gemini"` (and optionally `fallback` to `"openai"`).
-You can also pass `--stt-engine gemini` to override at startup.
+`provider` to `"gemini"` (and optionally `fallback` to `"openai"`).
+You can also pass `--stt-engine gemini` to override at startup. The legacy
+`openclaw.json` `talk.stt` block is still read if the daemon config file is
+absent, so old configs keep working until migrated.
 
 The Realtime API requires the standard OpenAI provider with `api_key` mode.
 The `openai-codex` OAuth profile shipped by OpenClaw will NOT work for this

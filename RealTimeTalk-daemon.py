@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.22.3"
+__version__ = "3.22.4"
 
 import argparse
 import asyncio
@@ -150,10 +150,18 @@ GEMINI_TRANSCRIPTION_MODE = "VERBATIM"  # or "SMART"; VERBATIM is better for com
 GEMINI_LANGUAGE_CODES     = ["en-US", "zh-CN", "zh-TW", "ko-KR", "ja-JP", "es-ES", "ms-MY"]
 GEMINI_CUSTOM_VOCABULARY: list = []       # populated at startup with agent name + config terms
 
-# STT engine selection. CLI --stt-engine overrides talk.stt.provider/fallback.
+# STT engine selection. CLI --stt-engine overrides the daemon-owned config file
+# (rtt_stt_config.json) and the legacy openclaw.json `talk.stt` block.
 STT_ENGINE_OPENAI  = "openai"
 STT_ENGINE_GEMINI  = "gemini"
 DEFAULT_STT_ENGINE = STT_ENGINE_OPENAI
+# Engine settings live in the daemon's OWN config file, not openclaw.json:
+# OpenClaw's TalkSchema has no `stt` key, so the gateway strips that block on
+# every config rewrite, blocks config hot-reloads while it is present, and
+# `openclaw models status` / `config validate` hard-fail with it there.
+# The legacy openclaw.json `talk.stt` block is still read as a fallback source
+# for configs that haven't migrated yet.
+STT_CONFIG_FILE    = os.path.expanduser("~/.openclaw/workspace/rtt_stt_config.json")
 
 CHANNELS          = 1
 BLOCKSIZE         = 2400         # 100 ms at 24 kHz
@@ -7928,14 +7936,27 @@ setInterval(function(){{
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def _resolve_stt_engine(openai_key: str, gemini_key: str) -> str:
-    """Pick the active STT engine from CLI arg, config, or key availability."""
-    cfg = {}
+def _load_stt_settings() -> dict:
+    """STT engine settings (provider / fallback / vocabulary).
+
+    Read from the daemon-owned rtt_stt_config.json first, then the legacy
+    openclaw.json `talk.stt` block (same shape) for configs not yet migrated.
+    """
     try:
-        cfg = _load_json(OPENCLAW_CONFIG)
+        stt = _load_json(STT_CONFIG_FILE)
+        if isinstance(stt, dict) and stt.get("provider"):
+            return stt
     except Exception:
         pass
-    stt_cfg = cfg.get("talk", {}).get("stt", {})
+    try:
+        return _load_json(OPENCLAW_CONFIG).get("talk", {}).get("stt", {}) or {}
+    except Exception:
+        return {}
+
+
+def _resolve_stt_engine(openai_key: str, gemini_key: str) -> str:
+    """Pick the active STT engine from CLI arg, config, or key availability."""
+    stt_cfg = _load_stt_settings()
     configured = stt_cfg.get("provider", "").strip().lower()
     fallback = stt_cfg.get("fallback", "").strip().lower()
 
@@ -8190,8 +8211,7 @@ if __name__ == "__main__":
     # This biases the live model toward proper nouns that are otherwise
     # misheard (e.g. "Zeebot" → "Zebit").
     try:
-        _cfg = _load_json(OPENCLAW_CONFIG)
-        _stt_vocab = _cfg.get("talk", {}).get("stt", {}).get("vocabulary", [])
+        _stt_vocab = _load_stt_settings().get("vocabulary", [])
     except Exception:
         _stt_vocab = []
     GEMINI_CUSTOM_VOCABULARY.clear()
