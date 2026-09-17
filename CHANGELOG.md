@@ -1,5 +1,26 @@
 # Changelog
 
+## [3.22.5] — 2026-09-16
+
+### Fixed
+
+- **Wake log line named the actual STT engine.** It hardcoded
+  "reconnecting to OpenAI" (predates the Gemini engine), so a Gemini session
+  waking from auto-sleep logged a false `reconnecting to OpenAI`. The line is
+  no longer emitted from the sleep block — naming a provider there would have
+  to guess — and is instead emitted after `_resolve_stt_engine()` has run, so
+  it reports the engine actually about to be connected. A new loop-local
+  `_woke_from_sleep` carries the "we just woke" fact across to that point.
+  The Mac-only `_log_entry("system", "Reconnecting…")` portal event is
+  unchanged.
+
+### Notes
+
+- Log-text change only; no behaviour difference. Ports the Pi fork's v3.22.7
+  fix, adapted to this fork's sleep loop (`_sleep_requested` / `_is_sleeping`
+  rather than the Pi's `_idle_disconnected`), and keeps this fork's wording
+  ("Wake received —" vs the Pi's "Wake signal received —").
+
 ## [3.22.4] — 2026-09-16
 
 ### Changed

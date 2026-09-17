@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.22.4"
+__version__ = "3.22.5"
 
 import argparse
 import asyncio
@@ -8053,6 +8053,7 @@ async def main(http_port: int, input_device=None, output_device=None,
         _threading.Thread(target=_get_spk_extractor, daemon=True, name="spk-prewarm").start()
 
     while not stop_event.is_set():
+        _woke_from_sleep = False
         if _sleep_requested[0]:
             # Sleeping (auto-sleep, or restored from disk): wait for /wake before connecting.
             _sleep_requested[0] = False
@@ -8067,11 +8068,17 @@ async def main(http_port: int, input_device=None, output_device=None,
             _save_sleep_state(False)
             if stop_event.is_set():
                 break
-            log.info("Wake received — reconnecting to OpenAI…")
+            # The wake message is logged below, once _resolve_stt_engine() has
+            # run — naming a provider here would have to guess, and it used to
+            # hardcode "OpenAI", misreporting every Gemini session.
             _log_entry("system", "Reconnecting…")
+            _woke_from_sleep = True
 
         engine_name = _resolve_stt_engine(openai_key, gemini_key)
         _active_stt_engine[0] = engine_name   # dashboard #dp shows the real engine, not just the CLI flag
+        if _woke_from_sleep:
+            log.info("Wake received — connecting to the %s STT engine…",
+                     engine_name.upper())
         if engine_name == STT_ENGINE_GEMINI:
             if not gemini_key:
                 log.error("Gemini STT requested but no Gemini API key configured")
