@@ -6,3 +6,8 @@ __pycache__/
 venv/
 *.log
 speaker_cal_store.json
+
+# Personal Claude Code overrides for this project -- .claude/settings.json
+# itself IS committed (it's the shared pre-commit hook config for everyone
+# working on this repo); only the personal-override file is ignored.
+.claude/settings.local.json

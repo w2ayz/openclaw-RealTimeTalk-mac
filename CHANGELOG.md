@@ -1,5 +1,36 @@
 # Changelog
 
+## [3.22.6] — 2026-09-17
+
+### Added
+
+- **Pre-commit quality gate + repo-local `CLAUDE.md`.** A cross-model audit
+  of this repo's commit history found two real bugs that shipped and only
+  surfaced at runtime: v3.22.0's `_cli_stt_engine` referenced but never
+  declared on the Pi fork (`NameError`, startup crash-loop), and v3.21.0's
+  bare `time.monotonic()`/`time.sleep()` with no top-level `import time`
+  (`NameError`, every streamed reply crashed). Both are syntactically
+  valid Python — `py_compile`/`bash -n` can't catch either — and neither
+  was caught before commit under any of the models that have worked on
+  this repo.
+  - `.githooks/pre-commit` runs `ruff check --select F821,E9` (undefined
+    names, syntax errors) on staged Python files and blocks the commit on
+    a hit — verified against the actual historical bug content: it flags
+    both incidents above. Activate once per clone with
+    `git config core.hooksPath .githooks` (this file is tracked, unlike
+    `.git/hooks/`, so it survives every clone — the manual activation
+    step is git's own limitation, not this repo's).
+  - `.claude/settings.json` (repo-level, committed) adds a matching
+    `PreToolUse` hook so a Claude Code session rooted at this repo gets
+    the same check *before* attempting `git commit`, and self-activates
+    `core.hooksPath` on first use — no manual step needed inside Claude
+    Code specifically.
+  - `CLAUDE.md` documents the two-fork version-lock convention, the bash
+    3.2 gotchas in the install scripts, why the hook exists, and how to
+    verify runtime behavior in the absence of a real test suite.
+  - `.gitignore` gained `.claude/settings.local.json` (personal overrides
+    only — `.claude/settings.json` itself is meant to be shared/committed).
+
 ## [3.22.5] — 2026-09-16
 
 ### Changed

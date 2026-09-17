@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Pre-commit quality gate.
+#
+# Blocks a commit if any staged Python file has an undefined name (F821) or
+# a syntax error (E9) -- the exact class of bug that shipped twice in this
+# repo's history and only surfaced at runtime: v3.22.0's _cli_stt_engine
+# (referenced but never declared on the Pi fork) and v3.21.0's bare
+# time.monotonic() call (no top-level `import time`). Both are silent at
+# `python3 -m py_compile` time and only crash when the code path actually
+# runs -- this check catches them before commit instead.
+#
+# Activation (one-time per clone -- committing this file does NOT turn it
+# on by itself):
+#   git config core.hooksPath .githooks
+#
+# Bypass in a genuine emergency: git commit --no-verify
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$REPO_ROOT" ]; then
+    exit 0   # not in a git repo somehow -- nothing to gate
+fi
+cd "$REPO_ROOT" || exit 0
+
+STAGED_PY=$(git diff --cached --name-only --diff-filter=ACM -- '*.py')
+if [ -z "$STAGED_PY" ]; then
+    exit 0   # no staged Python files -- nothing to check
+fi
+
+# Locate ruff: PATH first, then the common pip --user install locations on
+# macOS and Linux (covers a fresh clone that hasn't put it on PATH yet).
+RUFF=""
+if command -v ruff >/dev/null 2>&1; then
+    RUFF="ruff"
+else
+    for cand in "$HOME"/Library/Python/*/bin/ruff "$HOME"/.local/bin/ruff; do
+        if [ -x "$cand" ]; then
+            RUFF="$cand"
+            break
+        fi
+    done
+fi
+
+if [ -z "$RUFF" ]; then
+    echo "pre-commit: ruff not found (pip3 install --user ruff) -- skipping the" >&2
+    echo "pre-commit: undefined-name/syntax check for this commit. This is the" >&2
+    echo "pre-commit: check that would have caught the v3.22.0/v3.21.0 NameError" >&2
+    echo "pre-commit: bugs -- install ruff so it actually runs. See CLAUDE.md." >&2
+    exit 0
+fi
+
+echo "pre-commit: checking staged Python files for undefined names / syntax errors..."
+# shellcheck disable=SC2086
+if ! "$RUFF" check --select F821,E9 $STAGED_PY; then
+    echo "" >&2
+    echo "pre-commit: BLOCKED -- ruff found the issue(s) above in staged files." >&2
+    echo "pre-commit: fix them, or bypass with 'git commit --no-verify' (not recommended)." >&2
+    exit 1
+fi
+echo "pre-commit: OK"
+exit 0
