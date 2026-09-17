@@ -1,5 +1,23 @@
 # Changelog
 
+## [3.22.4] — 2026-09-16
+
+### Changed
+
+- **Language-gate rejections now log at `info`, not `debug`.** A transcript
+  dropped by the EN/ZH gate or the whitelist gate was invisible in the journal
+  at default log level, so the symptom was an utterance that passed the owner
+  check and then simply drew no reply — indistinguishable from the agent
+  ignoring you. Both drop paths now report at `info`; the message text is
+  unchanged, and there is no behavioural change. This is exactly the failure
+  mode that hid the Pi fork's Chinese-punctuation bug for so long (Pi v3.22.8):
+  the gate was discarding every Chinese sentence containing `？` `。` `，` `！`,
+  and nothing was logged to say so.
+
+### Notes
+
+- Log-level change only; no behaviour difference. Ported to the Pi as v3.22.9.
+
 ## [3.22.3] — 2026-09-15
 
 ### Fixed
