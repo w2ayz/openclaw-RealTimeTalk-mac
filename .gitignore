@@ -7,7 +7,8 @@ venv/
 *.log
 speaker_cal_store.json
 
-# Personal Claude Code overrides for this project -- .claude/settings.json
-# itself IS committed (it's the shared pre-commit hook config for everyone
-# working on this repo); only the personal-override file is ignored.
-.claude/settings.local.json
+# Claude Code session artifacts -- local only. This repo is public, and
+# these files (transcripts, worktrees, scratch scripts) must never be
+# committed. The pre-commit hook is distributed via .githooks/ instead,
+# which needs none of this to work -- see CLAUDE.md.
+.claude/

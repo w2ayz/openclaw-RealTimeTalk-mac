@@ -1,5 +1,24 @@
 # Changelog
 
+## [3.22.7] — 2026-09-17
+
+### Changed
+
+- **`.claude/` is now fully gitignored, not just `settings.local.json`.**
+  This repo is public, and `.claude/` can hold session artifacts
+  (transcripts, `EnterWorktree` worktrees, scratch scripts) that must
+  never be committed — a blanket `git add -A` is the failure mode this
+  guards against, and it very nearly happened on the Pi fork. The
+  `.claude/settings.json` PreToolUse convenience hook from v3.22.6 is now
+  untracked (kept locally, on disk, for anyone who wants it — Claude Code
+  reads project settings from the filesystem regardless of git tracking
+  status) rather than distributed via clone. The pre-commit gate itself
+  is unaffected: `.githooks/pre-commit` + `git config core.hooksPath
+  .githooks` needs nothing under `.claude/` to work — that one-time
+  `git config` command per clone is now a manual step (CLAUDE.md updated
+  to say so plainly, since v3.22.6's "opening this repo in Claude Code
+  does that automatically" claim no longer holds).
+
 ## [3.22.6] — 2026-09-17
 
 ### Added
