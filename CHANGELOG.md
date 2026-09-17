@@ -1,5 +1,51 @@
 # Changelog
 
+## [3.22.11] — 2026-09-17
+
+### Fixed
+
+- **Wake log line named the actual STT engine, not a hardcoded "OpenAI".**
+  Every wake from sleep printed `Wake received — reconnecting to
+  OpenAI…` regardless of which engine was actually configured, so a
+  Gemini session showed a wake log directly contradicted one line later
+  by `Connecting to Gemini STT service…`. The message now emits after
+  `_resolve_stt_engine()` has run, using the resolved engine name. Ported
+  from the Pi fork's v3.22.7 (`5aa6c1a`), which had explicitly noted
+  "Mac fork still hardcodes this line."
+
+- **Language-gate drop messages now log at `info`, not `debug`.** A
+  transcript dropped by the EN/ZH gate or the whitelist gate was
+  invisible at default log level — the symptom was an utterance that
+  passed the owner check and then drew no reply, indistinguishable from
+  the agent simply ignoring you. Ported from the Pi fork's v3.22.9
+  (`bbeb9a4`) — that commit's own message claimed this had "already been
+  ported to the Mac fork as v3.22.4," which turned out not to be true;
+  Mac's code still had `log.debug` on both lines until this commit.
+
+### Notes — version-lock restoration
+
+The two forks drifted out of lockstep (Mac stalled at v3.22.5 while a
+separate session pushed the Pi fork directly to origin through v3.22.10,
+including an independent fix for the same `load_gemini_key` bug this
+session had also found — see the Pi fork's v3.22.6/`80265e5`, and
+[[rtt-forks]] for how that reconciliation went). Checked all six
+intervening Pi commits (`2d6a7e6..60c6390`) for Mac applicability:
+
+- **Ported** (above): wake-log engine naming, language-gate log level.
+- **Already present, no port needed**: the Pi's v3.22.8 EN/ZH
+  punctuation-gate fix was itself a port *from* this fork (its own commit
+  message says so, byte-identical); the Pi's v3.22.10 ElevenLabs
+  Lily/`eleven_v3` switch brought Pi in line with a voice this fork
+  already used.
+- **Pi-only, not applicable**: v3.22.6's `load_gemini_key` fix — this
+  fork never had that bug (it's always had `load_gemini_key()` defined).
+- **Already handled separately**: the `.claude/` gitignore policy
+  (v3.22.7 on this fork, ported from the Pi's `60c6390`).
+
+Version bumped straight to 3.22.11 (skipping 3.22.8–3.22.10) to match the
+Pi fork's tip, rather than renumbering — both forks' CHANGELOGs stay
+internally consistent with what actually shipped under each number.
+
 ## [3.22.7] — 2026-09-17
 
 ### Changed

@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.22.7"
+__version__ = "3.22.11"
 
 import argparse
 import asyncio
@@ -4864,11 +4864,11 @@ class BaseVoiceSession:
         # Wake/sleep/monitoring phrases are already handled above and are exempt.
         if self._multilang in ("off", "en-zh"):
             if not _is_english_or_chinese(transcript):
-                log.debug("Dropped non-EN/ZH (mode=%s): %r", self._multilang, transcript)
+                log.info("Dropped non-EN/ZH (mode=%s): %r", self._multilang, transcript)
                 return
         elif self._multilang == "whitelist":
             if not _is_in_multilang_whitelist(transcript):
-                log.debug("Dropped off-whitelist: %r", transcript)
+                log.info("Dropped off-whitelist: %r", transcript)
                 return
         # "any" → all languages pass through
 
@@ -8061,6 +8061,7 @@ async def main(http_port: int, input_device=None, output_device=None,
         _threading.Thread(target=_get_spk_extractor, daemon=True, name="spk-prewarm").start()
 
     while not stop_event.is_set():
+        _woke_from_sleep = False
         if _sleep_requested[0]:
             # Sleeping (auto-sleep, or restored from disk): wait for /wake before connecting.
             _sleep_requested[0] = False
@@ -8075,11 +8076,19 @@ async def main(http_port: int, input_device=None, output_device=None,
             _save_sleep_state(False)
             if stop_event.is_set():
                 break
-            log.info("Wake received — reconnecting to OpenAI…")
+            # The engine-specific wake message is logged below, once
+            # _resolve_stt_engine() has run -- naming a provider here would
+            # have to guess, and it used to hardcode "OpenAI", misreporting
+            # every Gemini wake (contradicted one line later by the session's
+            # own "Connecting to Gemini STT service…" log).
+            _woke_from_sleep = True
             _log_entry("system", "Reconnecting…")
 
         engine_name = _resolve_stt_engine(openai_key, gemini_key)
         _active_stt_engine[0] = engine_name   # dashboard #dp shows the real engine, not just the CLI flag
+        if _woke_from_sleep:
+            log.info("Wake signal received — connecting to the %s STT engine…",
+                      engine_name.upper())
         if engine_name == STT_ENGINE_GEMINI:
             if not gemini_key:
                 log.error("Gemini STT requested but no Gemini API key configured")
