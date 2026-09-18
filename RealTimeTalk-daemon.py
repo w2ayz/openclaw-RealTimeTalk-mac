@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.22.12"
+__version__ = "3.22.13"
 
 import argparse
 import asyncio
@@ -132,7 +132,17 @@ FFMPEG_CMD        = (
              if os.path.exists(p)), "ffmpeg")
 )
 
-OPENAI_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
+# gpt-live-transcribe, not gpt-4o-transcribe: only the "live" model supports
+# `keywords` custom-vocabulary hinting (verified live against the real API —
+# gpt-4o-transcribe hard-rejects the `keywords` field outright). It also
+# hard-rejects ALL automatic turn detection (server_vad and semantic_vad
+# both rejected, confirmed live) -- only turn_detection:null is accepted, so
+# OpenAIRealtimeSession drives its own client-side speech start/stop (see
+# _send_audio_chunk) and sends input_audio_buffer.commit itself. Verified
+# live: commit alone produces a transcript (no response.create needed), and
+# multiple commits work correctly within one connection (no buffer-clear
+# needed between turns).
+OPENAI_TRANSCRIBE_MODEL = "gpt-live-transcribe"
 OPENAI_WS_URL     = "wss://api.openai.com/v1/realtime?intent=transcription"
 SAMPLE_RATE       = 24000        # OpenAI Realtime API rate
 DEVICE_RATE       = 24000        # capture at 24 kHz — CoreAudio resamples from native
@@ -154,6 +164,11 @@ GEMINI_WS_URL = (
 GEMINI_TRANSCRIPTION_MODE = "VERBATIM"  # or "SMART"; VERBATIM is better for commands
 GEMINI_LANGUAGE_CODES     = ["en-US", "zh-CN", "zh-TW", "ko-KR", "ja-JP", "es-ES", "ms-MY"]
 GEMINI_CUSTOM_VOCABULARY: list = []       # populated at startup with agent name + config terms
+# Same source as GEMINI_CUSTOM_VOCABULARY (rtt_stt_config.json "vocabulary"),
+# sanitized separately for OpenAI: its API rejects the WHOLE session update
+# if any keyword contains <, >, CR, or LF (no such constraint on Gemini), so
+# offending terms are filtered out (with a warning) rather than shared as-is.
+OPENAI_TRANSCRIPTION_KEYWORDS: list = []  # populated at startup, see main()
 
 # STT engine selection. CLI --stt-engine overrides the daemon-owned config file
 # (rtt_stt_config.json) and the legacy openclaw.json `talk.stt` block.
@@ -5143,10 +5158,26 @@ class BaseVoiceSession:
 # ── OpenAI Realtime session ───────────────────────────────────────────────────
 
 class OpenAIRealtimeSession(BaseVoiceSession):
-    """OpenAI Realtime API in transcription-only mode."""
+    """OpenAI Realtime API in transcription-only mode.
+
+    gpt-live-transcribe rejects all automatic turn detection (server_vad and
+    semantic_vad both hard-rejected, verified live) — only turn_detection:null
+    is accepted, so this class drives its own client-side speech start/stop
+    from chunk peak level (see _send_audio_chunk) and sends
+    input_audio_buffer.commit itself when it decides an utterance ended.
+    """
+
+    # Debounce timings for the client-side VAD below — chosen to match the
+    # felt latency of the old server_vad config (threshold=0.35,
+    # silence_duration_ms=700) so users don't notice the swap.
+    CLIENT_VAD_START_DEBOUNCE_SECS = 0.15  # sustained sound before "speech started"
+    CLIENT_VAD_STOP_SILENCE_SECS   = 0.7   # sustained silence before "speech stopped" + commit
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._client_vad_speaking     = False
+        self._client_vad_above_since  = None   # monotonic time sound first crossed the gate
+        self._client_vad_last_sound   = 0.0    # monotonic time of the most recent above-gate chunk
 
     def engine_name(self) -> str:
         return "OpenAI Realtime"
@@ -5158,6 +5189,8 @@ class OpenAIRealtimeSession(BaseVoiceSession):
             ping_interval=20,
             ping_timeout=10,
         ) as ws:
+            self._client_vad_speaking    = False
+            self._client_vad_above_since = None
             await ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
@@ -5167,13 +5200,13 @@ class OpenAIRealtimeSession(BaseVoiceSession):
                             "transcription": {
                                 "model": OPENAI_TRANSCRIBE_MODEL,
                                 **({"prompt": TRANSCRIPTION_PROMPT} if TRANSCRIPTION_PROMPT else {}),
+                                **({"keywords": OPENAI_TRANSCRIPTION_KEYWORDS} if OPENAI_TRANSCRIPTION_KEYWORDS else {}),
                             },
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "threshold": 0.35,
-                                "prefix_padding_ms": 500,
-                                "silence_duration_ms": 700,
-                            },
+                            # gpt-live-transcribe supports no automatic mode
+                            # (server_vad / semantic_vad both rejected) —
+                            # null is the only accepted value; see class
+                            # docstring for the client-side replacement.
+                            "turn_detection": None,
                         },
                     },
                 },
@@ -5196,9 +5229,40 @@ class OpenAIRealtimeSession(BaseVoiceSession):
             "type": "input_audio_buffer.append",
             "audio": base64.b64encode(chunk).decode(),
         }))
+        # Client-side turn detection (gpt-live-transcribe has no server-side
+        # option — see class docstring). Peak is computed from `chunk`
+        # itself, not the shared _mic_level_current global, so this is
+        # automatically silent during TTS-busy/barge-in-suppressed windows:
+        # _send_mic already zeroes `chunk` then (see its _is_speaking/_is_tx
+        # guard) before this method ever sees it. Compared against the
+        # existing, already-calibrated _mic_gate_ref — reuses the
+        # room-calibrated noise gate that already drives everything else
+        # rather than inventing a second independent threshold.
+        now = time.monotonic()
+        peak = int(np.max(np.abs(np.frombuffer(chunk, np.int16)))) if chunk else 0
+        if peak >= _mic_gate_ref[0]:
+            self._client_vad_last_sound = now
+            if self._client_vad_above_since is None:
+                self._client_vad_above_since = now
+            elif (not self._client_vad_speaking
+                    and now - self._client_vad_above_since >= self.CLIENT_VAD_START_DEBOUNCE_SECS):
+                self._client_vad_speaking = True
+                self._on_speech_started()
+        else:
+            self._client_vad_above_since = None
+            if (self._client_vad_speaking
+                    and now - self._client_vad_last_sound >= self.CLIENT_VAD_STOP_SILENCE_SECS):
+                self._client_vad_speaking = False
+                self._on_speech_stopped()
+                await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
 
     async def _clear_audio_buffer(self, ws):
         await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+        # A cleared buffer has nothing left to commit — drop any in-progress
+        # detection so a stale "speaking" state doesn't fire a commit on an
+        # empty buffer (which OpenAI would reject) once silence resumes.
+        self._client_vad_speaking = False
+        self._client_vad_above_since = None
 
     async def _handle_engine_message(self, ws, raw: bytes):
         msg = json.loads(raw)
@@ -5216,11 +5280,10 @@ class OpenAIRealtimeSession(BaseVoiceSession):
         elif t == "error":
             log.error("OpenAI error: %s", msg.get("error", msg))
 
-        elif t == "input_audio_buffer.speech_started":
-            self._on_speech_started()
-
-        elif t == "input_audio_buffer.speech_stopped":
-            self._on_speech_stopped()
+        # No input_audio_buffer.speech_started/speech_stopped branches here:
+        # gpt-live-transcribe never emits them under turn_detection:null.
+        # _on_speech_started()/_on_speech_stopped() are driven client-side
+        # instead, from _send_audio_chunk's own peak-level detection.
 
         elif t not in (
             "input_audio_buffer.committed",
@@ -8229,16 +8292,31 @@ if __name__ == "__main__":
     OWNER_ONLY_ON_PHRASES  = {p for p in OWNER_ONLY_ON_PHRASES  if p != "zeebot only listen to me"}  | {f"{_n} only listen to me"}
     OWNER_ONLY_OFF_PHRASES = {p for p in OWNER_ONLY_OFF_PHRASES if p != "zeebot listen to everyone"} | {f"{_n} listen to everyone"}
 
-    # Build Gemini custom vocabulary from agent name + configured terms.
-    # This biases the live model toward proper nouns that are otherwise
-    # misheard (e.g. "Zeebot" → "Zebit").
+    # Build the shared custom-vocabulary set from agent name + configured
+    # terms — one source, sent to both STT engines. This biases the live
+    # model toward proper nouns that are otherwise misheard (e.g. "Zeebot"
+    # → "Zebit").
     try:
         _stt_vocab = _load_stt_settings().get("vocabulary", [])
     except Exception:
         _stt_vocab = []
+    _vocab_terms = {_agent_name, "OpenClaw"} | set(str(t).strip() for t in _stt_vocab if str(t).strip())
     GEMINI_CUSTOM_VOCABULARY.clear()
-    for _term in {_agent_name, "OpenClaw"} | set(str(t).strip() for t in _stt_vocab if str(t).strip()):
+    for _term in _vocab_terms:
         GEMINI_CUSTOM_VOCABULARY.append(_term)
+    # OpenAI rejects the WHOLE session update if any keyword contains <, >,
+    # CR, or LF — filter those out here rather than let one bad term break
+    # OpenAI's session while Gemini (no such constraint) keeps working.
+    OPENAI_TRANSCRIPTION_KEYWORDS.clear()
+    _openai_kw_rejected = []
+    for _term in _vocab_terms:
+        if any(c in _term for c in "<>\r\n"):
+            _openai_kw_rejected.append(_term)
+            continue
+        OPENAI_TRANSCRIPTION_KEYWORDS.append(_term)
+    if _openai_kw_rejected:
+        log.warning("OpenAI keywords: dropped %d term(s) with <, >, CR, or LF: %s",
+                    len(_openai_kw_rejected), _openai_kw_rejected)
 
     if args.list_devices:
         devs = _list_audio_devices()

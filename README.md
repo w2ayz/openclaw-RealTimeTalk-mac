@@ -102,6 +102,15 @@ You can also pass `--stt-engine gemini` to override at startup. The legacy
 `openclaw.json` `talk.stt` block is still read if the daemon config file is
 absent, so old configs keep working until migrated.
 
+`"vocabulary"` is a **single shared list sent to both engines** — Gemini's
+`custom_vocabulary` and OpenAI's `keywords` (OpenAI's `gpt-live-transcribe`
+model only; the daemon always uses that model for this reason). Add proper
+nouns, names, or jargon that either engine tends to mishear. Both treat it
+as a *hint*, not a guarantee — it measurably helps common misspellings but
+won't fix everything (an unusual acronym or call sign, for example, may
+still come through imperfectly). Restart the daemon after editing this
+list; it's only read at startup.
+
 The Realtime API requires the standard OpenAI provider with `api_key` mode.
 The `openai-codex` OAuth profile shipped by OpenClaw will NOT work for this
 endpoint.

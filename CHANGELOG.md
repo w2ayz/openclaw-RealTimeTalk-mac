@@ -1,5 +1,52 @@
 # Changelog
 
+## [3.22.13] — 2026-09-17
+
+### Added
+
+- **Shared custom-vocabulary list now hints both STT engines.**
+  `rtt_stt_config.json`'s `"vocabulary"` array already fed Gemini's
+  `custom_vocabulary`; it now also feeds OpenAI's `keywords` via a new
+  `OPENAI_TRANSCRIPTION_KEYWORDS`, built from the same source in `main()`.
+  Terms containing `<`, `>`, CR, or LF are filtered out for OpenAI only
+  (its API rejects the *whole* session update on one bad term; Gemini has
+  no such constraint), with a warning naming any dropped term.
+
+### Changed
+
+- **OpenAI engine switched from `gpt-4o-transcribe` to `gpt-live-transcribe`.**
+  Verified live against the real API before making this change:
+  `gpt-4o-transcribe` hard-rejects the `keywords` field outright — there is
+  no way to get vocabulary hinting on OpenAI's side without this model.
+  `gpt-live-transcribe` in turn hard-rejects *all* automatic turn detection
+  (`server_vad`, what this daemon used before, and `semantic_vad` are both
+  rejected — confirmed live) — only `turn_detection: null` is accepted.
+  `OpenAIRealtimeSession` now drives its own client-side speech start/stop
+  from mic chunk peak level in `_send_audio_chunk` (debounced: ~150ms
+  sustained sound to start, ~700ms sustained silence to stop — chosen to
+  match the old `server_vad` config's felt latency) and sends
+  `input_audio_buffer.commit` itself on detected stop, reusing the
+  existing calibrated `_mic_gate_ref` rather than a new threshold. Verified
+  live before shipping: commit alone produces a transcript (no
+  `response.create` needed), and multiple commits work correctly within
+  one connection (no buffer-clear needed between turns). The now-dead
+  `input_audio_buffer.speech_started`/`speech_stopped` event branches
+  (gpt-live-transcribe never emits them under `turn_detection: null`) are
+  removed from `_handle_engine_message`.
+- Ported the existing `prompt` field support to the Pi fork's OpenAI
+  session, which previously sent none at all — both forks now send
+  matching `prompt` + `keywords`.
+
+### Notes
+
+- Keywords are a *hint*, not a guarantee, on both engines — verified live:
+  the shared list fixed "Annabel" → "Annabelle" but did not fully correct
+  a synthetic call sign in the same test. Documented in CLAUDE.md and
+  README so this isn't oversold.
+- Found while porting to Pi (fixed there, same commit): `GEMINI_CUSTOM_VOCABULARY`
+  was declared but never populated in `main()` on that fork — Gemini custom
+  vocabulary has been silently inert on Pi since it was introduced.
+
 ## [3.22.12] — 2026-09-17
 
 ### Notes — branch reconciliation

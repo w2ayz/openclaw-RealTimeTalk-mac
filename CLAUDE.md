@@ -48,3 +48,23 @@
   lives in `~/.openclaw/workspace/rtt_stt_config.json` (the daemon's own
   config file, not `openclaw.json`) — see README's "STT engine selection"
   section.
+
+- **OpenAI's engine runs on `gpt-live-transcribe`, not `gpt-4o-transcribe`.**
+  Verified live against the real API before choosing this: `gpt-4o-transcribe`
+  hard-rejects the `keywords` field outright, so custom vocabulary requires
+  the newer model. That model in turn hard-rejects *all* automatic turn
+  detection (`server_vad` and `semantic_vad` both rejected, confirmed live) —
+  only `turn_detection: null` works, so `OpenAIRealtimeSession` drives its
+  own client-side speech start/stop from mic chunk peak level in
+  `_send_audio_chunk`, reusing the existing calibrated `_mic_gate_ref`
+  rather than a new threshold. If OpenAI transcripts start feeling
+  cut-off or laggy, check `CLIENT_VAD_START_DEBOUNCE_SECS`/
+  `CLIENT_VAD_STOP_SILENCE_SECS` on that class before assuming anything
+  else broke — this is a homegrown VAD, not OpenAI's.
+
+- **`rtt_stt_config.json`'s `"vocabulary"` list feeds both STT engines**,
+  not just Gemini — see `OPENAI_TRANSCRIPTION_KEYWORDS` alongside
+  `GEMINI_CUSTOM_VOCABULARY` in `main()`. Verified live: it measurably
+  helps ("Annabel" → "Annabelle") but is a *hint*, not a guarantee — an
+  unusual term (a call sign in testing) still came through imperfectly
+  with the hint active. Don't oversell it in user-facing docs.
