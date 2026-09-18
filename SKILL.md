@@ -29,7 +29,7 @@ service manager) is swapped for Mac-native equivalents.
 | Mic device discovery | `pactl list sources` | `sounddevice.query_devices()` |
 | Output device discovery | `pactl list sinks` | `sounddevice.query_devices()` |
 | AGC | PipeWire WebRTC AGC virtual source | None — software gain/gate only |
-| TTS | Piper binary | ElevenLabs (zh/mixed) → OpenAI TTS → macOS `say` |
+| TTS | Piper binary | ElevenLabs → Edge TTS → OpenAI TTS → macOS `say` (default order — configurable, see below) |
 | Audio decoding | direct PCM from Piper | ffmpeg → 24 kHz mono int16 |
 | Volume control | `pactl set-sink-volume` | `osascript -e 'set volume output volume'` |
 | Service manager | systemd user service | launchd LaunchAgent |
@@ -57,8 +57,15 @@ websockets + numpy:
 
 ## TTS pipeline
 
+Engine order is configurable (`rtt_tts_config.json`'s `"order"`, resolved
+once at startup into `TTS_ORDER` by `_resolve_tts_order()` — see
+`RealTimeTalk-configure.sh`/`run_tts_setup`). The steps below show the
+default order; any engine can be dropped from the chain except `say`, which
+`_resolve_tts_order()` always appends as the last-resort entry since it
+needs no key or network.
+
 ```python
-# In speak(text) — engine chain, first success wins:
+# In _synthesize(text) — engine chain (TTS_ORDER), first success wins:
 1. _elevenlabs_tts_to_mp3(text, /tmp/rtt_XXX.mp3)
    └─ ElevenLabs eleven_v3, voice "Lily" — whole text in one call
 2. _edge_tts_to_pcm(text)
@@ -137,26 +144,41 @@ New HTTP endpoints: `/ownermode[/on|/off]`, `/ownermode/threshold?value=N`,
 
 ## API key requirements
 
-The daemon reads `talk.providers.openai.apiKey` (required) and
-`talk.providers.elevenlabs.apiKey` (optional) from `~/.openclaw/openclaw.json`.
-The Realtime API requires the regular OpenAI provider (api_key mode), not the
-`openai-codex` OAuth profile. Add this block to openclaw.json:
+The daemon reads `talk.providers.{openai,gemini,elevenlabs}.apiKey` from
+`~/.openclaw/openclaw.json`. All three are optional:
+
+- **STT** (mic/wake-word listening): needs an OpenAI key, a Gemini key, or
+  both (see README's "STT engine selection" for provider/fallback). With
+  neither configured, `_resolve_stt_engine()` resolves to `STT_ENGINE_NONE`
+  and the daemon runs TTS-only — no mic session at all, but the HTTP
+  dashboard and `POST /speak` (OpenClaw pushing text to read aloud) still
+  work normally. The Realtime API requires the regular OpenAI provider
+  (api_key mode), not the `openai-codex` OAuth profile.
+- **TTS**: ElevenLabs gives the best multilingual (Chinese/mixed) quality;
+  without it, `speak()`/`_synthesize()` just falls to the next engine in
+  `TTS_ORDER` (default: Edge TTS, then OpenAI TTS, then macOS `say`, which
+  needs no key at all and is always kept in the chain).
 
 ```json
 "talk": {
   "providers": {
     "openai":     { "apiKey": "sk-..." },
+    "gemini":     { "apiKey": "AIza..." },
     "elevenlabs": { "apiKey": "..." }
   }
 }
 ```
 
-`load_openai_key()` raises and exits the daemon if missing.
-`load_elevenlabs_key()` returns `""` if missing — `speak()` just skips straight
-to OpenAI TTS for Chinese/mixed replies.
+`load_openai_key()` / `load_gemini_key()` / `load_elevenlabs_key()` all
+return `""` (not an error) if unset.
 
-The installer (`RealTimeTalk-install-mac.sh`) checks the OpenAI precondition
-and prints instructions if missing.
+Run `bash RealTimeTalk-configure.sh` anytime (re-runnable, no
+brew/venv/plist steps) to add/replace any of these keys, choose or skip the
+STT engine, reorder or drop TTS engines, or extend the STT vocabulary hint.
+It also checks your shell environment (`OPENAI_API_KEY`, `GEMINI_API_KEY`/
+`GOOGLE_API_KEY`, `ELEVENLABS_API_KEY`) and offers a key found there before
+prompting for one. `RealTimeTalk-install-mac.sh`'s §4 calls the same
+functions (from `RealTimeTalk-config-lib.sh`) during a fresh install.
 
 ---
 
@@ -203,7 +225,7 @@ Functions that work natively on Mac:
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Daemon exits with "No OpenAI API key" | `talk.providers.openai.apiKey` missing in openclaw.json | Add the key (regular OpenAI API key, not OAuth) |
+| Dashboard shows "STT: Text-only (no STT)", mic never listens | No OpenAI/Gemini key configured (or explicit Skip in configure) | Expected in TTS-only mode; run `RealTimeTalk-configure.sh` to add a key if you want mic/wake-word listening |
 | `--list-devices` shows no inputs | No mic connected | Plug in a USB mic, pair Bluetooth, or enable iPhone Continuity |
 | Bluetooth playback sounds compressed | macOS SCO mode (8 kHz) | Expected when BT mic+speaker on same device — use separate output |
 | Daemon won't restart after edit | LaunchAgent throttle (10 s) | `launchctl kickstart -k gui/$UID/ai.openclaw.realtimetalk` |

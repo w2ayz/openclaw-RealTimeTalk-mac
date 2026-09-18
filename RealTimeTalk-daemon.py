@@ -6,6 +6,10 @@ Audio flow:
   Mic → OpenAI Realtime API (VAD + STT only) → transcript
   transcript → OpenClaw gateway (chat.send / agent.wait) → Zeebot's reply
   Zeebot's reply → ElevenLabs → Edge TTS → OpenAI TTS → macOS `say` → speaker
+  (TTS engine order is configurable — see rtt_tts_config.json / DEFAULT_TTS_ORDER
+   below; the order above is just the default). If no OpenAI/Gemini STT key is
+  configured, the daemon runs TTS-only (no mic/wake-word listening) — OpenClaw
+  can still push text to speak via POST /speak.
 
 Stop via:
   http://localhost:19000/dashboard         — local browser
@@ -28,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.22.19"
+__version__ = "3.23.0"
 
 import argparse
 import asyncio
@@ -174,6 +178,7 @@ OPENAI_TRANSCRIPTION_KEYWORDS: list = []  # populated at startup, see main()
 # (rtt_stt_config.json) and the legacy openclaw.json `talk.stt` block.
 STT_ENGINE_OPENAI  = "openai"
 STT_ENGINE_GEMINI  = "gemini"
+STT_ENGINE_NONE    = "none"     # no provider key configured — TTS-only, no mic/STT session
 DEFAULT_STT_ENGINE = STT_ENGINE_OPENAI
 # Engine settings live in the daemon's OWN config file, not openclaw.json:
 # OpenClaw's TalkSchema has no `stt` key, so the gateway strips that block on
@@ -186,6 +191,15 @@ STT_CONFIG_FILE    = os.path.expanduser("~/.openclaw/workspace/rtt_stt_config.js
 # _ensure_stt_config_seeded() so an update from a pre-v3.22.4 daemon (which
 # never had this file) doesn't silently start the STT keyword hint empty.
 DEFAULT_STT_VOCABULARY = ["OpenClaw", "STT", "TTS", "RealTimeTalk", "RTT"]
+
+# TTS engine chain order — same daemon-owned-file pattern as STT above.
+# RealTimeTalk-configure.sh writes {"order": [...]} here; any engine name it
+# omits is simply never tried (see _load_tts_settings/TTS_ORDER, populated
+# once at startup) except "say", which _ensure_tts_config_seeded()/TTS_ORDER
+# always keeps as the last-resort entry since it needs no key/network at all.
+TTS_CONFIG_FILE    = os.path.expanduser("~/.openclaw/workspace/rtt_tts_config.json")
+DEFAULT_TTS_ORDER  = ["elevenlabs", "edge", "openai", "say"]
+TTS_ORDER: list = list(DEFAULT_TTS_ORDER)  # populated at startup, see main()
 
 CHANNELS          = 1
 BLOCKSIZE         = 2400         # 100 ms at 24 kHz
@@ -3088,37 +3102,36 @@ def _synthesize(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0,
         pcm = np.zeros(0, dtype=np.int16)
         _eng = ""   # which engine actually produced usable audio this call
 
-        # TTS engine chain: ElevenLabs → Edge TTS → OpenAI TTS → macOS `say`.
-        if _elevenlabs_tts_to_mp3(clean, mp3_path):
-            pcm = _decode_to_pcm(mp3_path)
-            log.info("  ElevenLabs TTS OK — PCM decode: %d samples (%.1fs)",
-                     pcm.size, pcm.size / TTS_SAMPLE_RATE)
-            if pcm.size:
-                _eng = "ElevenLabs"
-        else:
-            log.info("  ElevenLabs TTS unavailable/failed — trying Edge TTS")
+        def _try_elevenlabs() -> "np.ndarray":
+            if _elevenlabs_tts_to_mp3(clean, mp3_path):
+                p = _decode_to_pcm(mp3_path)
+                log.info("  ElevenLabs TTS OK — PCM decode: %d samples (%.1fs)",
+                         p.size, p.size / TTS_SAMPLE_RATE)
+                return p
+            log.info("  ElevenLabs TTS unavailable/failed")
+            return np.zeros(0, dtype=np.int16)
 
-        if pcm.size == 0:
-            pcm = _edge_tts_to_pcm(clean)
-            if pcm.size:
-                _eng = "Edge"
+        def _try_edge() -> "np.ndarray":
+            p = _edge_tts_to_pcm(clean)
+            if p.size:
                 log.info("  Edge TTS OK — PCM decode: %d samples (%.1fs)",
-                         pcm.size, pcm.size / TTS_SAMPLE_RATE)
+                         p.size, p.size / TTS_SAMPLE_RATE)
             else:
-                log.info("  Edge TTS unavailable/failed — falling back to OpenAI TTS")
+                log.info("  Edge TTS unavailable/failed")
+            return p
 
-        if pcm.size == 0:
+        def _try_openai() -> "np.ndarray":
             ok_oai = _openai_tts_to_mp3(clean, mp3_path)
             log.info("  OpenAI TTS %s", "OK" if ok_oai else "FAILED")
-            if ok_oai:
-                pcm = _decode_to_pcm(mp3_path)
-                log.info("  PCM decode: %d samples (%.1fs)",
-                         pcm.size, pcm.size / TTS_SAMPLE_RATE)
-                if pcm.size:
-                    _eng = "OpenAI"
+            if not ok_oai:
+                return np.zeros(0, dtype=np.int16)
+            p = _decode_to_pcm(mp3_path)
+            log.info("  PCM decode: %d samples (%.1fs)", p.size, p.size / TTS_SAMPLE_RATE)
+            return p
 
-        if pcm.size == 0:
-            # Fall back to macOS `say` — split by script for correct voice selection
+        def _try_say() -> "np.ndarray":
+            # Split by script for correct voice selection (Samantha/Tingting).
+            parts: list[np.ndarray] = []
             for seg_text, lang in _split_by_script(clean):
                 if not seg_text.strip():
                     continue
@@ -3129,9 +3142,26 @@ def _synthesize(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0,
                 if ok_say:
                     seg_pcm = _decode_to_pcm(aiff_path)
                     if seg_pcm.size:
-                        _eng = "say"
-                        pcm_parts.append(seg_pcm)
-        else:
+                        parts.append(seg_pcm)
+            return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int16)
+
+        # TTS engine chain — order configurable via rtt_tts_config.json (see
+        # TTS_ORDER, resolved once at startup by _resolve_tts_order());
+        # default is ElevenLabs → Edge TTS → OpenAI TTS → macOS `say`.
+        _tts_handlers = {"elevenlabs": _try_elevenlabs, "edge": _try_edge,
+                          "openai": _try_openai, "say": _try_say}
+        _tts_labels   = {"elevenlabs": "ElevenLabs", "edge": "Edge",
+                          "openai": "OpenAI", "say": "say"}
+        for _engine in TTS_ORDER:
+            _handler = _tts_handlers.get(_engine)
+            if _handler is None:
+                continue
+            pcm = _handler()
+            if pcm.size:
+                _eng = _tts_labels[_engine]
+                break
+
+        if pcm.size:
             pcm_parts.append(pcm)
 
         if _eng:
@@ -5717,7 +5747,8 @@ def _dashboard_dynamic(sess) -> dict:
     _tts_eng = _last_tts_engine[0] or "&mdash;"
     _tts_seg = (f'<span style="color:#2dd4bf;font-weight:600;">{_tts_eng}</span>'
                 if _is_speaking[0] else _tts_eng)
-    _stt_eng = _active_stt_engine[0] or _cli_stt_engine[0] or "openai"
+    _stt_eng_raw = _active_stt_engine[0] or _cli_stt_engine[0] or "openai"
+    _stt_eng = "Text-only (no STT)" if _stt_eng_raw == STT_ENGINE_NONE else _stt_eng_raw
     device_panel = (
         f'<div id="dp">'
         f'&#127908; {_ds["mic"]} &ensp;'
@@ -8109,6 +8140,54 @@ def _ensure_stt_config_seeded(agent_name: str) -> None:
         log.warning("Could not seed rtt_stt_config.json vocabulary: %s", e)
 
 
+def _load_tts_settings() -> dict:
+    """TTS engine-order settings ({"order": [...]}) — same daemon-owned-file
+    pattern as _load_stt_settings(), no legacy openclaw.json fallback (this
+    config didn't exist before v3.23.0)."""
+    try:
+        cfg = _load_json(TTS_CONFIG_FILE)
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _ensure_tts_config_seeded() -> None:
+    """Create rtt_tts_config.json with the default engine order if it's
+    missing. Never overwrites an existing "order" (including a deliberately
+    short one from RealTimeTalk-configure.sh) — mirrors
+    _ensure_stt_config_seeded()'s never-clobber behavior."""
+    try:
+        cfg = _load_json(TTS_CONFIG_FILE) if os.path.isfile(TTS_CONFIG_FILE) else {}
+    except Exception:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    if "order" in cfg:
+        return
+    cfg["order"] = list(DEFAULT_TTS_ORDER)
+    try:
+        os.makedirs(os.path.dirname(TTS_CONFIG_FILE), exist_ok=True)
+        with open(TTS_CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+        log.info("Seeded rtt_tts_config.json order: %s", cfg["order"])
+    except Exception as e:
+        log.warning("Could not seed rtt_tts_config.json order: %s", e)
+
+
+def _resolve_tts_order() -> list:
+    """Validate rtt_tts_config.json's "order" against the known TTS engines,
+    dropping unknown names and duplicates, and always keeping "say" as the
+    last-resort entry even if the user's list omits it (it needs no key or
+    network, so it's the one engine that must never be droppable to zero)."""
+    known = {"elevenlabs", "edge", "openai", "say"}
+    raw = _load_tts_settings().get("order")
+    order = [str(t).strip().lower() for t in raw] if isinstance(raw, list) else DEFAULT_TTS_ORDER
+    result = [t for t in dict.fromkeys(order) if t in known]
+    if "say" not in result:
+        result.append("say")
+    return result or list(DEFAULT_TTS_ORDER)
+
+
 def _resolve_stt_engine(openai_key: str, gemini_key: str) -> str:
     """Pick the active STT engine from CLI arg, config, or key availability."""
     stt_cfg = _load_stt_settings()
@@ -8118,6 +8197,15 @@ def _resolve_stt_engine(openai_key: str, gemini_key: str) -> str:
     # CLI override wins
     if _cli_stt_engine[0]:
         return _cli_stt_engine[0]
+
+    # No usable key at all — TTS-only, regardless of what "provider" says
+    # (a stale "openai"/"gemini" left over from a since-removed key must not
+    # attempt a connection). Also honors an explicit "none" from the
+    # configure script's Skip option.
+    if not openai_key and not gemini_key:
+        return STT_ENGINE_NONE
+    if configured == STT_ENGINE_NONE:
+        return STT_ENGINE_NONE
 
     # Configured primary, if key exists
     if configured:
@@ -8241,6 +8329,22 @@ async def main(http_port: int, input_device=None, output_device=None,
 
         engine_name = _resolve_stt_engine(openai_key, gemini_key)
         _active_stt_engine[0] = engine_name   # dashboard #dp shows the real engine, not just the CLI flag
+
+        if engine_name == STT_ENGINE_NONE:
+            # No OpenAI/Gemini key configured (RealTimeTalk-configure.sh's
+            # "Skip" option, or just no key yet) — run TTS-only. The HTTP
+            # server (already started above) keeps serving /speak, /status
+            # and the dashboard with no session at all; openai_key/gemini_key
+            # are only read once at the top of main(), so adding a key later
+            # needs a daemon restart to take effect, same as any other STT
+            # config change.
+            log.info("No STT provider key configured — running TTS-only "
+                      "(no mic/wake-word listening). OpenClaw can still push "
+                      "text to speak via POST /speak.")
+            session_ref[0] = None
+            await stop_event.wait()
+            break
+
         if _woke_from_sleep:
             log.info("Wake received — connecting to the %s STT engine…",
                      engine_name.upper())
@@ -8380,6 +8484,11 @@ if __name__ == "__main__":
         _stt_vocab = _load_stt_settings().get("vocabulary", [])
     except Exception:
         _stt_vocab = []
+
+    # TTS engine order — same populate-once-at-startup pattern as the STT
+    # vocabulary above, read by _synthesize() via the module-level TTS_ORDER.
+    _ensure_tts_config_seeded()
+    TTS_ORDER[:] = _resolve_tts_order()
     _vocab_terms = {_agent_name, "OpenClaw"} | set(str(t).strip() for t in _stt_vocab if str(t).strip())
     GEMINI_CUSTOM_VOCABULARY.clear()
     for _term in _vocab_terms:

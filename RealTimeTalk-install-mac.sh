@@ -5,14 +5,19 @@
 #   1. Verify Homebrew dependencies (portaudio, ffmpeg, node)
 #   2. Resolve the Edge TTS skill (first TTS fallback) and prepare its node deps
 #   3. Create Python venv and install dependencies
-#   4. Prompt for STT provider keys (OpenAI and/or Gemini — either or both),
-#      verify each against its provider API, and write the engine choice to
-#      ~/.openclaw/workspace/rtt_stt_config.json
+#   4. STT keys/engine, TTS keys/engine order, and STT vocabulary — delegated
+#      to RealTimeTalk-config-lib.sh's run_stt_setup/run_tts_setup/
+#      run_vocabulary_setup (same functions RealTimeTalk-configure.sh uses to
+#      re-run this later without repeating steps 1-3, 5-7)
 #   5. List audio devices and prompt user for input + output device indices,
 #      agent name, and wake phrase; optionally download the Voice ID
 #      speaker-embedding model
 #   6. Render and install the LaunchAgent plist
 #   7. Load the agent
+#
+# Re-run bash RealTimeTalk-configure.sh anytime afterward to change STT/TTS
+# keys, the TTS engine order, or the STT vocabulary without repeating this
+# whole installer.
 
 set -euo pipefail
 
@@ -99,13 +104,18 @@ echo "Installing Python deps (see requirements.txt)..."
 green "  ✓ venv ready"
 echo
 
-# ── 4. STT provider keys — OpenAI and/or Gemini ──────────────────────────────
-# Keys live in openclaw.json (talk.providers.<name>.apiKey). The ENGINE choice
-# lives in the daemon's own config file (~/.openclaw/workspace/rtt_stt_config.json,
-# v3.22.4+) — NOT in openclaw.json: OpenClaw's TalkSchema has no `stt` key, so
-# a talk.stt block there gets stripped by gateway config rewrites and fails
+# ── 4. STT keys/engine, TTS keys/engine order, STT vocabulary ────────────────
+# Keys live in openclaw.json (talk.providers.<name>.apiKey). Engine/order
+# choices live in the daemon's own config files
+# (~/.openclaw/workspace/rtt_stt_config.json, rtt_tts_config.json) — NOT in
+# openclaw.json: OpenClaw's TalkSchema has no `stt` key, so a talk.stt block
+# there gets stripped by gateway config rewrites and fails
 # `openclaw config validate`. The daemon still reads a legacy openclaw.json
 # talk.stt block as a fallback source, but this installer never writes one.
+#
+# All three interview steps live in RealTimeTalk-config-lib.sh so
+# RealTimeTalk-configure.sh can re-run them later without repeating the rest
+# of this installer.
 
 if [[ ! -f "$OPENCLAW_JSON" ]]; then
     red "  ✗ $OPENCLAW_JSON not found"
@@ -113,199 +123,14 @@ if [[ ! -f "$OPENCLAW_JSON" ]]; then
 fi
 
 STT_CFG="$HOME/.openclaw/workspace/rtt_stt_config.json"
+TTS_CFG="$HOME/.openclaw/workspace/rtt_tts_config.json"
 
-echo "STT providers currently configured in openclaw.json:"
-"$VENV_PY" - <<PY
-import json
-cfg = json.load(open("$OPENCLAW_JSON"))
-prov = cfg.get("talk", {}).get("providers", {})
-for name in ("openai", "gemini"):
-    k = (prov.get(name) or {}).get("apiKey", "")
-    print(f"  {name:8s} {'configured' if k else '- not set'}")
-PY
-echo
+# shellcheck source=RealTimeTalk-config-lib.sh
+source "$SKILL_DIR/RealTimeTalk-config-lib.sh"
 
-echo "  STT engine setup — which provider key(s) do you want to use?"
-echo "    [1] OpenAI Realtime        (regular sk-... API key — NOT the ChatGPT OAuth profile)"
-echo "    [2] Gemini Transcribe Live (Gemini API key, AIza...)"
-echo "    [3] Both                   (pick the default engine; the other becomes the fallback)"
-echo "    [4] Keep existing configuration"
-echo
-while true; do
-    read -r -p "  Choice [1/2/3/4, Enter = keep existing]: " STT_CHOICE
-    STT_CHOICE="${STT_CHOICE:-4}"
-    case "$STT_CHOICE" in 1|2|3|4) break ;; esac
-    yellow "  → enter 1, 2, 3 or 4"
-done
-
-# ensure_stt_key <provider> — prompts (hidden) if needed and writes the key.
-# Returns 0 if the provider has a usable key afterwards, 1 otherwise.
-ensure_stt_key() {
-    local prov="$1" prefix="^sk-"
-    [[ "$prov" == "gemini" ]] && prefix="^AIza"
-    local existing
-    existing=$("$VENV_PY" - "$prov" <<PY
-import json, sys
-cfg = json.load(open("$OPENCLAW_JSON"))
-k = cfg.get("talk", {}).get("providers", {}).get(sys.argv[1], {}).get("apiKey", "")
-print("yes" if k else "no")
-PY
-)
-    local KEY=""
-    if [[ "$existing" == "yes" ]]; then
-        read -r -p "  $prov key already configured — Enter to keep it, or paste a replacement: " KEY
-        [[ -z "$KEY" ]] && { green "  ✓ kept existing $prov key"; return 0; }
-    else
-        read -rs -p "  Enter $prov API key (hidden input): " KEY
-        echo
-        if [[ -z "$KEY" ]]; then
-            yellow "  → no $prov key entered — $prov STT will not be usable"
-            return 1
-        fi
-    fi
-    if ! [[ "$KEY" =~ $prefix ]]; then
-        local reply
-        read -r -p "  ⚠ That doesn't look like a $prov key (expected ${prefix#^}...). Use it anyway? [y/N]: " reply
-        if [[ ! "$reply" =~ ^[Yy] ]]; then return 1; fi
-    fi
-    # Best-effort live verification — warn-only so an offline install still works.
-    local http
-    if [[ "$prov" == "openai" ]]; then
-        http=$(curl -s -o /dev/null -w "%{http_code}" -m 10 \
-            https://api.openai.com/v1/models -H "Authorization: Bearer $KEY" || echo 000)
-    else
-        http=$(curl -s -o /dev/null -w "%{http_code}" -m 10 \
-            https://generativelanguage.googleapis.com/v1beta/models -H "x-goog-api-key: $KEY" || echo 000)
-    fi
-    case "$http" in
-        200)     green "  ✓ $prov key verified against the provider API" ;;
-        000)     yellow "  → could not reach the $prov API to verify (offline?) — continuing" ;;
-        401|403) red   "  ✗ $prov key was REJECTED by the provider (HTTP $http) — not saving it"
-                 return 1 ;;
-        *)       yellow "  → provider returned HTTP $http — saving anyway (can re-run this installer)" ;;
-    esac
-    "$VENV_PY" - "$prov" "$KEY" <<'PY'
-import json, os, sys
-prov, key = sys.argv[1], sys.argv[2]
-path = os.path.expanduser("~/.openclaw/openclaw.json")
-cfg = json.load(open(path))
-cfg.setdefault("talk", {}).setdefault("providers", {}).setdefault(prov, {})["apiKey"] = key
-json.dump(cfg, open(path, "w"), indent=2)
-os.chmod(path, 0o600)
-PY
-    green "  ✓ $prov key written to openclaw.json"
-}
-
-# write_stt_engine <provider> <fallback-or-empty>
-write_stt_engine() {
-    "$VENV_PY" - "$1" "$2" <<'PY'
-import json, os, sys
-provider, fallback = sys.argv[1], sys.argv[2]
-path = os.path.expanduser("~/.openclaw/workspace/rtt_stt_config.json")
-os.makedirs(os.path.dirname(path), exist_ok=True)
-# Merge into any existing file instead of overwriting it outright — a
-# reinstall/upgrade must not wipe a "vocabulary" list the daemon seeded
-# (see _ensure_stt_config_seeded in RealTimeTalk-daemon.py) or the user
-# has since customized.
-cfg = {}
-if os.path.isfile(path):
-    try:
-        with open(path) as f:
-            existing = json.load(f)
-        if isinstance(existing, dict):
-            cfg = existing
-    except Exception:
-        pass
-cfg["provider"] = provider
-if fallback:
-    cfg["fallback"] = fallback
-else:
-    cfg.pop("fallback", None)
-json.dump(cfg, open(path, "w"), indent=2)
-PY
-    green "  ✓ STT engine → $1${2:+ (fallback: $2)} written to $STT_CFG"
-}
-
-STT_ENGINE=""      # what rtt_stt_config.json should say at the end
-case "$STT_CHOICE" in
-    1)
-        ensure_stt_key openai || true
-        if "$VENV_PY" - <<PY
-import json, sys
-sys.exit(0 if json.load(open("$OPENCLAW_JSON")).get("talk", {}).get("providers", {}).get("openai", {}).get("apiKey") else 1)
-PY
-        then
-            # A gemini key (if present) becomes a free fallback.
-            if "$VENV_PY" - <<PY
-import json, sys
-sys.exit(0 if json.load(open("$OPENCLAW_JSON")).get("talk", {}).get("providers", {}).get("gemini", {}).get("apiKey", "") else 1)
-PY
-            then write_stt_engine openai gemini; else write_stt_engine openai ""; fi
-        fi
-        ;;
-    2)
-        ensure_stt_key gemini || true
-        if "$VENV_PY" - <<PY
-import json, sys
-sys.exit(0 if json.load(open("$OPENCLAW_JSON")).get("talk", {}).get("providers", {}).get("gemini", {}).get("apiKey", "") else 1)
-PY
-        then
-            if "$VENV_PY" - <<PY
-import json, sys
-sys.exit(0 if json.load(open("$OPENCLAW_JSON")).get("talk", {}).get("providers", {}).get("openai", {}).get("apiKey", "") else 1)
-PY
-            then write_stt_engine gemini openai; else write_stt_engine gemini ""; fi
-        fi
-        ;;
-    3)
-        ensure_stt_key openai || true
-        ensure_stt_key gemini || true
-        if "$VENV_PY" - <<PY
-import json, sys
-prov = json.load(open("$OPENCLAW_JSON")).get("talk", {}).get("providers", {})
-sys.exit(0 if (prov.get("openai", {}).get("apiKey", "") and prov.get("gemini", {}).get("apiKey", "")) else 1)
-PY
-        then
-            while true; do
-                read -r -p "  Default STT engine [gemini/openai, Enter = openai]: " DEFAULT_ENGINE
-                DEFAULT_ENGINE="$(echo "${DEFAULT_ENGINE:-openai}" | tr '[:upper:]' '[:lower:]')"
-                case "$DEFAULT_ENGINE" in gemini|openai) break ;; esac
-                yellow "  → enter 'gemini' or 'openai'"
-            done
-            if [[ "$DEFAULT_ENGINE" == "gemini" ]]; then write_stt_engine gemini openai
-            else write_stt_engine openai gemini; fi
-        else
-            yellow "  → 'Both' needs both keys — set the engine manually in $STT_CFG"
-        fi
-        ;;
-    4) green "  ✓ keeping existing configuration" ;;
-esac
-
-# Final precondition: at least one usable STT key.
-if ! "$VENV_PY" - <<PY
-import json, sys
-prov = json.load(open("$OPENCLAW_JSON")).get("talk", {}).get("providers", {})
-sys.exit(0 if (prov.get("openai", {}).get("apiKey", "") or prov.get("gemini", {}).get("apiKey", "")) else 1)
-PY
-then
-    red "  ✗ No STT provider key configured (openai or gemini) in $OPENCLAW_JSON"
-    echo
-    echo "  Add one to openclaw.json — either provider works on its own:"
-    echo
-    cat <<'EXAMPLE'
-  "talk": {
-      "providers": {
-          "openai": { "apiKey": "sk-..." },
-          "gemini": { "apiKey": "AIza..." }
-      }
-  }
-EXAMPLE
-    echo
-    echo "  Then re-run this installer."
-    exit 1
-fi
-green "  ✓ STT provider key(s) ready"
-echo
+run_stt_setup
+run_tts_setup
+run_vocabulary_setup
 
 # ── 5. Audio devices ─────────────────────────────────────────────────────────
 

@@ -1,5 +1,50 @@
 # Changelog
 
+## [3.23.0] — 2026-09-18
+
+### Added
+
+- **STT is now optional — RealTimeTalk can run TTS-only.** With no
+  OpenAI/Gemini key configured (or `rtt_stt_config.json`'s `"provider"`
+  explicitly set to `"none"`), `_resolve_stt_engine()` resolves to the new
+  `STT_ENGINE_NONE` and `main()` skips mic/wake-word session setup
+  entirely — no `sys.exit(1)` anymore. The HTTP server, dashboard, and
+  `POST /speak` keep working unchanged, so OpenClaw can still push text to
+  be read aloud. Dashboard shows "Text-only (no STT)" instead of a raw
+  `none`.
+- **TTS engine order is now configurable and droppable**
+  (`~/.openclaw/workspace/rtt_tts_config.json`'s `"order"`, resolved once
+  at startup by the new `_resolve_tts_order()` into the module-level
+  `TTS_ORDER`). Default order is unchanged (ElevenLabs → Edge TTS → OpenAI
+  TTS → `say`); any engine can be dropped except `say`, which is always
+  force-appended as the last-resort entry since it needs no key or
+  network. `_synthesize()`'s hardcoded engine chain is now a loop over
+  `TTS_ORDER` dispatching to small per-engine handler functions — same
+  audio output, same logging, for anyone who never touches the new config.
+- **`RealTimeTalk-configure.sh`** (new): re-runnable setup for STT
+  keys/engine (including the new Skip → TTS-only option), an ElevenLabs
+  key prompt, the TTS engine order, and the STT vocabulary hint list —
+  safe to run anytime without repeating brew/venv/device/plist setup.
+  Checks the shell environment (`OPENAI_API_KEY`, `GEMINI_API_KEY` /
+  `GOOGLE_API_KEY`, `ELEVENLABS_API_KEY`) and offers a key found there
+  before prompting.
+- **`RealTimeTalk-config-lib.sh`** (new): the shared
+  `run_stt_setup`/`run_tts_setup`/`run_vocabulary_setup`/
+  `ensure_provider_key`/`write_stt_engine` functions behind both the new
+  configure script and `RealTimeTalk-install-mac.sh`'s §4, so the two
+  entry points can't drift out of sync.
+
+### Changed
+
+- `RealTimeTalk-install-mac.sh`'s STT-key interview (previously inline)
+  now delegates to `RealTimeTalk-config-lib.sh`, and no longer hard-fails
+  the install when no STT key ends up configured — it offers to continue
+  in TTS-only mode instead.
+
+Not yet ported to the Pi fork (`github.com/w2ayz/openclaw-RealTimeTalk`) —
+both the STT-bypass and configurable-TTS-order concepts apply there too,
+adapted to its idioms (`piper` in place of `say`).
+
 ## [3.22.19] — 2026-09-18
 
 ### Fixed

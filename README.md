@@ -59,7 +59,7 @@ verbatim from the Pi version.
 | Dependency                  | Install                                    |
 |-----------------------------|--------------------------------------------|
 | [OpenClaw](https://openclaw.ai) gateway running | platform requirement (`openclaw gateway start`) |
-| STT provider key(s) in `~/.openclaw/openclaw.json` | OpenAI (`talk.providers.openai.apiKey`, regular `sk-...` key, **not** the openai-codex OAuth profile) and/or Gemini (`talk.providers.gemini.apiKey`, `AIza...` from AI Studio) — either one works on its own |
+| STT provider key(s) in `~/.openclaw/openclaw.json` (optional) | OpenAI (`talk.providers.openai.apiKey`, regular `sk-...` key, **not** the openai-codex OAuth profile) and/or Gemini (`talk.providers.gemini.apiKey`, `AIza...` from AI Studio) — either works on its own; with neither, RealTimeTalk runs TTS-only (no mic/wake-word listening — see "STT engine selection" below) |
 | [Edge TTS skill](https://github.com/w2ayz/openclaw-edge-tts) (first TTS fallback — optional) | install at the official path `~/.openclaw/workspace/skills/edge-tts/` (`npm install` in `scripts/`); the installer resolves it and prepares its deps |
 | Homebrew + portaudio + ffmpeg + node | `brew install portaudio ffmpeg node`     |
 | `hidapi` (only for Radio Mode's AIOC hardware-revision detection — cosmetic, everything else works without it) | `brew install hidapi` |
@@ -68,10 +68,25 @@ verbatim from the Pi version.
 
 ### Adding the STT API key(s)
 
-The daemon reads the STT key(s) from `talk.providers.openai.apiKey` and/or
-`talk.providers.gemini.apiKey` in `~/.openclaw/openclaw.json`. Add this block
-(or merge it into your existing `talk` block) — **the `providers` part only;
-STT engine selection lives in the daemon's own config file (next section)**:
+STT (mic/wake-word listening) is optional — skip this section entirely to
+run RealTimeTalk TTS-only (OpenClaw can still push text to speak via
+`POST /speak`; see "Pushing text from OpenClaw" below).
+
+The easiest way to add, change, or remove these keys after install is the
+re-runnable configure script:
+
+```bash
+bash RealTimeTalk-configure.sh
+```
+
+It also checks your shell environment (`OPENAI_API_KEY`, `GEMINI_API_KEY`/
+`GOOGLE_API_KEY`) and offers a key found there before prompting for one.
+
+To edit `openclaw.json` directly instead: the daemon reads the STT key(s)
+from `talk.providers.openai.apiKey` and/or `talk.providers.gemini.apiKey`.
+Add this block (or merge it into your existing `talk` block) — **the
+`providers` part only; STT engine selection lives in the daemon's own
+config file (next section)**:
 
 ```json
 "talk": {
@@ -103,6 +118,11 @@ You can also pass `--stt-engine gemini` to override at startup. The legacy
 `openclaw.json` `talk.stt` block is still read if the daemon config file is
 absent, so old configs keep working until migrated.
 
+Set `"provider": "none"` (what `RealTimeTalk-configure.sh`'s Skip option
+writes) to run TTS-only on purpose even if a key is configured. With
+neither an OpenAI nor a Gemini key present at all, the daemon resolves to
+this same TTS-only mode automatically regardless of what `"provider"` says.
+
 `"vocabulary"` is a **single shared list sent to both engines** — Gemini's
 `custom_vocabulary` and OpenAI's `keywords` (OpenAI's `gpt-live-transcribe`
 model only; the daemon always uses that model for this reason). Add proper
@@ -131,8 +151,23 @@ Chinese and mixed Chinese/English replies use ElevenLabs multilingual v2
 }
 ```
 
-Optional — if unset, Chinese/mixed replies fall back to OpenAI TTS
-(same as English replies).
+Optional — if unset, Chinese/mixed replies fall back down the TTS chain
+(OpenAI TTS by default). `bash RealTimeTalk-configure.sh` prompts for this
+key too (checking `$ELEVENLABS_API_KEY` in your environment first).
+
+### TTS engine order (`~/.openclaw/workspace/rtt_tts_config.json`)
+
+```json
+{ "order": ["elevenlabs", "edge", "openai", "say"] }
+```
+
+Same daemon-owned-config pattern as STT engine selection above. The default
+is ElevenLabs → Edge TTS → OpenAI TTS → macOS `say`, tried in order until
+one produces audio. `RealTimeTalk-configure.sh` lets you reorder this list
+or drop engines you don't want (e.g. `["edge", "say"]` to never touch
+ElevenLabs/OpenAI TTS) — `say` is always kept as the last-resort entry even
+if you leave it out, since it needs no key or network. Restart the daemon
+after editing this file directly; it's only read at startup.
 
 ---
 
@@ -156,12 +191,24 @@ setup expects.)
 The installer:
 1. `brew install`s portaudio, ffmpeg, node (skipped if already present)
 2. Creates a Python venv at `./venv` and installs `sounddevice`, `websockets`, `numpy`, `zhconv`
-3. Prompts for STT provider keys (choice menu: OpenAI / Gemini / both / keep existing) — hidden input, each key verified against its provider API; writes the engine choice to `~/.openclaw/workspace/rtt_stt_config.json`. Exits with instructions if neither key is configured
+3. STT keys/engine, TTS keys/engine order, and STT vocabulary — a choice
+   menu (OpenAI / Gemini / both / keep existing / **skip for TTS-only**),
+   hidden key input verified against each provider's API, an ElevenLabs key
+   prompt, and a reorderable/droppable TTS engine chain. These three steps
+   live in `RealTimeTalk-config-lib.sh` so you can re-run just this part
+   later with `bash RealTimeTalk-configure.sh` — see the sections above
 4. Lists CoreAudio devices and prompts you for input + output device indices
 5. Writes the LaunchAgent plist to `~/Library/LaunchAgents/ai.openclaw.realtimetalk.plist`
 6. Loads the agent (boots at every login)
 
 Then open `http://localhost:19000/dashboard`.
+
+To change any STT/TTS key, the STT engine choice, the TTS engine order, or
+the STT vocabulary later without repeating the whole install, re-run:
+
+```bash
+bash ~/.openclaw/workspace/skills/realtimetalk/RealTimeTalk-configure.sh
+```
 
 ### Microphone permission reliability (recommended)
 
@@ -230,7 +277,9 @@ activates immediately. Once active: "\<agent name\> go to sleep",
 aloud on demand — the piece that lets an OpenClaw agent do work triggered
 by keyboard/text (not voice) and still deliver the result through RTT.
 Useful when the request was typed but the answer should come back spoken —
-away from the keyboard, on the radio, hands busy, etc.
+away from the keyboard, on the radio, hands busy, etc. This is also what
+makes TTS-only (no STT key configured) mode useful rather than just inert —
+see "STT engine selection" above.
 
 ```bash
 curl -s -X POST --data-urlencode "text=Your text here" http://127.0.0.1:19000/speak
@@ -476,11 +525,12 @@ Mic (CoreAudio)
                         ├─ Wake/sleep / command matcher  (skip if matched)
                         └─ GatewayClient.ask()  (OpenClaw chat.send → agent.wait)
                             └─ Agent's reply text
-                                └─ speak()
-                                    ├─ ElevenLabs eleven_v3  (primary, full text)
-                                    ├─ Edge TTS  (per-segment, native zh/en voices — first fallback)
-                                    ├─ OpenAI TTS tts-1-hd  (paid network fallback)
-                                    ├─ macOS `say`  (per-segment, offline last resort)
+                                └─ speak() / _synthesize()
+                                    ├─ TTS_ORDER (configurable, default shown):
+                                    │   ├─ ElevenLabs eleven_v3  (full text)
+                                    │   ├─ Edge TTS  (per-segment, native zh/en voices)
+                                    │   ├─ OpenAI TTS tts-1-hd  (paid network fallback)
+                                    │   └─ macOS `say`  (per-segment, offline last resort — always kept)
                                     ├─ ffmpeg → 24 kHz mono PCM int16
                                     ├─ software volume attenuation
                                     └─ sounddevice.play()  (CoreAudio output)

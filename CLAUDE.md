@@ -1,11 +1,21 @@
 # CLAUDE.md — RealTimeTalk (Mac fork)
 
 - Two version-locked forks: this one (Mac, `sounddevice`/PortAudio,
-  ElevenLabs → Edge → OpenAI → `say` TTS chain) and the Pi fork
-  (github.com/w2ayz/openclaw-RealTimeTalk, PipeWire/Piper). Bump
-  `__version__` in `RealTimeTalk-daemon.py` and add matching CHANGELOG
-  entries in both when a fix or feature applies to both fork — port by
-  adapting to each fork's idioms, not by cherry-picking the diff.
+  default ElevenLabs → Edge → OpenAI → `say` TTS chain) and the Pi fork
+  (github.com/w2ayz/openclaw-RealTimeTalk, PipeWire/Piper — `piper` takes
+  `say`'s place as the last-resort entry there). Bump `__version__` in
+  `RealTimeTalk-daemon.py` and add matching CHANGELOG entries in both when a
+  fix or feature applies to both fork — port by adapting to each fork's
+  idioms, not by cherry-picking the diff. As of v3.23.0 the TTS order is
+  user-configurable (`rtt_tts_config.json`'s `"order"`, resolved once at
+  startup into `TTS_ORDER` — see `_resolve_tts_order()`), and STT is
+  optional (`rtt_stt_config.json`'s `"provider": "none"`, or simply no
+  OpenAI/Gemini key at all, resolves to `STT_ENGINE_NONE` — TTS-only, no
+  mic/wake-word session; `/speak` still works). Both are set via
+  `RealTimeTalk-configure.sh` (re-runnable anytime) or the installer's §4,
+  which now just calls into `RealTimeTalk-config-lib.sh`'s
+  `run_stt_setup`/`run_tts_setup`/`run_vocabulary_setup` — this concept
+  still needs porting to the Pi fork.
 
 - Bash 3.2 (macOS system bash) in the install/toggle scripts: no
   `declare -A`, no `${var,,}`, and `"${ARR[@]}"` on an empty array trips
