@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.22.11"
+__version__ = "3.22.12"
 
 import argparse
 import asyncio
@@ -40,6 +40,7 @@ import logging
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -125,7 +126,11 @@ EDGE_TTS_TIMEOUT  = 8.0
 # macOS `say` — offline fallback. Voices are pre-installed on macOS.
 SAY_VOICE_EN      = "Samantha"
 SAY_VOICE_ZH      = "Tingting"
-FFMPEG_CMD        = "/opt/homebrew/bin/ffmpeg"
+FFMPEG_CMD        = (
+    shutil.which("ffmpeg")
+    or next((p for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")
+             if os.path.exists(p)), "ffmpeg")
+)
 
 OPENAI_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
 OPENAI_WS_URL     = "wss://api.openai.com/v1/realtime?intent=transcription"
@@ -2040,6 +2045,14 @@ def _resolve_provider_api_key(cfg: dict, provider: str) -> str:
         for part in [p for p in key.get("id", "").split("/") if p]:
             secrets = secrets[part]
         key = secrets
+    if isinstance(key, str) and key.startswith("keychain:"):
+        parts   = key.split(":", 2)
+        service = parts[1] if len(parts) > 1 else ""
+        account = parts[2] if len(parts) > 2 else "default"
+        key = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
     # store SecretRef: the named secret may live in the environment, at the
     # top level of any configured file-based secrets provider, or under that
     # provider's providers.<name>.apiKey subtree.
@@ -8081,14 +8094,14 @@ async def main(http_port: int, input_device=None, output_device=None,
             # have to guess, and it used to hardcode "OpenAI", misreporting
             # every Gemini wake (contradicted one line later by the session's
             # own "Connecting to Gemini STT service…" log).
-            _woke_from_sleep = True
             _log_entry("system", "Reconnecting…")
+            _woke_from_sleep = True
 
         engine_name = _resolve_stt_engine(openai_key, gemini_key)
         _active_stt_engine[0] = engine_name   # dashboard #dp shows the real engine, not just the CLI flag
         if _woke_from_sleep:
-            log.info("Wake signal received — connecting to the %s STT engine…",
-                      engine_name.upper())
+            log.info("Wake received — connecting to the %s STT engine…",
+                     engine_name.upper())
         if engine_name == STT_ENGINE_GEMINI:
             if not gemini_key:
                 log.error("Gemini STT requested but no Gemini API key configured")

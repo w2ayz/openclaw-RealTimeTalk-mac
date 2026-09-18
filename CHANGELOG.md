@@ -1,37 +1,40 @@
 # Changelog
 
-## [3.22.11] — 2026-09-17
+## [3.22.12] — 2026-09-17
 
-### Fixed
+### Notes — branch reconciliation
 
-- **Wake log line named the actual STT engine, not a hardcoded "OpenAI".**
-  Every wake from sleep printed `Wake received — reconnecting to
-  OpenAI…` regardless of which engine was actually configured, so a
-  Gemini session showed a wake log directly contradicted one line later
-  by `Connecting to Gemini STT service…`. The message now emits after
-  `_resolve_stt_engine()` has run, using the resolved engine name. Ported
-  from the Pi fork's v3.22.7 (`5aa6c1a`), which had explicitly noted
-  "Mac fork still hardcodes this line."
+`feat/gemini-stt-engine` (this session's working branch, PR #3) had
+already been merged into `main` at v3.22.3 — unnoticed all session, since
+nothing here ever checked. After that merge, `main` moved forward
+independently with its own v3.22.4 (language-gate log level) and v3.22.5
+(wake-log engine naming) — **both functionally identical to fixes this
+session separately ported from the Pi fork under the same intent**, one
+of them even colliding on the exact version number "3.22.4" with
+completely different content on each side. `main` also carried two older
+fixes (`bcb0287` keychain `SecretRef` resolution, `8f8b372` ffmpeg
+runtime path lookup) this branch never had, because the branch forked
+before they were merged.
 
-- **Language-gate drop messages now log at `info`, not `debug`.** A
-  transcript dropped by the EN/ZH gate or the whitelist gate was
-  invisible at default log level — the symptom was an utterance that
-  passed the owner check and then drew no reply, indistinguishable from
-  the agent simply ignoring you. Ported from the Pi fork's v3.22.9
-  (`bbeb9a4`) — that commit's own message claimed this had "already been
-  ported to the Mac fork as v3.22.4," which turned out not to be true;
-  Mac's code still had `log.debug` on both lines until this commit.
+This entry is the result of merging `origin/main` into this branch,
+resolving the conflicts, and renumbering everything after the
+already-shipped `main` v3.22.4/v3.22.5 so no version number is reused for
+different content. The former "v3.22.11" entry (wake-log + language-gate
+log level, "ported from the Pi fork") is removed from this file — it
+described the same fixes `main` had already shipped one day earlier under
+v3.22.4/v3.22.5; see those entries below for the real history. Going
+forward, work happens on `main` directly.
 
-### Notes — version-lock restoration
+## [3.22.9] — 2026-09-17
 
-The two forks drifted out of lockstep (Mac stalled at v3.22.5 while a
-separate session pushed the Pi fork directly to origin through v3.22.10,
-including an independent fix for the same `load_gemini_key` bug this
-session had also found — see the Pi fork's v3.22.6/`80265e5`, and
-[[rtt-forks]] for how that reconciliation went). Checked all six
-intervening Pi commits (`2d6a7e6..60c6390`) for Mac applicability:
+### Notes — Pi fork version-lock check
 
-- **Ported** (above): wake-log engine naming, language-gate log level.
+Checked all six Pi-fork commits between `2d6a7e6` and `60c6390` for Mac
+applicability (see [[rtt-forks]]):
+
+- **Already covered**: the Pi's v3.22.7 (wake-log engine naming) and
+  v3.22.9 (language-gate log level) fixes are the same ones `main`
+  independently shipped as v3.22.5 and v3.22.4 above — no further action.
 - **Already present, no port needed**: the Pi's v3.22.8 EN/ZH
   punctuation-gate fix was itself a port *from* this fork (its own commit
   message says so, byte-identical); the Pi's v3.22.10 ElevenLabs
@@ -39,33 +42,10 @@ intervening Pi commits (`2d6a7e6..60c6390`) for Mac applicability:
   already used.
 - **Pi-only, not applicable**: v3.22.6's `load_gemini_key` fix — this
   fork never had that bug (it's always had `load_gemini_key()` defined).
-- **Already handled separately**: the `.claude/` gitignore policy
-  (v3.22.7 on this fork, ported from the Pi's `60c6390`).
+- **Already handled**: the `.claude/` gitignore policy below (v3.22.8)
+  independently matches the Pi's `60c6390`.
 
-Version bumped straight to 3.22.11 (skipping 3.22.8–3.22.10) to match the
-Pi fork's tip, rather than renumbering — both forks' CHANGELOGs stay
-internally consistent with what actually shipped under each number.
-
-## [3.22.7] — 2026-09-17
-
-### Changed
-
-- **`.claude/` is now fully gitignored, not just `settings.local.json`.**
-  This repo is public, and `.claude/` can hold session artifacts
-  (transcripts, `EnterWorktree` worktrees, scratch scripts) that must
-  never be committed — a blanket `git add -A` is the failure mode this
-  guards against, and it very nearly happened on the Pi fork. The
-  `.claude/settings.json` PreToolUse convenience hook from v3.22.6 is now
-  untracked (kept locally, on disk, for anyone who wants it — Claude Code
-  reads project settings from the filesystem regardless of git tracking
-  status) rather than distributed via clone. The pre-commit gate itself
-  is unaffected: `.githooks/pre-commit` + `git config core.hooksPath
-  .githooks` needs nothing under `.claude/` to work — that one-time
-  `git config` command per clone is now a manual step (CLAUDE.md updated
-  to say so plainly, since v3.22.6's "opening this repo in Claude Code
-  does that automatically" claim no longer holds).
-
-## [3.22.6] — 2026-09-17
+## [3.22.8] — 2026-09-17
 
 ### Added
 
@@ -83,20 +63,18 @@ internally consistent with what actually shipped under each number.
     a hit — verified against the actual historical bug content: it flags
     both incidents above. Activate once per clone with
     `git config core.hooksPath .githooks` (this file is tracked, unlike
-    `.git/hooks/`, so it survives every clone — the manual activation
-    step is git's own limitation, not this repo's).
-  - `.claude/settings.json` (repo-level, committed) adds a matching
-    `PreToolUse` hook so a Claude Code session rooted at this repo gets
-    the same check *before* attempting `git commit`, and self-activates
-    `core.hooksPath` on first use — no manual step needed inside Claude
-    Code specifically.
+    `.git/hooks/`, so it survives every clone).
+  - `.claude/` is fully gitignored — this repo is public, and `.claude/`
+    can hold session artifacts (transcripts, `EnterWorktree` worktrees,
+    scratch scripts) that must never be committed. A `.claude/settings.json`
+    `PreToolUse` convenience hook is fine to keep locally/untracked, but
+    never staged. `git config core.hooksPath .githooks` is therefore a
+    manual, one-time step per clone — CLAUDE.md says so plainly.
   - `CLAUDE.md` documents the two-fork version-lock convention, the bash
     3.2 gotchas in the install scripts, why the hook exists, and how to
     verify runtime behavior in the absence of a real test suite.
-  - `.gitignore` gained `.claude/settings.local.json` (personal overrides
-    only — `.claude/settings.json` itself is meant to be shared/committed).
 
-## [3.22.5] — 2026-09-16
+## [3.22.7] — 2026-09-16
 
 ### Changed
 
@@ -114,7 +92,7 @@ internally consistent with what actually shipped under each number.
   - Existing keys prompt "Enter to keep, or paste a replacement", so re-running
     the installer never forces a re-entry.
   - The engine choice goes to `~/.openclaw/workspace/rtt_stt_config.json`
-    (v3.22.4's daemon-owned file); the installer never writes `talk.stt` to
+    (v3.22.6's daemon-owned file); the installer never writes `talk.stt` to
     `openclaw.json`. Exits with dual-provider instructions if neither key ends
     up configured.
 - Deployment.md: §1 prerequisite now lists "OpenAI **and/or** Gemini";
@@ -123,7 +101,7 @@ internally consistent with what actually shipped under each number.
   resolution order + fallback semantics: boot-time, not live failover);
   §4 installer step list matches the new prompt flow.
 
-## [3.22.4] — 2026-09-15
+## [3.22.6] — 2026-09-15
 
 ### Changed
 
@@ -139,7 +117,46 @@ internally consistent with what actually shipped under each number.
 - Resolution priority is unchanged: CLI `--stt-engine` > daemon config file >
   legacy `openclaw.json` `talk.stt` (still read for unmigrated configs) >
   key-availability auto > openai. The custom-vocabulary loader uses the same
-  source chain. (Pi fork ports the same change in v3.22.4.)
+  source chain. (Pi fork ports the same change, its own v3.22.4.)
+
+## [3.22.5] — 2026-09-16
+
+### Fixed
+
+- **Wake log line named the actual STT engine.** It hardcoded
+  "reconnecting to OpenAI" (predates the Gemini engine), so a Gemini session
+  waking from auto-sleep logged a false `reconnecting to OpenAI`. The line is
+  no longer emitted from the sleep block — naming a provider there would have
+  to guess — and is instead emitted after `_resolve_stt_engine()` has run, so
+  it reports the engine actually about to be connected. A new loop-local
+  `_woke_from_sleep` carries the "we just woke" fact across to that point.
+  The Mac-only `_log_entry("system", "Reconnecting…")` portal event is
+  unchanged.
+
+### Notes
+
+- Log-text change only; no behaviour difference. Ports the Pi fork's v3.22.7
+  fix, adapted to this fork's sleep loop (`_sleep_requested` / `_is_sleeping`
+  rather than the Pi's `_idle_disconnected`), and keeps this fork's wording
+  ("Wake received —" vs the Pi's "Wake signal received —").
+
+## [3.22.4] — 2026-09-16
+
+### Changed
+
+- **Language-gate rejections now log at `info`, not `debug`.** A transcript
+  dropped by the EN/ZH gate or the whitelist gate was invisible in the journal
+  at default log level, so the symptom was an utterance that passed the owner
+  check and then simply drew no reply — indistinguishable from the agent
+  ignoring you. Both drop paths now report at `info`; the message text is
+  unchanged, and there is no behavioural change. This is exactly the failure
+  mode that hid the Pi fork's Chinese-punctuation bug for so long (Pi v3.22.8):
+  the gate was discarding every Chinese sentence containing `？` `。` `，` `！`,
+  and nothing was logged to say so.
+
+### Notes
+
+- Log-level change only; no behaviour difference. Ported to the Pi as v3.22.9.
 
 ## [3.22.3] — 2026-09-15
 
