@@ -1,5 +1,25 @@
 # Changelog
 
+## [3.22.16] — 2026-09-17
+
+### Changed
+
+- **`_split_sentences` now also breaks on line breaks, ':', and ';'** —
+  previously it only split on `.!?`/`。！？`, so a `/speak`-pushed bullet
+  list (newline-separated, no periods between items) was queued to
+  ElevenLabs as a single oversized chunk. Confirmed live: a 4-item news
+  bullet list rendered as one ~19s ElevenLabs call producing 59.7s of
+  audio, versus 8-10s for normal single-sentence chunks. New
+  `_CHUNK_BOUND_RE` (used only by `_split_sentences`, not by
+  `_last_sentence_boundary`/`_release_point` — those still decide when
+  live-streamed text is safe to release, a separate question from how a
+  released region gets sliced for TTS) adds `\n+`, and `:`/`;`/`：`/`；`
+  reusing `_is_fake_boundary`'s digit-adjacency guard so clock times
+  ("4:20") and ratios ("3:1") aren't split mid-number — verified against
+  the actual news text (splits per bullet, colon-led intro/closing
+  clauses split correctly) and against time/ratio/numbered-list/URL edge
+  cases.
+
 ## [3.22.15] — 2026-09-17
 
 ### Changed

@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.22.15"
+__version__ = "3.22.16"
 
 import argparse
 import asyncio
@@ -2677,18 +2677,50 @@ def _last_clause_boundary(text: str) -> int:
     m = list(re.finditer(r'[,;，；——…\n]+[\s"\'”’]?', text))
     return m[-1].end() if m else 0
 
+# Chunk boundaries for _split_sentences — a superset of _SENT_BOUND_RE that also
+# breaks on ':'/';' (list-intro colons, clause-separating semicolons) and line
+# breaks, so a bullet list or long colon-led clause doesn't get queued as one
+# oversized TTS call. Deliberately NOT used by _last_sentence_boundary/
+# _release_point — those decide when live-streamed text is safe to release at
+# all, which is a different question from how a released region gets sliced
+# into TTS-call-sized pieces.
+_CHUNK_BOUND_RE = re.compile(
+    r'[.!?]+[\'"’”)\]}】」』]?(?:\s+|$)'
+    r'|[。！？][\'"’”)\]}】」』]?(?=\S|$)'
+    r'|[:;][\'"’”)\]}】」』]?(?:\s+|$)'
+    r'|[：；][\'"’”)\]}】」』]?(?=\S|$)'
+    r'|\n+'
+)
+
+def _is_fake_chunk_boundary(text: str, m) -> bool:
+    """_is_fake_boundary, plus: a line-break match is always a real boundary.
+
+    _is_fake_boundary's digit-after-match check exists to protect decimals
+    ("3.14") and — for ':'/';' matches — clock times ("4:20") and ratios
+    ("3:1") from being split mid-number. Applied to a line-break match it
+    would wrongly veto splitting before a numbered list item ("1. xxx"),
+    since the digit check only looks at the character *after* the match.
+    """
+    if text[m.start()] == '\n':
+        return False
+    return _is_fake_boundary(text, m)
+
 def _split_sentences(segment: str) -> list[tuple[str, int]]:
     """Split a flushed segment into [(sentence, offset_in_segment)].
 
-    The trailing partial (a segment that ends mid-sentence — happens on final()
-    of a reply with no trailing punctuation) is kept as the last chunk."""
+    Breaks on sentence-ending punctuation, ':'/';', and line breaks (see
+    _CHUNK_BOUND_RE) — so a newline-separated bullet list or a long
+    colon-led clause becomes several TTS-call-sized chunks instead of one.
+    The trailing partial (a segment that ends mid-sentence — happens on
+    final() of a reply with no trailing punctuation) is kept as the last
+    chunk."""
     parts: list[tuple[str, int]] = []
     last = 0
-    for m in _SENT_BOUND_RE.finditer(segment):
+    for m in _CHUNK_BOUND_RE.finditer(segment):
         e = m.end()
         if e >= len(segment):
             break
-        if _is_fake_boundary(segment, m):
+        if _is_fake_chunk_boundary(segment, m):
             continue
         chunk = segment[last:e].strip()
         if chunk:
