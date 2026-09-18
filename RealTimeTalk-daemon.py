@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.22.18"
+__version__ = "3.22.19"
 
 import argparse
 import asyncio
@@ -8471,11 +8471,17 @@ if __name__ == "__main__":
              _device_label(_selected_input_device[0]),
              _device_label(_selected_output_device[0]),
              MIC_GAIN, MIC_GATE_PEAK)
-    if load_openai_key() and MIC_GATE_PEAK <= 80:
-        log.warning("Noise gate (%d) looks uncalibrated. OpenAI's gpt-live-transcribe "
-                     "has no server-side voice detection (turn_detection: null) -- this "
-                     "gate is the ONLY signal deciding when you've stopped talking. If "
-                     "OpenAI transcripts never finalize (mic seems to 'hang open'), run "
+    # Only warn when nobody ever passed --mic-gate at all — a value <= 80
+    # isn't necessarily wrong (a genuinely quiet room can calibrate lower
+    # than that), so compare presence-on-the-command-line rather than the
+    # resulting number, or a real calibrated value would falsely trip this.
+    _mic_gate_explicit = any(a == "--mic-gate" or a.startswith("--mic-gate=") for a in sys.argv)
+    if load_openai_key() and not _mic_gate_explicit:
+        log.warning("Noise gate (%d) is the compiled-in default -- never calibrated for "
+                     "this room/mic. OpenAI's gpt-live-transcribe has no server-side voice "
+                     "detection (turn_detection: null) -- this gate is the ONLY signal "
+                     "deciding when you've stopped talking. If OpenAI transcripts never "
+                     "finalize (mic seems to 'hang open'), run "
                      "'RealTimeTalk-daemon.py --calibrate' for this room/mic and restart "
                      "with the recommended --mic-gate.", MIC_GATE_PEAK)
 

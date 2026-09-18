@@ -1,5 +1,21 @@
 # Changelog
 
+## [3.22.19] — 2026-09-18
+
+### Fixed
+
+- **v3.22.18's uncalibrated-gate warning could false-positive on a
+  genuinely calibrated setup.** It compared `MIC_GATE_PEAK <= 80`, but
+  this machine's own LaunchAgent already passes an explicitly
+  calibrated `--mic-gate 64` — a real, working value below the
+  threshold, which would have logged a spurious "looks uncalibrated"
+  warning on the very next restart. Caught before restarting to pick
+  up v3.22.18. Now checks whether `--mic-gate` was ever passed on the
+  command line at all (`sys.argv`), not the resulting number — a low
+  value from real calibration is not a problem; only the untouched
+  compiled-in default is. Ported the same fix to the Pi fork's two
+  raw-signal-path warnings.
+
 ## [3.22.18] — 2026-09-18
 
 ### Fixed
