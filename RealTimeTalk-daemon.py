@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.22.14"
+__version__ = "3.22.15"
 
 import argparse
 import asyncio
@@ -88,7 +88,7 @@ _openai_tts_key: list = [""]      # set from openai_key in main()
 # ElevenLabs TTS — primary voice engine for all assistant replies.
 ELEVENLABS_VOICE_ID = "pFZP5JQG7iQjIQuC4Bku"   # "Lily - Velvety Actress"
 ELEVENLABS_MODEL    = "eleven_v3"
-ELEVENLABS_TIMEOUT  = 15.0
+ELEVENLABS_TIMEOUT  = 30.0
 _elevenlabs_tts_key: list = [""]  # set from load_elevenlabs_key() in main()
 
 # Edge TTS skill — first TTS fallback after ElevenLabs. Free, no API key, and

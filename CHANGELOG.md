@@ -1,5 +1,20 @@
 # Changelog
 
+## [3.22.15] — 2026-09-17
+
+### Changed
+
+- **`ELEVENLABS_TIMEOUT` raised 15s → 30s.** Observed live: a news-brief
+  chunk mixing English proper nouns into Chinese text took ElevenLabs
+  >15s to render and hit the timeout, dropping that one chunk to the
+  Edge TTS fallback — which, unlike ElevenLabs' single-voice multilingual
+  `eleven_v3` rendering, must split mixed-script text into separate
+  zh/en segments and alternate voices per segment. That produced an
+  audible voice switch mid-reply. Successful ElevenLabs calls the same
+  session were already taking up to ~13s, so 15s was cutting it close
+  for longer chunks; 30s gives headroom before falling through to a
+  fallback engine that can't preserve one voice across languages.
+
 ## [3.22.14] — 2026-09-17
 
 ### Changed
