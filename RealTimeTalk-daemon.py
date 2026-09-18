@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.23.0"
+__version__ = "3.23.1"
 
 import argparse
 import asyncio
@@ -1911,8 +1911,19 @@ _WAKE_CONFIRM_AFFIRM = {
 _WAKE_CONFIRM_TIMEOUT = 15.0  # seconds to wait for confirmation before treating as mis-fire
 
 MONITOR_ON_PHRASES  = {
-    "zeebot start monitoring", "start monitoring", "zeebot monitor on",
-    "monitor on", "zeebot monitoring on", "monitoring on",
+    # "zeebot monitor on" / "zeebot monitoring on" deliberately excluded:
+    # _matches_phrase's fuzzy pass needs only 60% of a phrase's words, so a
+    # 3-word phrase where one word is the agent's name (present in nearly
+    # every utterance) and another is "on" (an extremely common word)
+    # cleared the bar on ANY sentence containing both — e.g. "what's ON
+    # your keyword list?" — without "monitor"/"monitoring" being said at
+    # all. Confirmed live: this fired on real questions with no monitoring
+    # intent, immediately switching mode (unlike WAKE_PHRASES' equally
+    # loose fuzzy match, which is safe because it's gated by a confirmation
+    # step). The standalone "monitor on"/"monitoring on" below still catch
+    # the exact phrase, just requiring both of ITS two words present.
+    "zeebot start monitoring", "start monitoring",
+    "monitor on", "monitoring on",
     "start monitor", "zeebot start monitor",
     "begin monitoring", "begin monitor", "zeebot begin monitoring",
     "turn on monitoring", "turn monitoring on", "enable monitoring",
@@ -1920,8 +1931,10 @@ MONITOR_ON_PHRASES  = {
     "monitor please", "please start monitoring", "please monitor",
 }
 MONITOR_OFF_PHRASES = {
-    "zeebot stop monitoring", "stop monitoring", "zeebot monitor off",
-    "monitor off", "zeebot monitoring off", "monitoring off",
+    # "zeebot monitor off" / "zeebot monitoring off" excluded — same reason
+    # as MONITOR_ON_PHRASES above (agent name + "off" is enough to false-fire).
+    "zeebot stop monitoring", "stop monitoring",
+    "monitor off", "monitoring off",
     "stop monitor", "zeebot stop monitor",
     "end monitoring", "end monitor", "zeebot end monitoring",
     "turn off monitoring", "turn monitoring off", "disable monitoring",
@@ -2032,6 +2045,25 @@ def _normalize(text: str) -> str:
     t = re.sub(r'\b5\b', '5', t)  # no numeric shorthand for Zeebot
     return " ".join(t.split())
 
+def _matches_phrase_exact(transcript: str, phrases: set) -> bool:
+    """True if the transcript contains any trigger phrase as a literal substring
+    after normalisation — no fuzzy word-overlap pass.
+
+    Use this (not _matches_phrase) for any command that fires immediately with
+    no confirmation step and no fallback to normal agent routing on a false
+    positive — sleep, monitoring on/off, owner-only on/off, continue. Confirmed
+    live: _matches_phrase's 60%-of-the-PHRASE's-words fuzzy pass false-fired
+    on ordinary questions (e.g. "what's ON your keyword list?" matched a
+    3-word monitor-on phrase via "zeebot" + "on" alone, "monitor"/"monitoring"
+    never said) and hijacked the turn — unlike WAKE_PHRASES, whose equally
+    loose fuzzy match is safe because it's gated by a "Yes?" confirmation.
+    """
+    t = _normalize(transcript)
+    for phrase in phrases:
+        if _normalize(phrase) in t:
+            return True
+    return False
+
 def _matches_phrase(transcript: str, phrases: set) -> bool:
     """True if the transcript contains any trigger phrase, or is a fuzzy word-overlap match.
 
@@ -2039,6 +2071,10 @@ def _matches_phrase(transcript: str, phrases: set) -> bool:
     1. Exact substring after normalisation.
     2. Fuzzy: if the transcript shares ≥ 60% of a phrase's words it counts as a match
        (handles car-noise garbling like 'zeebot wake up' → 'zeebot break up').
+
+    Only safe for phrase sets where a false positive is cheap to recover from
+    — currently just WAKE_PHRASES, gated by a confirmation step right after.
+    Everything else uses _matches_phrase_exact (see its docstring for why).
     """
     t = _normalize(transcript)
     for phrase in phrases:
@@ -4855,7 +4891,7 @@ class BaseVoiceSession:
             return
 
         # Sleep phrase — only meaningful when active
-        if _matches_phrase(normalized, SLEEP_PHRASES):
+        if _matches_phrase_exact(normalized, SLEEP_PHRASES):
             if self._active:
                 self._active = False
                 _persist_active[0] = False
@@ -4891,13 +4927,13 @@ class BaseVoiceSession:
         _has_monitor = bool(_norm_words & {"monitor", "monitoring"})
         _start_words = {"start", "starting", "begin", "beginning", "on", "enable",
                         "activate", "please", "turn", "star"}  # "star" = common mishear of "start"
-        _stop_words  = {"stop", "end", "off", "disable", "deactivate"}
+        _stop_words  = {"stop", "stopping", "end", "ending", "off", "disable", "deactivate"}
         _monitor_on  = (_has_monitor
                         and not bool(_norm_words & _stop_words)
                         and (bool(_norm_words & _start_words) or len(_norm_words) <= 3))
         _monitor_off = (_has_monitor and bool(_norm_words & _stop_words))
 
-        if _matches_phrase(normalized, MONITOR_ON_PHRASES) or _monitor_on:
+        if _matches_phrase_exact(normalized, MONITOR_ON_PHRASES) or _monitor_on:
             if not self._monitoring:
                 self._monitoring = True
                 _persist_monitoring[0] = True
@@ -4907,7 +4943,7 @@ class BaseVoiceSession:
                     None, speak, "Monitoring started.", self.alsa_output
                 )
             return
-        if _matches_phrase(normalized, MONITOR_OFF_PHRASES) or _monitor_off:
+        if _matches_phrase_exact(normalized, MONITOR_OFF_PHRASES) or _monitor_off:
             if self._monitoring:
                 self._monitoring = False
                 _persist_monitoring[0] = False
@@ -4919,7 +4955,7 @@ class BaseVoiceSession:
             return
 
         # Owner-only mode toggles — already owner-gated by _verify_speaker above
-        if _matches_phrase(normalized, OWNER_ONLY_ON_PHRASES):
+        if _matches_phrase_exact(normalized, OWNER_ONLY_ON_PHRASES):
             if not _owner_profiles:
                 await asyncio.get_running_loop().run_in_executor(
                     None, speak,
@@ -4944,7 +4980,7 @@ class BaseVoiceSession:
                         "anyone on it until you add one.",
                         self.alsa_output)
             return
-        if _matches_phrase(normalized, OWNER_ONLY_OFF_PHRASES):
+        if _matches_phrase_exact(normalized, OWNER_ONLY_OFF_PHRASES):
             if _owner_only[0]:
                 _owner_only[0] = False
                 _save_voice_mode()
@@ -4999,7 +5035,7 @@ class BaseVoiceSession:
             return
 
         # Continue phrase — resume paused TTS (from where it was cut off) without asking Zeebot
-        if _matches_phrase(normalized, CONTINUE_PHRASES):
+        if _matches_phrase_exact(normalized, CONTINUE_PHRASES):
             saved = _paused_speech[0]
             if saved:
                 _paused_speech[0] = None  # clear before speak() re-enters, or its own
@@ -8465,11 +8501,15 @@ if __name__ == "__main__":
                      "real time talk off", "real-time talk off", "realtimetalk off"}
 
     _n = _agent_name_lc
+    # "{name} monitor on"/"{name} monitoring on" (and off) deliberately
+    # excluded here too — see the false-fire note on MONITOR_ON_PHRASES'
+    # definition above; regenerating them per agent-name would silently
+    # reintroduce the bug for any name.
     MONITOR_ON_PHRASES  = ({p for p in MONITOR_ON_PHRASES  if not p.startswith("zeebot ")} |
-                           {f"{_n} start monitoring", f"{_n} monitor on", f"{_n} monitoring on",
+                           {f"{_n} start monitoring",
                             f"{_n} start monitor",    f"{_n} begin monitoring"})
     MONITOR_OFF_PHRASES = ({p for p in MONITOR_OFF_PHRASES if not p.startswith("zeebot ")} |
-                           {f"{_n} stop monitoring",  f"{_n} monitor off", f"{_n} monitoring off",
+                           {f"{_n} stop monitoring",
                             f"{_n} stop monitor",     f"{_n} end monitoring"})
     CONTINUE_PHRASES       = {p for p in CONTINUE_PHRASES       if p != "zeebot continue"}       | {f"{_n} continue"}
     OWNER_ONLY_ON_PHRASES  = {p for p in OWNER_ONLY_ON_PHRASES  if p != "zeebot only listen to me"}  | {f"{_n} only listen to me"}

@@ -1,5 +1,38 @@
 # Changelog
 
+## [3.23.1] — 2026-09-18
+
+### Fixed
+
+- **Fuzzy voice-command matching false-fired on ordinary questions,
+  hijacking the turn.** Reported live: asking "what's on your keyword
+  list?" triggered "monitoring ON" instead of being answered.
+  `_matches_phrase`'s fuzzy pass only requires 60% of a *phrase*'s words to
+  appear in the transcript — for short phrases where one word is the agent
+  name (in nearly every utterance) and another is a common word ("on",
+  "off", "start", "stop", "please", "to"), any unrelated sentence
+  containing both cleared the bar without the actual command word
+  ("monitor"/"monitoring"/"sleep"/etc.) ever being said. Confirmed on a
+  wider audit than the original report: also false-fired
+  `MONITOR_ON`/`MONITOR_OFF` on "turn on/off the porch light", "start a
+  timer", "please stop what you're doing", "begin the meeting", "the game
+  end[ed]"; `SLEEP_PHRASES` (worst case — silences the daemon with no
+  confirmation and no fallback) on "go to the store website...", "go to
+  sleep mode settings..."; and `OWNER_ONLY_ON_PHRASES` on "get that book
+  to me...".
+  Added `_matches_phrase_exact()` (substring-only, no fuzzy pass) and
+  switched every phrase set that fires immediately with no confirmation
+  step — `SLEEP_PHRASES`, `MONITOR_ON/OFF_PHRASES`,
+  `OWNER_ONLY_ON/OFF_PHRASES`, `CONTINUE_PHRASES` — to use it.
+  `WAKE_PHRASES` keeps the fuzzy `_matches_phrase` (verified still working:
+  "zeebot break up" still fuzzy-matches "zeebot wake up") since a false
+  wake is cheap — it only asks "Yes?" and self-corrects on no reply.
+- Also fixed while auditing: the separate `_monitor_on`/`_monitor_off`
+  ASCII-normalization heuristic's `_stop_words` was missing "stopping"
+  (and "ending", added for symmetry with "starting" already being in
+  `_start_words`) — "stopping monitoring" would have incorrectly turned
+  monitoring **on** instead of off.
+
 ## [3.23.0] — 2026-09-18
 
 ### Added

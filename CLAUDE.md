@@ -14,8 +14,23 @@
   mic/wake-word session; `/speak` still works). Both are set via
   `RealTimeTalk-configure.sh` (re-runnable anytime) or the installer's §4,
   which now just calls into `RealTimeTalk-config-lib.sh`'s
-  `run_stt_setup`/`run_tts_setup`/`run_vocabulary_setup` — this concept
-  still needs porting to the Pi fork.
+  `run_stt_setup`/`run_tts_setup`/`run_vocabulary_setup` — ported to the Pi
+  fork in v3.23.0 too (adapted: TTS order applies uniformly to all text
+  there, not just Chinese/mixed, and its ElevenLabs key moved off a flat
+  secrets file onto `talk.providers.elevenlabs.apiKey`, same as here).
+
+- **Voice-command phrase matching: `_matches_phrase`'s fuzzy pass is only
+  safe for `WAKE_PHRASES`.** It counts a match at ≥60% of a *phrase*'s
+  words present anywhere in the transcript — fine for wake, which asks
+  "Yes?" and self-corrects on a false positive, but every other phrase set
+  (`SLEEP_PHRASES`, `MONITOR_ON/OFF_PHRASES`, `OWNER_ONLY_ON/OFF_PHRASES`,
+  `CONTINUE_PHRASES`) fires immediately with no confirmation. Confirmed
+  live in v3.23.1: short phrases combining the agent name (in nearly every
+  utterance) with one common word ("on", "start", "to") false-fired on
+  ordinary questions — "what's on your keyword list?" → monitoring ON;
+  "go to the store website" → sleep (worst case: silences the daemon, no
+  fallback). Use `_matches_phrase_exact()` (substring-only) for any new
+  phrase set unless it has its own confirmation gate like wake's.
 
 - Bash 3.2 (macOS system bash) in the install/toggle scripts: no
   `declare -A`, no `${var,,}`, and `"${ARR[@]}"` on an empty array trips
