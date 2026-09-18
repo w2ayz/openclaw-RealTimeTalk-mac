@@ -314,6 +314,32 @@ bold "Available CoreAudio devices:"
 echo
 
 read -r -p "Input device index  [Enter for system default]: " IN_DEV
+
+echo
+echo "  OpenAI's realtime STT (gpt-live-transcribe) has no server-side voice"
+echo "  detection anymore — this daemon's own noise gate is now the ONLY"
+echo "  signal deciding when you've stopped talking. Too low (the compiled-in"
+echo "  default is just a rough starting point) and background/fan noise"
+echo "  reads as 'speech' forever, so OpenAI transcripts never finalize."
+MIC_GATE_ARG=""
+read -r -p "  Run mic calibration now (~3s of quiet)? [Y/n]: " RUN_CAL
+if [[ ! "$RUN_CAL" =~ ^[Nn] ]]; then
+    CAL_ARGS=()
+    [[ -n "$IN_DEV" ]] && CAL_ARGS+=("--input-device" "$IN_DEV")
+    CAL_OUT="$("$VENV_PY" "$DAEMON_PY" --calibrate "${CAL_ARGS[@]+"${CAL_ARGS[@]}"}" 2>&1)" || CAL_OUT=""
+    echo "$CAL_OUT"
+    MIC_GATE_ARG="$(echo "$CAL_OUT" | grep -oE 'recommended MIC_GATE_PEAK: [0-9]+' | grep -oE '[0-9]+' || true)"
+    if [[ -n "$MIC_GATE_ARG" ]]; then
+        green "  ✓ noise gate calibrated → --mic-gate $MIC_GATE_ARG"
+    else
+        yellow "  → could not read a recommended value — keeping the default. Calibrate later with:"
+        yellow "    $DAEMON_PY --calibrate [--input-device N]"
+    fi
+else
+    yellow "  → Skipped. If OpenAI transcripts don't finalize (mic seems to 'hang open'),"
+    yellow "    calibrate later with: $DAEMON_PY --calibrate [--input-device N]"
+fi
+echo
 read -r -p "Output device index [Enter for system default]: " OUT_DEV
 while true; do
     read -r -p "Agent name          [Enter for default 'Zeebot']: " AGENT_NAME_ARG
@@ -361,6 +387,7 @@ if [[ -n "$IN_DEV" ]];         then EXTRA_ARGS+=("--input-device"  "$IN_DEV");  
 if [[ -n "$OUT_DEV" ]];        then EXTRA_ARGS+=("--output-device" "$OUT_DEV");        fi
 if [[ -n "$AGENT_NAME_ARG" ]]; then EXTRA_ARGS+=("--agent-name"    "$AGENT_NAME_ARG"); fi
 if [[ -n "$WAKE_PHRASE_ARG" ]]; then EXTRA_ARGS+=("--wake-phrase"  "$WAKE_PHRASE_ARG"); fi
+if [[ -n "$MIC_GATE_ARG" ]];   then EXTRA_ARGS+=("--mic-gate"      "$MIC_GATE_ARG");    fi
 
 # ── 6. Render and install LaunchAgent plist ──────────────────────────────────
 

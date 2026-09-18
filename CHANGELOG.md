@@ -1,5 +1,42 @@
 # Changelog
 
+## [3.22.18] — 2026-09-18
+
+### Fixed
+
+- **Default `MIC_GATE_PEAK` raised 20 → 80.** That value (set in the very
+  first Mac-native commit, `7737a1c`, tuned for UI/interrupt sensitivity
+  under OpenAI's then-current *server-side* VAD) sat almost exactly at
+  `MIC_GATE_MIN`'s "quietest usable room" floor. Since the move to
+  `gpt-live-transcribe` (`turn_detection: null` — no server-side VAD;
+  `OpenAIRealtimeSession` runs its own client-side speech start/stop
+  keyed off this same gate), that low a value meant ordinary room/fan
+  noise sat above the gate almost everywhere, so
+  `CLIENT_VAD_STOP_SILENCE_SECS` of continuous "silence" was never
+  reached, `input_audio_buffer.commit` never fired, and OpenAI
+  transcripts never finalized — i.e. voice transcription not working
+  out of the box on a fresh deploy. 80 is a safer *uncalibrated* floor,
+  not a substitute for real per-room calibration.
+
+### Added
+
+- **Startup warning** when an OpenAI key is configured and
+  `MIC_GATE_PEAK` is still at/below that uncalibrated floor (80),
+  pointing at `--calibrate`.
+- **Installer now offers to calibrate the mic** (`RealTimeTalk-install-
+  mac.sh`, new step in "── 5. Audio devices ──") — runs `--calibrate`
+  for the selected input device, parses the recommended value, and
+  wires it in as `--mic-gate` in the LaunchAgent args. Explains why this
+  matters now (OpenAI's removed server-side VAD) before asking.
+- Ported the awareness (not the numeric default — Pi's `MIC_GATE_PEAK
+  = 300` and `AGC_MIC_GATE = 60` already reflect deliberate reasoning
+  for this exact concern, and the AGC path is a self-normalizing
+  mechanism a Mac-style numeric bump doesn't apply to) to the Pi fork:
+  a matching startup warning on its two raw-signal paths (explicit
+  `--input-source`, and the static fallback when AGC is unavailable —
+  deliberately *not* the AGC-active path), plus a post-install note in
+  `RealTimeTalk-install-pi.sh` when an OpenAI key is configured.
+
 ## [3.22.17] — 2026-09-18
 
 ### Added

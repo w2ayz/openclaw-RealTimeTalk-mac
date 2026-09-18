@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.22.17"
+__version__ = "3.22.18"
 
 import argparse
 import asyncio
@@ -197,7 +197,20 @@ AUTO_SLEEP_SECS   = 600          # go silent after 10 min of no interaction
 # Languages accepted in multi-lang WHITELIST mode (langdetect codes + script tokens).
 MULTILANG_WHITELIST_LANGS: list = ["en", "zh-cn", "zh-tw", "zh", "ko", "ja", "es", "ms"]
 MIC_GAIN          = 5.0
-MIC_GATE_PEAK     = 20           # noise gate — pre-gain peak below this → silence
+# Pre-calibration starting point — NOT a substitute for --calibrate, which
+# measures this room's actual noise floor. 20 (its value up to v3.22.16) was
+# tuned back when this only fed the interrupt/UI-sensitivity path and OpenAI's
+# Realtime API still ran its own server-side VAD; since the move to
+# gpt-live-transcribe (turn_detection: null — see OpenAIRealtimeSession's
+# client-side VAD, ~5278), this gate is now the SOLE signal deciding when
+# OpenAI STT thinks a turn has ended. At 20 — barely above MIC_GATE_MIN's
+# "quietest usable room" floor — ordinary fan/room noise sits above the gate
+# almost everywhere, so CLIENT_VAD_STOP_SILENCE_SECS of continuous "silence"
+# is never reached, input_audio_buffer.commit never fires, and OpenAI
+# transcripts never finalize. 80 is a safer uncalibrated floor (still tiny
+# next to real speech peaks and MIC_GATE_MAX below) but every real room
+# still needs --calibrate — see the installer's calibration step.
+MIC_GATE_PEAK     = 80           # noise gate — pre-gain peak below this → silence
 MIC_GATE_MIN      = 15           # calibration clamp — quietest usable room
 MIC_GATE_MAX      = 3000         # calibration clamp — above this, use a headset
 
@@ -8458,6 +8471,13 @@ if __name__ == "__main__":
              _device_label(_selected_input_device[0]),
              _device_label(_selected_output_device[0]),
              MIC_GAIN, MIC_GATE_PEAK)
+    if load_openai_key() and MIC_GATE_PEAK <= 80:
+        log.warning("Noise gate (%d) looks uncalibrated. OpenAI's gpt-live-transcribe "
+                     "has no server-side voice detection (turn_detection: null) -- this "
+                     "gate is the ONLY signal deciding when you've stopped talking. If "
+                     "OpenAI transcripts never finalize (mic seems to 'hang open'), run "
+                     "'RealTimeTalk-daemon.py --calibrate' for this room/mic and restart "
+                     "with the recommended --mic-gate.", MIC_GATE_PEAK)
 
     # Seed fingerprint so first dashboard load doesn't falsely announce a change.
     _audio_fingerprint[0] = _get_audio_fingerprint()
