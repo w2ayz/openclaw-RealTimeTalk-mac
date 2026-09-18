@@ -7,7 +7,7 @@
 #   3. Create Python venv and install dependencies
 #   4. STT keys/engine, TTS keys/engine order, and STT vocabulary — delegated
 #      to RealTimeTalk-config-lib.sh's run_stt_setup/run_tts_setup/
-#      run_vocabulary_setup (same functions RealTimeTalk-configure.sh uses to
+#      run_vocabulary_setup (same functions RTT-Config.sh uses to
 #      re-run this later without repeating steps 1-3, 5-7)
 #   5. List audio devices and prompt user for input + output device indices,
 #      agent name, and wake phrase; optionally download the Voice ID
@@ -15,7 +15,7 @@
 #   6. Render and install the LaunchAgent plist
 #   7. Load the agent
 #
-# Re-run bash RealTimeTalk-configure.sh anytime afterward to change STT/TTS
+# Re-run bash RTT-Config.sh anytime afterward to change STT/TTS
 # keys, the TTS engine order, or the STT vocabulary without repeating this
 # whole installer.
 
@@ -114,7 +114,7 @@ echo
 # talk.stt block as a fallback source, but this installer never writes one.
 #
 # All three interview steps live in RealTimeTalk-config-lib.sh so
-# RealTimeTalk-configure.sh can re-run them later without repeating the rest
+# RTT-Config.sh can re-run them later without repeating the rest
 # of this installer.
 
 if [[ ! -f "$OPENCLAW_JSON" ]]; then

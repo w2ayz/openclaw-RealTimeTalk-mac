@@ -1,5 +1,31 @@
 # Changelog
 
+## [3.24.0] — 2026-09-18
+
+### Added
+
+- **RTT-Config button on the Calibration page**, next to Monitor — makes
+  the re-runnable configure script discoverable from the dashboard, not
+  just the docs. It can't drive the script's interactive prompts directly
+  (no way for a browser click to answer hidden-key/menu prompts), so it
+  opens a small panel with the exact `bash <absolute-path>/RTT-Config.sh`
+  command and a Copy button — same command on every install regardless of
+  where the skill lives, via the new `RTT_CONFIG_SCRIPT` module constant
+  (`os.path.dirname(os.path.abspath(__file__))`-based, same pattern the
+  DTMF launcher already used). Zero new server-side surface — pure
+  client-side JS toggling a hidden `<div>`, no new HTTP endpoint, no
+  ability for the dashboard to spawn a shell it didn't already have.
+
+### Changed
+
+- **`RealTimeTalk-configure.sh` renamed to `RTT-Config.sh`** (shorter, and
+  matches the dashboard button's label). All references updated
+  (`RealTimeTalk-config-lib.sh`, `RealTimeTalk-install-mac.sh`,
+  `RealTimeTalk-daemon.py` comments, `README.md`, `SKILL.md`, `CLAUDE.md`);
+  `RealTimeTalk-config-lib.sh` itself keeps its name (sourced internally,
+  not meant to be typed directly). Old CHANGELOG entries below still say
+  `RealTimeTalk-configure.sh` — left as historical record, not rewritten.
+
 ## [3.23.1] — 2026-09-18
 
 ### Fixed

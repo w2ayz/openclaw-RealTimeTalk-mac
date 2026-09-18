@@ -76,7 +76,7 @@ The easiest way to add, change, or remove these keys after install is the
 re-runnable configure script:
 
 ```bash
-bash RealTimeTalk-configure.sh
+bash RTT-Config.sh
 ```
 
 It also checks your shell environment (`OPENAI_API_KEY`, `GEMINI_API_KEY`/
@@ -118,7 +118,7 @@ You can also pass `--stt-engine gemini` to override at startup. The legacy
 `openclaw.json` `talk.stt` block is still read if the daemon config file is
 absent, so old configs keep working until migrated.
 
-Set `"provider": "none"` (what `RealTimeTalk-configure.sh`'s Skip option
+Set `"provider": "none"` (what `RTT-Config.sh`'s Skip option
 writes) to run TTS-only on purpose even if a key is configured. With
 neither an OpenAI nor a Gemini key present at all, the daemon resolves to
 this same TTS-only mode automatically regardless of what `"provider"` says.
@@ -152,7 +152,7 @@ Chinese and mixed Chinese/English replies use ElevenLabs multilingual v2
 ```
 
 Optional — if unset, Chinese/mixed replies fall back down the TTS chain
-(OpenAI TTS by default). `bash RealTimeTalk-configure.sh` prompts for this
+(OpenAI TTS by default). `bash RTT-Config.sh` prompts for this
 key too (checking `$ELEVENLABS_API_KEY` in your environment first).
 
 ### TTS engine order (`~/.openclaw/workspace/rtt_tts_config.json`)
@@ -163,7 +163,7 @@ key too (checking `$ELEVENLABS_API_KEY` in your environment first).
 
 Same daemon-owned-config pattern as STT engine selection above. The default
 is ElevenLabs → Edge TTS → OpenAI TTS → macOS `say`, tried in order until
-one produces audio. `RealTimeTalk-configure.sh` lets you reorder this list
+one produces audio. `RTT-Config.sh` lets you reorder this list
 or drop engines you don't want (e.g. `["edge", "say"]` to never touch
 ElevenLabs/OpenAI TTS) — `say` is always kept as the last-resort entry even
 if you leave it out, since it needs no key or network. Restart the daemon
@@ -196,7 +196,7 @@ The installer:
    hidden key input verified against each provider's API, an ElevenLabs key
    prompt, and a reorderable/droppable TTS engine chain. These three steps
    live in `RealTimeTalk-config-lib.sh` so you can re-run just this part
-   later with `bash RealTimeTalk-configure.sh` — see the sections above
+   later with `bash RTT-Config.sh` — see the sections above
 4. Lists CoreAudio devices and prompts you for input + output device indices
 5. Writes the LaunchAgent plist to `~/Library/LaunchAgents/ai.openclaw.realtimetalk.plist`
 6. Loads the agent (boots at every login)
@@ -207,7 +207,7 @@ To change any STT/TTS key, the STT engine choice, the TTS engine order, or
 the STT vocabulary later without repeating the whole install, re-run:
 
 ```bash
-bash ~/.openclaw/workspace/skills/realtimetalk/RealTimeTalk-configure.sh
+bash ~/.openclaw/workspace/skills/realtimetalk/RTT-Config.sh
 ```
 
 ### Microphone permission reliability (recommended)

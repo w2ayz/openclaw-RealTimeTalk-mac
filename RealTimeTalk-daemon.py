@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.23.1"
+__version__ = "3.24.0"
 
 import argparse
 import asyncio
@@ -124,6 +124,9 @@ def _resolve_edge_tts_script() -> str:
     return official
 
 EDGE_TTS_SCRIPT   = _resolve_edge_tts_script()
+# Absolute path so the Calibration page's RTT-Config button can show a
+# copy-pasteable command regardless of where this skill is installed.
+RTT_CONFIG_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "RTT-Config.sh")
 EDGE_VOICE_EN     = "en-US-AriaNeural"
 EDGE_VOICE_ZH     = "zh-CN-XiaoxiaoNeural"
 EDGE_TTS_TIMEOUT  = 8.0
@@ -193,7 +196,7 @@ STT_CONFIG_FILE    = os.path.expanduser("~/.openclaw/workspace/rtt_stt_config.js
 DEFAULT_STT_VOCABULARY = ["OpenClaw", "STT", "TTS", "RealTimeTalk", "RTT"]
 
 # TTS engine chain order — same daemon-owned-file pattern as STT above.
-# RealTimeTalk-configure.sh writes {"order": [...]} here; any engine name it
+# RTT-Config.sh writes {"order": [...]} here; any engine name it
 # omits is simply never tried (see _load_tts_settings/TTS_ORDER, populated
 # once at startup) except "say", which _ensure_tts_config_seeded()/TTS_ORDER
 # always keeps as the last-resort entry since it needs no key/network at all.
@@ -6597,6 +6600,13 @@ function confirmClear(btn, device) {{
                     + '&#128266; Monitor' + ('&nbsp;&#10003;' if _radio_monitor_active[0] else '')
                     + '</button>'
                 )
+                _config_btn = (
+                    '<button id="configbtn" onclick="toggleConfigPanel()" '
+                    'style="padding:4px 11px;font-size:13px;color:#38bdf8;border-color:#38bdf8;" '
+                    'title="Show the command to add/change STT/TTS keys, engine order, or vocabulary">'
+                    '&#9881; RTT-Config'
+                    '</button>'
+                )
                 _dtmf_btns = (
                     '<a href="/dtmf-monitor" style="padding:4px 11px;font-size:13px;'
                     'text-decoration:none;border:1px solid #334155;border-radius:8px;'
@@ -6692,8 +6702,19 @@ a:hover{{text-decoration:underline;}}
   {_voice_id_btn}
   {_radio_btn}
   {_monitor_btn}
+  {_config_btn}
   {_echotest_btn}
   {_dtmf_btns}
+</div>
+<div id="configpanel" style="display:none;background:var(--sf2);border:1px solid #38bdf8;border-radius:var(--r);padding:10px 12px;margin:0 0 10px;">
+  <div style="font-size:13px;color:var(--tx);margin-bottom:6px;">
+    Run this in a terminal to add/change STT or TTS keys, reorder the TTS engine chain, or extend the STT vocabulary — safe to re-run anytime:
+  </div>
+  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+    <code id="configcmd" style="background:var(--sf);border:1px solid var(--bd);border-radius:6px;padding:4px 8px;font-size:13px;color:var(--gn);">bash {RTT_CONFIG_SCRIPT}</code>
+    <button onclick="copyConfigCmd()" style="padding:4px 11px;font-size:13px;">Copy</button>
+    <span id="configcopied" style="font-size:12px;color:var(--gn);display:none;">Copied!</span>
+  </div>
 </div>
 {spk_adj_section}
 <div style="margin:14px 0 6px;display:flex;align-items:center;gap:10px;">
@@ -6894,6 +6915,20 @@ function toggleRadioMonitor(){{
 }}
 /* --- Device selection --- */
 let _devExpanded=false, _devTimer=null;
+function toggleConfigPanel(){{
+  const p=document.getElementById('configpanel');
+  p.style.display=(p.style.display==='none')?'block':'none';
+}}
+function copyConfigCmd(){{
+  const text=document.getElementById('configcmd').textContent;
+  const done=()=>{{
+    const c=document.getElementById('configcopied');
+    c.style.display='inline';
+    setTimeout(()=>{{ c.style.display='none'; }}, 1500);
+  }};
+  if(navigator.clipboard) navigator.clipboard.writeText(text).then(done, done);
+  else done();
+}}
 function toggleDevices(){{
   _devExpanded=!_devExpanded;
   // Persist across reloads (device-change / Radio Mode auto-refresh) —
@@ -8190,7 +8225,7 @@ def _load_tts_settings() -> dict:
 def _ensure_tts_config_seeded() -> None:
     """Create rtt_tts_config.json with the default engine order if it's
     missing. Never overwrites an existing "order" (including a deliberately
-    short one from RealTimeTalk-configure.sh) — mirrors
+    short one from RTT-Config.sh) — mirrors
     _ensure_stt_config_seeded()'s never-clobber behavior."""
     try:
         cfg = _load_json(TTS_CONFIG_FILE) if os.path.isfile(TTS_CONFIG_FILE) else {}
@@ -8367,7 +8402,7 @@ async def main(http_port: int, input_device=None, output_device=None,
         _active_stt_engine[0] = engine_name   # dashboard #dp shows the real engine, not just the CLI flag
 
         if engine_name == STT_ENGINE_NONE:
-            # No OpenAI/Gemini key configured (RealTimeTalk-configure.sh's
+            # No OpenAI/Gemini key configured (RTT-Config.sh's
             # "Skip" option, or just no key yet) — run TTS-only. The HTTP
             # server (already started above) keeps serving /speak, /status
             # and the dashboard with no session at all; openai_key/gemini_key

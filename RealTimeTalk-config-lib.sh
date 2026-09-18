@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # RealTimeTalk-config-lib.sh — shared interview functions for the STT/TTS/
 # vocabulary setup steps, sourced by both RealTimeTalk-install-mac.sh (as
-# part of a fresh install) and RealTimeTalk-configure.sh (re-runnable
+# part of a fresh install) and RTT-Config.sh (re-runnable
 # anytime, no venv/brew/plist steps). Keeping this in one file means the two
 # entry points can't drift out of sync with each other.
 #
@@ -226,7 +226,7 @@ PY
         read -r -p "  Continue anyway in TTS-only (no STT) mode? [Y/n]: " CONT_TEXT_ONLY
         if [[ "$CONT_TEXT_ONLY" =~ ^[Nn] ]]; then
             red "  ✗ No STT key configured. Re-run this script when you have one:"
-            yellow "    bash \"$SKILL_DIR/RealTimeTalk-configure.sh\""
+            yellow "    bash \"$SKILL_DIR/RTT-Config.sh\""
             return 1
         fi
         write_stt_engine none ""

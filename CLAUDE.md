@@ -12,7 +12,7 @@
   optional (`rtt_stt_config.json`'s `"provider": "none"`, or simply no
   OpenAI/Gemini key at all, resolves to `STT_ENGINE_NONE` — TTS-only, no
   mic/wake-word session; `/speak` still works). Both are set via
-  `RealTimeTalk-configure.sh` (re-runnable anytime) or the installer's §4,
+  `RTT-Config.sh` (re-runnable anytime) or the installer's §4,
   which now just calls into `RealTimeTalk-config-lib.sh`'s
   `run_stt_setup`/`run_tts_setup`/`run_vocabulary_setup` — ported to the Pi
   fork in v3.23.0 too (adapted: TTS order applies uniformly to all text

@@ -59,7 +59,7 @@ websockets + numpy:
 
 Engine order is configurable (`rtt_tts_config.json`'s `"order"`, resolved
 once at startup into `TTS_ORDER` by `_resolve_tts_order()` — see
-`RealTimeTalk-configure.sh`/`run_tts_setup`). The steps below show the
+`RTT-Config.sh`/`run_tts_setup`). The steps below show the
 default order; any engine can be dropped from the chain except `say`, which
 `_resolve_tts_order()` always appends as the last-resort entry since it
 needs no key or network.
@@ -172,7 +172,7 @@ The daemon reads `talk.providers.{openai,gemini,elevenlabs}.apiKey` from
 `load_openai_key()` / `load_gemini_key()` / `load_elevenlabs_key()` all
 return `""` (not an error) if unset.
 
-Run `bash RealTimeTalk-configure.sh` anytime (re-runnable, no
+Run `bash RTT-Config.sh` anytime (re-runnable, no
 brew/venv/plist steps) to add/replace any of these keys, choose or skip the
 STT engine, reorder or drop TTS engines, or extend the STT vocabulary hint.
 It also checks your shell environment (`OPENAI_API_KEY`, `GEMINI_API_KEY`/
@@ -225,7 +225,7 @@ Functions that work natively on Mac:
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Dashboard shows "STT: Text-only (no STT)", mic never listens | No OpenAI/Gemini key configured (or explicit Skip in configure) | Expected in TTS-only mode; run `RealTimeTalk-configure.sh` to add a key if you want mic/wake-word listening |
+| Dashboard shows "STT: Text-only (no STT)", mic never listens | No OpenAI/Gemini key configured (or explicit Skip in configure) | Expected in TTS-only mode; run `RTT-Config.sh` to add a key if you want mic/wake-word listening |
 | `--list-devices` shows no inputs | No mic connected | Plug in a USB mic, pair Bluetooth, or enable iPhone Continuity |
 | Bluetooth playback sounds compressed | macOS SCO mode (8 kHz) | Expected when BT mic+speaker on same device — use separate output |
 | Daemon won't restart after edit | LaunchAgent throttle (10 s) | `launchctl kickstart -k gui/$UID/ai.openclaw.realtimetalk` |
