@@ -203,9 +203,24 @@ import json, os, sys
 provider, fallback = sys.argv[1], sys.argv[2]
 path = os.path.expanduser("~/.openclaw/workspace/rtt_stt_config.json")
 os.makedirs(os.path.dirname(path), exist_ok=True)
-cfg = {"provider": provider}
+# Merge into any existing file instead of overwriting it outright — a
+# reinstall/upgrade must not wipe a "vocabulary" list the daemon seeded
+# (see _ensure_stt_config_seeded in RealTimeTalk-daemon.py) or the user
+# has since customized.
+cfg = {}
+if os.path.isfile(path):
+    try:
+        with open(path) as f:
+            existing = json.load(f)
+        if isinstance(existing, dict):
+            cfg = existing
+    except Exception:
+        pass
+cfg["provider"] = provider
 if fallback:
     cfg["fallback"] = fallback
+else:
+    cfg.pop("fallback", None)
 json.dump(cfg, open(path, "w"), indent=2)
 PY
     green "  ✓ STT engine → $1${2:+ (fallback: $2)} written to $STT_CFG"

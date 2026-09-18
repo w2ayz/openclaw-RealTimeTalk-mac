@@ -1,5 +1,36 @@
 # Changelog
 
+## [3.22.17] — 2026-09-18
+
+### Added
+
+- **`rtt_stt_config.json` now self-seeds a starter `"vocabulary"` on
+  startup** via new `_ensure_stt_config_seeded()`, called from `main()`
+  right before the vocabulary is read for the STT engines. Fixes an
+  upgrade gap: a daemon updated in place (`git pull` + restart, no
+  installer re-run) from a pre-v3.22.4 version — which never had this
+  file at all — silently started with an empty custom-vocabulary hint
+  for both STT engines. Seeds `[agent_name, "OpenClaw", "STT", "TTS",
+  "RealTimeTalk", "RTT"]` when the file is missing, or when it exists
+  but has no `"vocabulary"` key yet (e.g. one written by the installer's
+  `write_stt_engine`, which only ever wrote `provider`/`fallback`).
+  Never touches `provider`/`fallback`, and never overwrites a
+  `"vocabulary"` key that already exists — including a deliberately
+  emptied `[]`, which is left as-is rather than reseeded. Verified
+  against 4 scenarios: missing file, provider-only file, an already-
+  customized vocabulary, and a deliberately emptied one.
+
+### Fixed
+
+- **Installer's `write_stt_engine` no longer wipes the config file.**
+  It previously overwrote `rtt_stt_config.json` outright with just
+  `{"provider":..., "fallback":...}` whenever the STT-provider step ran
+  (options 1-3) — destroying any `"vocabulary"` list the daemon had
+  seeded or the user had customized. It now merges `provider`/`fallback`
+  into the existing file instead. Verified: rerunning the installer
+  with a different provider choice now preserves an existing
+  `"vocabulary"` list untouched.
+
 ## [3.22.16] — 2026-09-17
 
 ### Changed

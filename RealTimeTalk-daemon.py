@@ -28,7 +28,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.22.16"
+__version__ = "3.22.17"
 
 import argparse
 import asyncio
@@ -182,6 +182,10 @@ DEFAULT_STT_ENGINE = STT_ENGINE_OPENAI
 # The legacy openclaw.json `talk.stt` block is still read as a fallback source
 # for configs that haven't migrated yet.
 STT_CONFIG_FILE    = os.path.expanduser("~/.openclaw/workspace/rtt_stt_config.json")
+# Starter terms for rtt_stt_config.json's "vocabulary" — seeded by
+# _ensure_stt_config_seeded() so an update from a pre-v3.22.4 daemon (which
+# never had this file) doesn't silently start the STT keyword hint empty.
+DEFAULT_STT_VOCABULARY = ["OpenClaw", "STT", "TTS", "RealTimeTalk", "RTT"]
 
 CHANNELS          = 1
 BLOCKSIZE         = 2400         # 100 ms at 24 kHz
@@ -8062,6 +8066,36 @@ def _load_stt_settings() -> dict:
         return {}
 
 
+def _ensure_stt_config_seeded(agent_name: str) -> None:
+    """Create rtt_stt_config.json with a starter vocabulary if it's missing,
+    or add the starter terms to an existing config that has none yet.
+
+    Covers both a fresh install and an in-place update (git pull + restart,
+    no installer re-run) from a pre-v3.22.4 daemon that never had this file
+    — without this, that upgrade path left the STT keyword hint silently
+    empty. Never touches "provider"/"fallback", and never overwrites a
+    vocabulary the user already customized (including a deliberately
+    emptied one — an existing "vocabulary" key of any kind, even [], is
+    left alone).
+    """
+    try:
+        cfg = _load_json(STT_CONFIG_FILE) if os.path.isfile(STT_CONFIG_FILE) else {}
+    except Exception:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    if "vocabulary" in cfg:
+        return
+    cfg["vocabulary"] = list(dict.fromkeys([agent_name] + DEFAULT_STT_VOCABULARY))
+    try:
+        os.makedirs(os.path.dirname(STT_CONFIG_FILE), exist_ok=True)
+        with open(STT_CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+        log.info("Seeded rtt_stt_config.json vocabulary: %s", cfg["vocabulary"])
+    except Exception as e:
+        log.warning("Could not seed rtt_stt_config.json vocabulary: %s", e)
+
+
 def _resolve_stt_engine(openai_key: str, gemini_key: str) -> str:
     """Pick the active STT engine from CLI arg, config, or key availability."""
     stt_cfg = _load_stt_settings()
@@ -8328,6 +8362,7 @@ if __name__ == "__main__":
     # terms — one source, sent to both STT engines. This biases the live
     # model toward proper nouns that are otherwise misheard (e.g. "Zeebot"
     # → "Zebit").
+    _ensure_stt_config_seeded(_agent_name)
     try:
         _stt_vocab = _load_stt_settings().get("vocabulary", [])
     except Exception:
