@@ -15,7 +15,7 @@ internals, see [SKILL.md](SKILL.md).
 
 | Requirement | Notes |
 |---|---|
-| [OpenClaw](https://openclaw.ai) gateway running | `openclaw gateway start`. RealTimeTalk talks to Zeebot through this — it won't start without it. |
+| [OpenClaw](https://openclaw.ai) gateway running | `openclaw gateway start`. RealTimeTalk talks to your agent through this — it won't start without it. |
 | STT provider key (OpenAI **and/or** Gemini) | Either one works on its own; with both configured you can pick the engine and a boot-time fallback (§3.2). OpenAI: regular `sk-...` key in `~/.openclaw/openclaw.json`, **not** the `openai-codex` OAuth profile (the Realtime API rejects it). Gemini: `AIza...` key from AI Studio. See §3. |
 | ElevenLabs API key (optional) | Primary TTS voice for all replies. Falls back to Edge TTS → OpenAI TTS → `say` if unset. |
 

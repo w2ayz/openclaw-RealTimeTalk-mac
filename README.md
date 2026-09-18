@@ -1,13 +1,14 @@
 # openclaw-RealTimeTalk-mac
 
-Real-time voice conversations with the OpenClaw agent (Zeebot), adapted from
+Real-time voice conversations with your OpenClaw agent (default name
+**Zeebot**, configurable — see `--agent-name`), adapted from
 [openclaw-RealTimeTalk](https://github.com/w2ayz/openclaw-RealTimeTalk) (Raspberry Pi)
 to run on a Mac Mini.
 
 ```
 Mic → OpenAI Realtime API or Gemini 3.5 Transcribe Live (VAD + STT)
        ↓
-    OpenClaw gateway → Zeebot → TTS → Speaker
+    OpenClaw gateway → Agent → TTS → Speaker
 ```
 
 TTS chain: ElevenLabs (`eleven_v3`, primary) → Edge TTS (free, no key, native
@@ -215,11 +216,13 @@ Or via HTTP:
 - `GET http://localhost:19000/restart` — restart daemon
 - `POST http://127.0.0.1:19000/speak` — speak arbitrary text (see below)
 
-Or via voice: say "Zeebot wake up" while Silent or Monitoring — Zeebot asks
-"Yes?" and activates only on an affirmative reply ("yes", "ok", "wake up", "好",
-etc.) or a repeated wake phrase within 15s, to avoid self-triggering off its
-own TTS or background chatter. The dashboard Wake button skips this and
-activates immediately. Once active: "Zeebot go to sleep", "calibrate mic", etc.
+Or via voice: say "\<agent name\> wake up" (e.g. "Zeebot wake up" with the
+default name) while Silent or Monitoring — the agent asks "Yes?" and
+activates only on an affirmative reply ("yes", "ok", "wake up", "好", etc.)
+or a repeated wake phrase within 15s, to avoid self-triggering off its own
+TTS or background chatter. The dashboard Wake button skips this and
+activates immediately. Once active: "\<agent name\> go to sleep",
+"calibrate mic", etc.
 
 ### Pushing text from OpenClaw (or any local process)
 
@@ -335,7 +338,7 @@ launchctl bootstrap "gui/$UID_VAL" ~/Library/LaunchAgents/ai.openclaw.realtimeta
 
 ## Speaker verification (owner-only mode)
 
-When enabled, Zeebot only acts on the enrolled owner's voice — every
+When enabled, the agent only acts on the enrolled owner's voice — every
 transcript's audio segment is embedded with a bilingual (EN/ZH)
 speaker-recognition model and compared against the enrolled profile by cosine
 similarity. Non-matching speech is silently ignored and logged to the
@@ -376,7 +379,7 @@ yourself, ≤ ~0.4 for others). To enroll a second device, switch to it on
 the Calibrate page first, then repeat. The enrollment page lists every
 other already-enrolled device with a Clear button. Enable **Owner Only**
 from the dashboard or by saying "only listen to me" — if the device you're
-currently on has no profile yet, Zeebot warns you and accepts all speakers
+currently on has no profile yet, the agent warns you and accepts all speakers
 on that device until you add one, rather than blocking Owner Only
 entirely. (Voice ID lives on Calibrate rather than the main dashboard nav
 since enrollment is a one-time/rare action; Owner Only/Everyone stays on
@@ -465,12 +468,14 @@ Key flags:
 Mic (CoreAudio)
     └─ sounddevice InputStream  (24 kHz mono int16, 100 ms blocks)
         └─ asyncio.Queue
-            └─ RealtimeSession.send_audio()  (forward to OpenAI WS)
-                └─ OpenAI gpt-4o-transcribe  (server-side VAD + STT)
+            └─ RealtimeSession.send_audio()  (forward to STT engine WS)
+                └─ Gemini 3.5 Transcribe Live (server-side VAD)
+                   or OpenAI gpt-live-transcribe (client-side VAD, see
+                   OpenAIRealtimeSession) — whichever is configured
                     └─ transcript event
                         ├─ Wake/sleep / command matcher  (skip if matched)
                         └─ GatewayClient.ask()  (OpenClaw chat.send → agent.wait)
-                            └─ Zeebot's reply text
+                            └─ Agent's reply text
                                 └─ speak()
                                     ├─ ElevenLabs eleven_v3  (primary, full text)
                                     ├─ Edge TTS  (per-segment, native zh/en voices — first fallback)
@@ -485,7 +490,7 @@ Mic (CoreAudio)
 ```
 
 End-to-end latency: ~4–12 seconds, dominated by VAD silence window (1.1s)
-and Zeebot's reasoning time.
+and the agent's reasoning time.
 
 ---
 

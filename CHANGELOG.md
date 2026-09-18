@@ -1,5 +1,21 @@
 # Changelog
 
+## [3.22.14] — 2026-09-17
+
+### Changed
+
+- **Docs: generic "the agent" instead of the hardcoded default name in
+  explanatory prose** (README, DEPLOYMENT.md) — this daemon's agent name
+  is configurable (`--agent-name`, default `Zeebot`), so prose like
+  "Zeebot's reply text" or "Zeebot only acts on the enrolled owner's
+  voice" read as if the name were fixed. Left every *literal* citation of
+  the actual default value untouched (installer prompts, config examples,
+  the `"vocabulary"` JSON example) — those are accurate as written; only
+  generic conceptual references changed. Also fixed a stale diagram in
+  the "How it works" section still showing `gpt-4o-transcribe (server-side
+  VAD)` as the only STT path — updated to reflect both engines and
+  v3.22.13's client-side VAD on the OpenAI path. Docs-only, no code change.
+
 ## [3.22.13] — 2026-09-17
 
 ### Added
