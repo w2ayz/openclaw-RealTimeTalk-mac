@@ -207,6 +207,41 @@ else
 fi
 echo
 
+# ── 5.6. Mic-permission wrapper app (RealTimeTalk.app) ───────────────────────
+# A bare `python3` LaunchAgent has no stable TCC identity, so mic access can
+# fail to prompt or fail to persist across restarts — see
+# RealTimeTalk-build-wrapper-mac.sh's own header. Detect "fresh install" by
+# whether the wrapper binary already exists rather than by plist presence:
+# that way a *re-run* of this installer (e.g. after `git pull`, or to change
+# devices) finds the existing wrapper and keeps it wired in, instead of
+# silently reverting a working mic-permission setup back to bare python3.
+
+WRAPPER_APP="$HOME/Applications/RealTimeTalk.app"
+WRAPPER_BIN="$WRAPPER_APP/Contents/MacOS/RealTimeTalk"
+USE_WRAPPER=false
+
+if [[ -x "$WRAPPER_BIN" ]]; then
+    green "  ✓ mic-permission wrapper already built at $WRAPPER_APP"
+    USE_WRAPPER=true
+else
+    echo "  A signed wrapper app gives the daemon a stable identity for macOS's"
+    echo "  mic-permission (TCC) system, so access prompts reliably and persists"
+    echo "  across restarts. Requires Xcode Command Line Tools (swiftc)."
+    read -r -p "Build the mic-permission wrapper app now (recommended)? [Y/n]: " BUILD_WRAPPER
+    if [[ ! "$BUILD_WRAPPER" =~ ^[Nn] ]]; then
+        if bash "$SKILL_DIR/RealTimeTalk-build-wrapper-mac.sh"; then
+            USE_WRAPPER=true
+            green "  ✓ wrapper built at $WRAPPER_APP"
+        else
+            yellow "  ✗ wrapper build failed — continuing with a bare python3 LaunchAgent."
+            yellow "    Retry later with: bash $SKILL_DIR/RealTimeTalk-build-wrapper-mac.sh"
+        fi
+    else
+        yellow "  → Skipped. Build later with: bash $SKILL_DIR/RealTimeTalk-build-wrapper-mac.sh"
+    fi
+fi
+echo
+
 EXTRA_ARGS=()
 if [[ -n "$IN_DEV" ]];         then EXTRA_ARGS+=("--input-device"  "$IN_DEV");         fi
 if [[ -n "$OUT_DEV" ]];        then EXTRA_ARGS+=("--output-device" "$OUT_DEV");        fi
@@ -230,8 +265,16 @@ done
 "$VENV_PY" - <<PY
 import re
 src = open("$PLIST_TEMPLATE").read()
-src = src.replace("__VENV_PYTHON__",     "$VENV_PY")
-src = src.replace("__DAEMON_PATH__",      "$DAEMON_PY")
+if "$USE_WRAPPER" == "true":
+    # Wrapper binary bakes in the venv python + daemon path itself and
+    # forwards any trailing args (see RealTimeTalk-build-wrapper-mac.sh) —
+    # collapse both placeholder lines into just the wrapper binary.
+    src = src.replace(
+        "        <string>__VENV_PYTHON__</string>\n        <string>__DAEMON_PATH__</string>",
+        "        <string>$WRAPPER_BIN</string>")
+else:
+    src = src.replace("__VENV_PYTHON__",     "$VENV_PY")
+    src = src.replace("__DAEMON_PATH__",      "$DAEMON_PY")
 src = src.replace("__SKILL_DIR__",        "$SKILL_DIR")
 src = src.replace("__EDGE_TTS_SCRIPT__",  "$EDGE_TTS_SCRIPT")
 
@@ -265,3 +308,11 @@ echo "  Dashboard: http://localhost:19000/dashboard"
 echo "  Logs:      tail -f /tmp/openclaw/realtimetalk.log"
 echo "  Toggle:    bash $SKILL_DIR/RealTimeTalk-toggle.sh {start|stop|restart|status|log}"
 echo
+if [[ "$USE_WRAPPER" == "true" ]]; then
+    echo "  Mic-permission wrapper: $WRAPPER_APP"
+    echo "  First launch prompts for microphone access. If the dialog doesn't"
+    echo "  appear (background launches sometimes suppress it), double-click"
+    echo "  $WRAPPER_APP in Finder once, then check System Settings →"
+    echo "  Privacy & Security → Microphone if it's listed but unchecked."
+    echo
+fi

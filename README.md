@@ -218,7 +218,17 @@ flaky — it may not prompt reliably, or the grant may not persist across
 restarts. `RealTimeTalk-build-wrapper-mac.sh` builds a tiny signed wrapper
 app (`~/Applications/RealTimeTalk.app`) that requests mic access via
 AVFoundation under its own stable bundle identity before launching the
-daemon as its child process:
+daemon as its child process.
+
+**`RealTimeTalk-install-mac.sh` builds and wires this in automatically**
+(§5.6) whenever `~/Applications/RealTimeTalk.app` doesn't already exist yet —
+prompting once, then rendering the plist to launch the wrapper binary
+directly (any extra args like `--mic-gate 64` still pass straight through).
+A re-run of the installer detects an already-built wrapper and keeps it
+wired in rather than reverting to bare `python3`.
+
+To build or rebuild it by hand (e.g. you skipped the installer's prompt, or
+`SKILL_DIR` moved):
 
 ```bash
 bash ~/.openclaw/workspace/skills/realtimetalk/RealTimeTalk-build-wrapper-mac.sh

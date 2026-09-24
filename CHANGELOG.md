@@ -1,5 +1,27 @@
 # Changelog
 
+## [3.25.0] — 2026-09-24
+
+### Added
+
+- **`RealTimeTalk-install-mac.sh` now builds and wires in the mic-permission
+  wrapper app automatically** (new §5.6), instead of leaving it as a
+  manual post-install step users had to remember from README/DEPLOYMENT.
+  Detects "already set up" by whether `~/Applications/RealTimeTalk.app`'s
+  binary already exists — not plist presence — so re-running the installer
+  later (e.g. to change audio devices) finds the existing wrapper and keeps
+  it wired in rather than silently reverting a working mic-permission setup
+  back to a bare `python3` LaunchAgent. Prompts once to build it
+  (`RealTimeTalk-build-wrapper-mac.sh`, needs Xcode CLT) if missing, falls
+  back gracefully to bare `python3` with a retry hint if the build fails,
+  and renders the plist's `ProgramArguments` to launch the wrapper binary
+  directly when in use (collapsing the venv-python + daemon-path entries
+  into one, matching the wrapper's own arg-forwarding behavior — extra
+  flags like `--mic-gate`/`--input-device` still pass straight through).
+  README.md and DEPLOYMENT.md's mic-permission sections now point to this
+  automatic path first, keeping the manual plist-edit steps as a fallback
+  for anyone who skips the prompt or moves `SKILL_DIR` after building.
+
 ## [3.24.0] — 2026-09-18
 
 ### Added

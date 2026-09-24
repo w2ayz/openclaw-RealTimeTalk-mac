@@ -283,6 +283,17 @@ repo works around it with a small signed wrapper app that requests mic
 access under its own stable bundle identity before launching the daemon
 as a child process.
 
+**`RealTimeTalk-install-mac.sh` §5.6 now builds and wires this in for you**
+on a fresh install: it checks whether `~/Applications/RealTimeTalk.app`
+already exists, and if not, offers to run
+`RealTimeTalk-build-wrapper-mac.sh` and renders the LaunchAgent plist to
+launch the wrapper binary directly — skipping the manual plist edit and
+reload below entirely. Re-running the installer later (e.g. to change
+devices) detects the existing wrapper and keeps it wired in rather than
+reverting to bare `python3`. The steps below are for building or wiring it
+in by hand — e.g. if you said no to the installer's prompt, or `SKILL_DIR`
+moved and the baked-in paths need refreshing.
+
 ```bash
 bash ~/.openclaw/workspace/skills/realtimetalk/RealTimeTalk-build-wrapper-mac.sh
 ```
