@@ -59,7 +59,7 @@ verbatim from the Pi version.
 | Dependency                  | Install                                    |
 |-----------------------------|--------------------------------------------|
 | [OpenClaw](https://openclaw.ai) gateway running | platform requirement (`openclaw gateway start`) |
-| STT provider key(s) in `~/.openclaw/openclaw.json` (optional) | OpenAI (`talk.providers.openai.apiKey`, regular `sk-...` key, **not** the openai-codex OAuth profile) and/or Gemini (`talk.providers.gemini.apiKey`, `AIza...` from AI Studio) — either works on its own; with neither, RealTimeTalk runs TTS-only (no mic/wake-word listening — see "STT engine selection" below) |
+| STT provider key(s) in `~/.openclaw/openclaw.json` (optional) | OpenAI (`talk.providers.openai.apiKey`, regular `sk-...` key, **not** the openai-codex OAuth profile) and/or Gemini (`talk.providers.gemini.apiKey`, `AQ....` or legacy `AIza...` from AI Studio) — either works on its own; with neither, RealTimeTalk runs TTS-only (no mic/wake-word listening — see "STT engine selection" below) |
 | [Edge TTS skill](https://github.com/w2ayz/openclaw-edge-tts) (first TTS fallback — optional) | install at the official path `~/.openclaw/workspace/skills/edge-tts/` (`npm install` in `scripts/`); the installer resolves it and prepares its deps |
 | Homebrew + portaudio + ffmpeg + node | `brew install portaudio ffmpeg node`     |
 | `hidapi` (only for Radio Mode's AIOC hardware-revision detection — cosmetic, everything else works without it) | `brew install hidapi` |

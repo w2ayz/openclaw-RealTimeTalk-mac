@@ -32,7 +32,7 @@ has_any_stt_key() {
     _has_provider_key openai || _has_provider_key gemini
 }
 
-# ensure_provider_key <provider> <prefix-regex-or-empty> <env-var> [<env-var-2>]
+# ensure_provider_key <provider> <prefix-regex-or-empty> <env-var> [<env-var-2>] [<hint>]
 #
 # Checks, in order: the environment (env-var, then env-var-2 if given — e.g.
 # GEMINI_API_KEY falling back to GOOGLE_API_KEY, Google's more common name
@@ -40,8 +40,12 @@ has_any_stt_key() {
 # fresh interactive prompt. A key found any way still goes through the same
 # live-verification call before being written. Returns 0 if a usable key
 # ends up configured, 1 otherwise (skip/rejected).
+#
+# <hint> overrides the auto-derived "expected X..." wording (normally just
+# <prefix-regex-or-empty> with its leading ^ stripped) for a prefix regex
+# that isn't human-readable as-is, e.g. gemini's alternation below.
 ensure_provider_key() {
-    local prov="$1" prefix="$2" envvar="${3:-}" envvar2="${4:-}"
+    local prov="$1" prefix="$2" envvar="${3:-}" envvar2="${4:-}" hint="${5:-${2#^}}"
     local existing="no"
     _has_provider_key "$prov" && existing="yes"
 
@@ -81,7 +85,11 @@ ensure_provider_key() {
 
     if [[ -n "$prefix" ]] && ! [[ "$KEY" =~ $prefix ]]; then
         local reply
-        read -r -p "  ⚠ That doesn't look like a $prov key (expected ${prefix#^}...). Use it anyway? [y/N]: " reply
+        read -r -p "  ⚠ That doesn't look like a $prov key (expected ${hint}...). Use it anyway? [y/N]: " reply
+        if [[ ! "$reply" =~ ^[Yy] ]]; then return 1; fi
+    elif [[ "$prov" == "gemini" && "$KEY" == AQ.* && "${#KEY}" -ne 53 ]]; then
+        local reply
+        read -r -p "  ⚠ Gemini AQ. keys are usually 53 characters; this one is ${#KEY} (truncated paste?). Use it anyway? [y/N]: " reply
         if [[ ! "$reply" =~ ^[Yy] ]]; then return 1; fi
     fi
 
@@ -167,7 +175,7 @@ PY
     echo
     echo "  STT engine setup — which provider key(s) do you want to use?"
     echo "    [1] OpenAI Realtime        (regular sk-... API key — NOT the ChatGPT OAuth profile)"
-    echo "    [2] Gemini Transcribe Live (Gemini API key, AIza...)"
+    echo "    [2] Gemini Transcribe Live (Gemini API key, AQ.... or AIza...)"
     echo "    [3] Both                   (pick the default engine; the other becomes the fallback)"
     echo "    [4] Keep existing configuration"
     echo "    [5] Skip — no STT, TTS-only (text-only) mode. OpenClaw can still push text to"
@@ -190,14 +198,14 @@ PY
             fi
             ;;
         2)
-            ensure_provider_key gemini "^AIza" GEMINI_API_KEY GOOGLE_API_KEY || true
+            ensure_provider_key gemini "^(AQ\.|AIza)" GEMINI_API_KEY GOOGLE_API_KEY "AQ.... or AIza..." || true
             if _has_provider_key gemini; then
                 if _has_provider_key openai; then write_stt_engine gemini openai; else write_stt_engine gemini ""; fi
             fi
             ;;
         3)
             ensure_provider_key openai "^sk-" OPENAI_API_KEY || true
-            ensure_provider_key gemini "^AIza" GEMINI_API_KEY GOOGLE_API_KEY || true
+            ensure_provider_key gemini "^(AQ\.|AIza)" GEMINI_API_KEY GOOGLE_API_KEY "AQ.... or AIza..." || true
             if _has_provider_key openai && _has_provider_key gemini; then
                 local DEFAULT_ENGINE
                 while true; do

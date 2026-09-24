@@ -16,7 +16,7 @@ internals, see [SKILL.md](SKILL.md).
 | Requirement | Notes |
 |---|---|
 | [OpenClaw](https://openclaw.ai) gateway running | `openclaw gateway start`. RealTimeTalk talks to your agent through this — it won't start without it. |
-| STT provider key (OpenAI **and/or** Gemini) | Either one works on its own; with both configured you can pick the engine and a boot-time fallback (§3.2). OpenAI: regular `sk-...` key in `~/.openclaw/openclaw.json`, **not** the `openai-codex` OAuth profile (the Realtime API rejects it). Gemini: `AIza...` key from AI Studio. See §3. |
+| STT provider key (OpenAI **and/or** Gemini) | Either one works on its own; with both configured you can pick the engine and a boot-time fallback (§3.2). OpenAI: regular `sk-...` key in `~/.openclaw/openclaw.json`, **not** the `openai-codex` OAuth profile (the Realtime API rejects it). Gemini: `AQ....` key (usually 53 characters) or legacy `AIza...` key from AI Studio. See §3. |
 | ElevenLabs API key (optional) | Primary TTS voice for all replies. Falls back to Edge TTS → OpenAI TTS → `say` if unset. |
 
 ### System
@@ -107,7 +107,7 @@ python3 - <<'PY'
 import json, sys
 
 KEY    = "sk-..."          # your regular OpenAI key (sk-proj-... or sk-...), or ""
-GEMKEY = ""                # your Gemini API key (AIza...), or ""
+GEMKEY = ""                # your Gemini API key (AQ.... or legacy AIza...), or ""
 ELKEY  = ""                # optional ElevenLabs key, or leave blank
 
 path = __import__("os").path.expanduser("~/.openclaw/openclaw.json")
@@ -128,7 +128,8 @@ PY
 > profile (`openai:<your-openai-account>` / `openai-codex`) is rejected
 > by the Realtime API. A project-scoped `sk-proj-...` key works fine.
 >
-> **Gemini key format:** an `AIza...` key from [AI Studio](https://aistudio.google.com/apikey).
+> **Gemini key format:** an `AQ....` key (usually 53 characters) or legacy
+> `AIza...` key (39 characters) from [AI Studio](https://aistudio.google.com/apikey).
 > The daemon connects to `gemini-3.5-transcribe-live` over WebSocket.
 
 `elevenlabs` is optional — omit or leave blank and it falls back to

@@ -1,5 +1,33 @@
 # Changelog
 
+## [3.25.2] — 2026-09-24
+
+### Fixed
+
+- **`RealTimeTalk-config-lib.sh` now accepts Gemini API keys starting with
+  `AQ.`** — the newer key format, usually 53 characters. It previously only
+  accepted the legacy `AIza...` format (39 characters, still accepted), so
+  a real `AQ.` key hit the "doesn't look like a gemini key" warning and was
+  refused unless overridden. An `AQ.` key that isn't 53 characters now gets
+  a "truncated paste?" confirm rather than a hard rejection. Ported from
+  the Pi fork's v3.25.2, adapted: `ensure_provider_key()` here takes the
+  prefix regex as an explicit parameter rather than switching on `$prov`
+  internally, so the port added an optional `<hint>` parameter for the
+  human-readable "expected X..." wording (an alternation regex like
+  `^(AQ\.|AIza)` isn't readable as-is once its leading `^` is stripped).
+  README.md/DEPLOYMENT.md updated to match.
+
+### Not ported
+
+- **Pi fork's v3.25.2 fix for SIGTERM being ignored while auto-sleeping**
+  does not apply here. That bug was Pi's `main()` blocking in
+  `run_in_executor(None, _wake_event[0].wait)` while asleep, which never
+  looked at `stop_event` until woken. This fork's equivalent sleep-wait
+  already races `wake_task`/`stop_task` via
+  `asyncio.wait([...], return_when=asyncio.FIRST_COMPLETED)` — an
+  `asyncio`-native wait that the signal handler's `stop_event.set()`
+  interrupts immediately — so it was never exposed to this bug.
+
 ## [3.25.1] — 2026-09-24
 
 ### Added
