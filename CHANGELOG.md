@@ -1,5 +1,29 @@
 # Changelog
 
+## [3.25.1] — 2026-09-24
+
+### Added
+
+- **ElevenLabs TTS voice is now configurable**, not hardcoded to "Lily."
+  `_resolve_elevenlabs_voice_id()` reads an `elevenlabsVoiceId` key from
+  `rtt_tts_config.json` at startup (falling back to the previous
+  `DEFAULT_ELEVENLABS_VOICE_ID` — Lily — if absent/blank), stored in the
+  same mutable-list-cell pattern as the existing TTS/STT key globals so
+  `_elevenlabs_tts_to_mp3()` can read it without a module-level rebind.
+  **No interactive setup prompt writes this key yet** — for now it only
+  takes effect if `elevenlabsVoiceId` is added to `rtt_tts_config.json` by
+  hand; `run_tts_setup` doesn't ask for it.
+
+### Fixed
+
+- **`RealTimeTalk-config-lib.sh`'s TTS-order setup step no longer clobbers
+  the rest of `rtt_tts_config.json`.** It previously did
+  `json.dump({"order": terms}, ...)`, overwriting the whole file — any
+  other key (like the new `elevenlabsVoiceId` above) set by hand or by a
+  future setup step would be silently destroyed the next time someone ran
+  `RTT-Config.sh`'s TTS-order step. Now reads the existing config first
+  and merges `terms` into it before writing back.
+
 ## [3.25.0] — 2026-09-24
 
 ### Added

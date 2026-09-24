@@ -293,7 +293,13 @@ for t in sys.argv[1].split(","):
         terms.append(t)
 if "say" not in terms:
     terms.append("say")
-json.dump({"order": terms}, open("$TTS_CFG", "w"), indent=2)
+try:
+    with open("$TTS_CFG") as f:
+        cfg = json.load(f)
+except Exception:
+    cfg = {}
+cfg["order"] = terms
+json.dump(cfg, open("$TTS_CFG", "w"), indent=2)
 print(",".join(terms))
 PY
 )
