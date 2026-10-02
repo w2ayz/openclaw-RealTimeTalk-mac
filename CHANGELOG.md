@@ -1,5 +1,27 @@
 # Changelog
 
+## [3.25.5] — 2026-10-02
+
+### Added
+
+- **`elevenlabsModel` in `rtt_tts_config.json`** selects the ElevenLabs
+  model (default `eleven_v3`, unchanged). The model was hardcoded, which
+  made an instant voice clone sound very different from the ElevenLabs
+  website: `eleven_v3` drifts a quick clone toward a generic voice. Stored
+  in a list cell (`_elevenlabs_model[0]`) like this fork's
+  `_elevenlabs_voice_id`, and the startup log line now prints the model next
+  to the voice id. Ported from the Pi fork's v3.25.5.
+
+### Not ported
+
+- **Pi fork's v3.25.4** (daemon-owned PipeWire echo-cancel module) is
+  PipeWire-only and doesn't apply to macOS.
+- **Pi fork's v3.25.7** fixed `main()` binding `_elevenlabs_voice_id` /
+  `_elevenlabs_model` as function locals (no `global`), so the configured
+  voice was never used there. This fork mutates list cells
+  (`_elevenlabs_voice_id[0] = ...`), which reaches the module-level object
+  from any scope, so it never had that bug.
+
 ## [3.25.3] — 2026-10-02
 
 ### Fixed

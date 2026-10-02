@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.25.3"
+__version__ = "3.25.5"
 
 import argparse
 import asyncio
@@ -91,10 +91,11 @@ _openai_tts_key: list = [""]      # set from openai_key in main()
 
 # ElevenLabs TTS — primary voice engine for all assistant replies.
 DEFAULT_ELEVENLABS_VOICE_ID = "pFZP5JQG7iQjIQuC4Bku"   # "Lily - Velvety Actress"
-ELEVENLABS_MODEL    = "eleven_v3"
+DEFAULT_ELEVENLABS_MODEL = "eleven_v3"   # instant clones track their samples far better on eleven_multilingual_v2
 ELEVENLABS_TIMEOUT  = 30.0
 _elevenlabs_tts_key: list = [""]  # set from load_elevenlabs_key() in main()
 _elevenlabs_voice_id: list = [DEFAULT_ELEVENLABS_VOICE_ID]
+_elevenlabs_model: list = [DEFAULT_ELEVENLABS_MODEL]   # set from rtt_tts_config.json at startup
 
 # Edge TTS skill — first TTS fallback after ElevenLabs. Free, no API key, and
 # native zh-CN / en-US neural voices (best free option for bilingual replies).
@@ -2969,7 +2970,7 @@ def _elevenlabs_tts_to_mp3(text: str, out_path: str, timeout: float = ELEVENLABS
     try:
         payload = json.dumps({
             "text": text,
-            "model_id": ELEVENLABS_MODEL,
+            "model_id": _elevenlabs_model[0],
             "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
         }).encode()
         req = urllib.request.Request(
@@ -8281,6 +8282,14 @@ def _resolve_elevenlabs_voice_id() -> str:
     return DEFAULT_ELEVENLABS_VOICE_ID
 
 
+def _resolve_elevenlabs_model() -> str:
+    """Read the ElevenLabs model id from rtt_tts_config.json, falling back to eleven_v3."""
+    raw = _load_tts_settings().get("elevenlabsModel")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return DEFAULT_ELEVENLABS_MODEL
+
+
 def _resolve_stt_engine(openai_key: str, gemini_key: str) -> str:
     """Pick the active STT engine from CLI arg, config, or key availability."""
     stt_cfg = _load_stt_settings()
@@ -8587,7 +8596,9 @@ if __name__ == "__main__":
     _ensure_tts_config_seeded()
     TTS_ORDER[:] = _resolve_tts_order()
     _elevenlabs_voice_id[0] = _resolve_elevenlabs_voice_id()
-    log.info("ElevenLabs voice id loaded from TTS config: %s", _elevenlabs_voice_id[0])
+    _elevenlabs_model[0] = _resolve_elevenlabs_model()
+    log.info("ElevenLabs voice id loaded from TTS config: %s (model %s)",
+             _elevenlabs_voice_id[0], _elevenlabs_model[0])
     _vocab_terms = {_agent_name, "OpenClaw"} | set(str(t).strip() for t in _stt_vocab if str(t).strip())
     GEMINI_CUSTOM_VOCABULARY.clear()
     for _term in _vocab_terms:

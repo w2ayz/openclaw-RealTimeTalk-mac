@@ -169,6 +169,21 @@ ElevenLabs/OpenAI TTS) — `say` is always kept as the last-resort entry even
 if you leave it out, since it needs no key or network. Restart the daemon
 after editing this file directly; it's only read at startup.
 
+Two optional keys pick the ElevenLabs voice and model:
+
+```json
+{ "order": ["elevenlabs", "edge", "openai", "say"],
+  "elevenlabsVoiceId": "pFZP5JQG7iQjIQuC4Bku",
+  "elevenlabsModel": "eleven_v3" }
+```
+
+Both default to the values shown (Lily on `eleven_v3`). For an instant
+voice clone, use `eleven_multilingual_v2` or `eleven_v4` rather than
+`eleven_v3`: v3 reinterprets the voice heavily, and a clone built from a
+couple of short samples drifts toward a generic voice on it (measured on
+the Pi fork: speaker-embedding similarity to the clone's own preview 0.53 on
+`eleven_v3`, 0.69 on `eleven_v4`, 0.77 on `eleven_multilingual_v2`).
+
 ---
 
 ## Installation
