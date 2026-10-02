@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.25.2"
+__version__ = "3.25.3"
 
 import argparse
 import asyncio
@@ -4655,49 +4655,58 @@ class BaseVoiceSession:
                 log.warning("Mic reconnect failed (%s) — will retry in 2s", e)
                 _last_mic_cb[0] = _wm.time()   # back off; don't spam
 
+    async def _apply_dtmf_flags(self, ws) -> bool:
+        """Apply pending DTMF force flags to this session. Called from every
+        engine's send loop so DTMF takes effect immediately rather than on the
+        next transcript. Returns True when the session was closed (deep sleep)
+        and the caller's send loop should exit."""
+        if _dtmf_force_active[0]:
+            _dtmf_force_active[0] = False
+            if self._monitoring:
+                self._monitoring = False   # Active supersedes Monitoring
+                _log_entry("system", "Monitoring stopped")
+            if not self._active:
+                self._active = True
+                _last_interaction[0] = __import__("time").time()
+                _log_entry("system", "Voice activated")
+                log.info("DTMF force-active applied to session")
+        if _dtmf_force_monitor[0] is not None:
+            _mon = _dtmf_force_monitor[0]
+            _dtmf_force_monitor[0] = None
+            if _mon and not self._monitoring:
+                self._monitoring = True
+                self._active = False   # monitoring is passive
+                _log_entry("system", "Monitoring started")
+                log.info("DTMF force-monitor ON")
+            elif not _mon and self._monitoring:
+                self._monitoring = False
+                _log_entry("system", "Monitoring stopped")
+                log.info("DTMF force-monitor OFF")
+        if _dtmf_force_deepsleep[0]:
+            _dtmf_force_deepsleep[0] = False
+            _persist_active[0] = False
+            _persist_monitoring[0] = False
+            self._monitoring = False   # turn off monitoring on current session
+            _sleep_requested[0] = True
+            _is_sleeping[0] = True
+            _save_sleep_state(True)
+            log.info("DTMF deep-sleep — closing WebSocket")
+            await ws.close()   # closes STT WebSocket; run() exits cleanly
+            return True
+        if _dtmf_force_silent[0]:
+            _dtmf_force_silent[0] = False
+            self._active = False
+            _log_entry("system", "Voice silenced")
+            log.info("DTMF force-silent applied to session")
+        return False
+
     async def _send_mic(self, ws):
         while not self.stop_event.is_set():
             # Apply DTMF force flags immediately (don't wait for next transcript)
             # — this loop iterates on every mic chunk, so this checks at least
             # every DEVICE_BLOCKSIZE and at most every 0.5s (the timeout below).
-            if _dtmf_force_active[0]:
-                _dtmf_force_active[0] = False
-                if self._monitoring:
-                    self._monitoring = False   # Active supersedes Monitoring
-                    _log_entry("system", "Monitoring stopped")
-                if not self._active:
-                    self._active = True
-                    _last_interaction[0] = __import__("time").time()
-                    _log_entry("system", "Voice activated")
-                    log.info("DTMF force-active applied to session")
-            if _dtmf_force_monitor[0] is not None:
-                _mon = _dtmf_force_monitor[0]
-                _dtmf_force_monitor[0] = None
-                if _mon and not self._monitoring:
-                    self._monitoring = True
-                    self._active = False   # monitoring is passive
-                    _log_entry("system", "Monitoring started")
-                    log.info("DTMF force-monitor ON")
-                elif not _mon and self._monitoring:
-                    self._monitoring = False
-                    _log_entry("system", "Monitoring stopped")
-                    log.info("DTMF force-monitor OFF")
-            if _dtmf_force_deepsleep[0]:
-                _dtmf_force_deepsleep[0] = False
-                _persist_active[0] = False
-                _persist_monitoring[0] = False
-                self._monitoring = False   # turn off monitoring on current session
-                _sleep_requested[0] = True
-                _is_sleeping[0] = True
-                _save_sleep_state(True)
-                log.info("DTMF deep-sleep — closing WebSocket")
-                await ws.close()   # closes STT WebSocket; run() exits cleanly
+            if await self._apply_dtmf_flags(ws):
                 return
-            if _dtmf_force_silent[0]:
-                _dtmf_force_silent[0] = False
-                self._active = False
-                _log_entry("system", "Voice silenced")
-                log.info("DTMF force-silent applied to session")
             try:
                 chunk = await asyncio.wait_for(self._mic_q.get(), timeout=0.5)
             except asyncio.TimeoutError:
@@ -5507,6 +5516,10 @@ class GeminiTranscribeSession(BaseVoiceSession):
         started = time.monotonic()
         last_send = time.monotonic()
         while not self.stop_event.is_set() and not self._shutdown.is_set():
+            # Gemini doesn't use _send_mic, so DTMF flags must be applied here
+            # too — otherwise they wait for the next transcript (or never apply).
+            if await self._apply_dtmf_flags(ws):
+                return
             try:
                 chunk = await asyncio.wait_for(self._mic_q.get(), timeout=0.1)
             except asyncio.TimeoutError:
