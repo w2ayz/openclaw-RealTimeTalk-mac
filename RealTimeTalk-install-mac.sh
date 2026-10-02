@@ -130,6 +130,7 @@ source "$SKILL_DIR/RealTimeTalk-config-lib.sh"
 
 run_stt_setup
 run_tts_setup
+run_elevenlabs_setup
 run_vocabulary_setup
 
 # ── 5. Audio devices ─────────────────────────────────────────────────────────

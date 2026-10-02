@@ -177,7 +177,10 @@ Two optional keys pick the ElevenLabs voice and model:
   "elevenlabsModel": "eleven_v3" }
 ```
 
-Both default to the values shown (Lily on `eleven_v3`). For an instant
+Both default to the values shown (Lily on `eleven_v3`). `RTT-Config.sh`
+sets them interactively: it lists your account's own voices and the
+TTS-capable models live from the ElevenLabs API (needs a key with
+`voices_read`/`models_read`; otherwise paste a voice ID by hand). For an instant
 voice clone, use `eleven_multilingual_v2` or `eleven_v4` rather than
 `eleven_v3`: v3 reinterprets the voice heavily, and a clone built from a
 couple of short samples drifts toward a generic voice on it (measured on

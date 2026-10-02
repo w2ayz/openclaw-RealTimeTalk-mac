@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # RTT-Config.sh — re-runnable setup for STT keys/engine, TTS
-# keys/engine order, and STT custom vocabulary. Safe to run anytime after
+# keys/engine order, ElevenLabs voice/model, and STT custom vocabulary. Safe to run anytime after
 # the initial install (RealTimeTalk-install-mac.sh) — it never touches
 # Homebrew deps, the Python venv, audio device selection, or the LaunchAgent
 # plist. Use it to add a key you skipped earlier, change the TTS engine
@@ -35,10 +35,11 @@ echo "  Every step below can be skipped — press Enter to keep what's already"
 echo "  there. This whole script is safe to re-run anytime:"
 echo "    bash \"$SKILL_DIR/RTT-Config.sh\""
 echo "  Run it again later to add a key you skipped now, change the TTS"
-echo "  engine order, or add more STT vocabulary."
+echo "  engine order, pick the ElevenLabs voice/model, or add more STT vocabulary."
 
 run_stt_setup
 run_tts_setup
+run_elevenlabs_setup
 run_vocabulary_setup
 
 bold "=== Configure complete ==="

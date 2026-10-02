@@ -1,5 +1,24 @@
 # Changelog
 
+## [3.25.6] — 2026-10-02
+
+### Added
+
+- **ElevenLabs voice and model step in `RTT-Config.sh`** (and the
+  installer), via a new `run_elevenlabs_setup` in
+  `RealTimeTalk-config-lib.sh`. It lists the account's own voices
+  (cloned/professional/generated, plus Lily) and every TTS-capable model
+  live from the ElevenLabs API, marks the current choice, and writes
+  `elevenlabsVoiceId` / `elevenlabsModel` to `rtt_tts_config.json`. Enter
+  keeps the current values; a voice ID can also be pasted directly, which
+  is the fallback when the key lacks `voices_read`. Skipped when there's no
+  ElevenLabs key or `elevenlabs` isn't in the TTS order. Ported from the Pi
+  fork's v3.25.6, adapted for Bash 3.2: the Python helper is written to a
+  `mktemp` file and run by path, rather than the Pi's `python -c
+  "$(cat <<'PYEOF' ...)"`, because Bash 3.2 mis-parses quotes inside a
+  heredoc nested in `$( )`. Running it by path also keeps stdin on the
+  terminal so `input()` works.
+
 ## [3.25.5] — 2026-10-02
 
 ### Added

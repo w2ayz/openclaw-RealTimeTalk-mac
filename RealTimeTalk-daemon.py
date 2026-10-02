@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.25.5"
+__version__ = "3.25.6"
 
 import argparse
 import asyncio
