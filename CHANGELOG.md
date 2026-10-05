@@ -1,5 +1,25 @@
 # Changelog
 
+## [3.27.2] — 2026-10-05
+
+### Fixed
+
+- **Saying "yes" to the step-2 "`<AgentName>`?" confirmation left the
+  daemon stuck in Silent** — confirmed live right after v3.27.1 removed
+  the owner-voice bypass: `_verify_speaker`'s `SPK_MIN_SECS` (0.8s) floor
+  routinely rejects a one-word reply like "yes" as "too short to verify",
+  and that gate ran *before* the `_pending_wake_confirm` check — so the
+  rejected "yes" never reached the code that would have cleared the flag
+  and activated. `_pending_wake_confirm` stayed `True` indefinitely (until
+  `_WAKE_CONFIRM_TIMEOUT` lapsed on some later transcript), and nothing
+  short enough to pass as a confirmation word could ever get through.
+  Fixed by moving the `_pending_wake_confirm` check ahead of the owner-only
+  gate's early return: the wake phrase that set the flag already passed
+  `_verify_speaker` (the gate still runs first and unconditionally, just no
+  longer *blocks* on its own result until after this check), so the
+  confirmation reply doesn't need a second, inherently-unreliable
+  biometric pass on a one-word utterance.
+
 ## [3.27.1] — 2026-10-05
 
 ### Fixed

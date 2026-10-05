@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.27.1"
+__version__ = "3.27.2"
 
 import argparse
 import asyncio
@@ -4987,9 +4987,12 @@ class BaseVoiceSession:
         # Owner-only gate — BEFORE wake/sleep/control phrases so that in
         # owner-only mode EVERYTHING requires the enrolled voice. Dashboard
         # HTTP buttons remain ungated fallbacks by design (they never reach
-        # this method).
-        if not await self._verify_speaker(transcript):
-            return
+        # this method). Still called unconditionally even when about to be
+        # bypassed below (_pending_wake_confirm case) — it unconditionally
+        # pops the matching audio segment off the FIFO regardless of
+        # verification result, and skipping the call entirely would desync
+        # that FIFO against the next real transcript.
+        _speaker_verified = await self._verify_speaker(transcript)
 
         import time as _ti
         import functools as _ft
@@ -4999,7 +5002,17 @@ class BaseVoiceSession:
             self._busy.clear()
             _post_busy_until[0] = _ti.time() + 0.5
 
-        # Wake confirmation pending — check affirmative response before anything else.
+        # Wake confirmation pending — check affirmative response before anything
+        # else, and BEFORE the owner-only gate below applies to it. The wake
+        # phrase that set this flag already passed _verify_speaker (gated
+        # above on every transcript), so this round-trip is not a fresh
+        # command needing its own biometric check — it's just a mis-fire
+        # safety confirmation. That matters because it's often a one-word
+        # reply ("yes", "<AgentName>"): confirmed live that _verify_speaker's
+        # SPK_MIN_SECS (0.8s) floor routinely rejects utterances that short
+        # as "too short to verify", which previously fell through to the
+        # gate's early return below and left _pending_wake_confirm stuck
+        # True — the daemon never left Silent no matter what was said next.
         if self._pending_wake_confirm:
             elapsed = _ti.time() - self._pending_wake_t
             self._pending_wake_confirm = False
@@ -5025,6 +5038,13 @@ class BaseVoiceSession:
             else:
                 log.info("Wake mis-fire — not confirmed: %r", transcript)
                 _log_entry("system", f"Wake mis-fire — ignored ({transcript!r})")
+            return
+
+        # Owner-only gate applies to everything from here on (the
+        # _pending_wake_confirm reply above is deliberately exempt — see its
+        # comment). Dashboard HTTP buttons remain ungated fallbacks by
+        # design (they never reach this method).
+        if not _speaker_verified:
             return
 
         # Wake phrase — always checked regardless of active/monitoring state.
