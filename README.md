@@ -306,8 +306,10 @@ listening for the pretrained phrase **"Hey Jarvis"** (no API key, no
 network; models fetched once by the installer, threshold `0.60`). Saying it
 only reconnects STT into Silent — it does **not** activate by itself, since
 a local wake-word model has a real false-positive rate unlike full-sentence
-STT matching; say "\<agent name\> wake up" as normal once reconnected to
-actually activate (same "Yes?" confirmation as any other wake). HTTP
+STT matching; say "\<agent name\> wake up" (or "Hey Jarvis" again — it's
+also a regular `WAKE_PHRASES` entry, not just OpenWakeWord's local trigger)
+once reconnected to request activation, then confirm with "yes" (or, again,
+a repeated wake phrase — "Hey Jarvis" works as that "yes" too). HTTP
 `/wake` and DTMF still work too, and don't need OpenWakeWord. Same design
 and threshold on both forks — the Pi fork keeps its OpenWakeWord listener
 running continuously the whole time the daemon is up (PipeWire supports

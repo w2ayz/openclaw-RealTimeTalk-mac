@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.26.0"
+__version__ = "3.26.1"
 
 import argparse
 import asyncio
@@ -1997,7 +1997,13 @@ TRANSCRIPTION_PROMPT = "Zeebot."  # teaches name spelling only; too short to hal
 TRANSCRIPTION_PROMPT_NORM = "zeebot"
 
 WAKE_PHRASES     = {"zeebot wake up", "real time talk on", "real-time talk on", "realtimetalk on",
-                    "zibob wake up", "zibot wake up", "libot wake up", "ziba wake up"}
+                    "zibob wake up", "zibot wake up", "libot wake up", "ziba wake up",
+                    # Also recognized as a normal STT wake phrase (not just by the local
+                    # OpenWakeWord detector) — lets "Hey Jarvis" work as the step-2
+                    # confirmation too, since a repeated WAKE_PHRASES match is accepted
+                    # as "yes" (see _pending_wake_confirm handling below). Matches the
+                    # Pi fork's WAKE_PHRASES exactly.
+                    "hey jarvis", "hey jarvis wake up", "hej jarvis", "hay jarvis", "jarvis"}
 SLEEP_PHRASES    = {"zeebot go to sleep", "real time talk off", "real-time talk off", "realtimetalk off"}
 
 # Wake confirmation — affirmative responses accepted after Zeebot asks "Yes?"
@@ -8672,7 +8678,11 @@ if __name__ == "__main__":
     TRANSCRIPTION_PROMPT      = f"{_agent_name}."
     TRANSCRIPTION_PROMPT_NORM = _agent_name_lc
 
-    WAKE_PHRASES  = {_wake_primary, "real time talk on", "real-time talk on", "realtimetalk on"}
+    WAKE_PHRASES  = {_wake_primary, "real time talk on", "real-time talk on", "realtimetalk on",
+                     # Matches the Pi fork's WAKE_PHRASES — also lets "Hey Jarvis" work as
+                     # the step-2 confirmation (a repeated WAKE_PHRASES match is accepted
+                     # as "yes"), not just as OpenWakeWord's reconnect-to-Silent trigger.
+                     "hey jarvis", "hey jarvis wake up", "hej jarvis", "hay jarvis", "jarvis"}
     if args.wake_phrase:
         WAKE_PHRASES.add(f"{_agent_name_lc} wake up")  # keep name-derived phrase alongside custom one
     SLEEP_PHRASES = {f"{_agent_name_lc} go to sleep",

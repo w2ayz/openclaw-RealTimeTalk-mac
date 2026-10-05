@@ -1,5 +1,25 @@
 # Changelog
 
+## [3.26.1] — 2026-10-04
+
+### Fixed
+
+- **"Hey Jarvis" now also works as the step-2 confirmation when waking
+  from Sleeping Mode**, not just as OpenWakeWord's step-1 reconnect
+  trigger. `WAKE_PHRASES` was missing `"hey jarvis"` / `"hey jarvis wake
+  up"` / `"hej jarvis"` / `"hay jarvis"` / `"jarvis"` entirely — Pi's
+  `WAKE_PHRASES` already had all five (its `_build_phrase_sets` docstring
+  even says so: "also caught by openwakeword in SLEEP state"), but Mac's
+  never did. Since a repeated `WAKE_PHRASES` match is accepted as "yes"
+  during `_pending_wake_confirm` (same mechanism "`<agent name>` wake up"
+  said twice already used), the fix is purely additive — no new
+  confirmation logic, just closing a phrase-list gap that made Mac and Pi
+  diverge in practice despite near-identical code. Two-step flow
+  unchanged by design (see v3.26.0): full reconnect-to-Active in one
+  "Hey Jarvis" was deliberately rejected as a feature request this same
+  day, to keep the local wake-word model's false-positive risk from
+  reaching Active on its own.
+
 ## [3.26.0] — 2026-10-04
 
 ### Changed
