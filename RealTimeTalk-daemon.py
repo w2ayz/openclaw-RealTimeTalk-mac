@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.27.3"
+__version__ = "3.27.4"
 
 import argparse
 import asyncio
@@ -2043,6 +2043,15 @@ SLEEP_PHRASES    = {"zeebot go to sleep", "real time talk off", "real-time talk 
 # "<AGENT_NAME>?" (echoes its own name back, rather than a generic "Yes?",
 # so the confirmation itself re-confirms which agent is being addressed —
 # see v3.27.0).
+#
+# Bare "<AgentName>" and "yes <AgentName>" are ALSO accepted — handled
+# separately in _handle_transcript (not added as literal strings here)
+# because TRANSCRIPTION_PROMPT_NORM is rebuilt per --agent-name at startup,
+# and this set is not. A bare agent-name reply used to be silently eaten by
+# the prompt-echo-drop filter before ever reaching this check, leaving
+# _pending_wake_confirm stuck True — see that filter's comment. Fixed
+# 2026-10-05 after a live mis-fire: user said "Zeebot" back to "Zeebot?"
+# and the daemon ignored it rather than confirming or rejecting it.
 _WAKE_CONFIRM_AFFIRM = {
     "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "correct", "affirmative",
     "go ahead", "wake up", "wake", "activate", "please", "do it", "yes please",
@@ -4958,15 +4967,23 @@ class BaseVoiceSession:
         transcript = _to_simplified(transcript)
 
         # Drop bare prompt echoes — "Zeebot." hallucinated on silence.
+        # Exempt while a wake confirmation is pending: the bare agent name is
+        # a valid "Zeebot?" reply there (see _pending_wake_confirm below), and
+        # this filter used to eat it silently (log.debug, invisible at the
+        # default log level) before it ever reached that check — leaving
+        # _pending_wake_confirm stuck True and swallowing the next real wake
+        # attempt as a stale timeout. Confirmed live 2026-10-05.
         _tnorm = _normalize(transcript)
-        if _tnorm == TRANSCRIPTION_PROMPT_NORM:
+        if _tnorm == TRANSCRIPTION_PROMPT_NORM and not self._pending_wake_confirm:
             log.debug("Dropped prompt echo: %r", transcript)
             return
 
         # Noise hallucination filter: drop consonant-heavy gibberish from background
         # noise that slipped past the VAD. (Monitoring mode is exempt so you can
-        # still diagnose what the transcriber produces.)
-        if not self._monitoring and _is_likely_noise(transcript):
+        # still diagnose what the transcriber produces; a pending wake
+        # confirmation is exempt for the same reason as the prompt-echo guard
+        # above — short yes/no replies must reach that check, not die here.)
+        if not self._monitoring and not self._pending_wake_confirm and _is_likely_noise(transcript):
             log.debug("Dropped noise hallucination: %r", transcript)
             return
 
@@ -5014,7 +5031,10 @@ class BaseVoiceSession:
             if elapsed > _WAKE_CONFIRM_TIMEOUT:
                 log.info("Wake confirmation timed out (%.1fs) — mis-fire: %r", elapsed, transcript)
                 _log_entry("system", "Wake mis-fire (timeout) — staying silent")
-            elif normalized in _WAKE_CONFIRM_AFFIRM or _matches_phrase(normalized, WAKE_PHRASES):
+            elif (normalized in _WAKE_CONFIRM_AFFIRM
+                  or normalized == TRANSCRIPTION_PROMPT_NORM               # bare "<AgentName>"
+                  or normalized == f"yes {TRANSCRIPTION_PROMPT_NORM}"      # "yes <AgentName>"
+                  or _matches_phrase(normalized, WAKE_PHRASES)):
                 log.info("Wake confirmed — voice active")
                 _log_entry("system", "Voice activated")
                 self._busy.set()

@@ -1,5 +1,31 @@
 # Changelog
 
+## [3.27.4] — 2026-10-05
+
+### Changed
+
+- **Step-2 wake confirmation now also accepts a bare `"<AgentName>"` or
+  `"yes <AgentName>"` reply** (alongside existing `"yes"`/`"ok"`/etc.),
+  per request. Required two fixes together, not just a new accepted
+  phrase:
+  - The "drop bare prompt echoes" filter (meant to catch the STT
+    hallucinating its own `TRANSCRIPTION_PROMPT` hint on silence) was
+    eating a genuine bare-name confirmation reply *before* it ever
+    reached the `_pending_wake_confirm` check — confirmed live: saying
+    "Zeebot" back to "Zeebot?" was silently dropped (`log.debug`,
+    invisible at default log level), leaving `_pending_wake_confirm`
+    stuck `True` and causing the *next* real wake attempt to be consumed
+    as a stale timeout instead of registering. Same exemption applied to
+    the noise-hallucination filter for the same reason. Both filters stay
+    active for everything else — only exempted while a wake confirmation
+    is actually pending.
+  - The acceptance check itself now also matches
+    `TRANSCRIPTION_PROMPT_NORM` (bare agent name) and `f"yes
+    {TRANSCRIPTION_PROMPT_NORM}"`, computed from the already
+    per-`--agent-name`-rebuilt constant rather than hardcoded into the
+    static `_WAKE_CONFIRM_AFFIRM` set, so a custom `--agent-name` gets
+    the same two phrases for free.
+
 ## [3.27.3] — 2026-10-05
 
 ### Changed
