@@ -1,5 +1,35 @@
 # Changelog
 
+## [3.27.6] — 2026-10-05
+
+### Added
+
+- **Automatic mic gate calibration on every startup**, by request —
+  previously the gate only ever changed via an explicit `--calibrate`
+  run or the dashboard's manual recalibrate button; otherwise every
+  restart used whatever was last baked into the LaunchAgent plist (or
+  the compiled-in `MIC_GATE_PEAK = 80` if nobody ever ran either). Now,
+  unless `--no-auto-calibrate` is passed, the daemon measures ~2s of
+  ambient noise (`calibrate_mic()`, same algorithm as `--calibrate`,
+  now with a `verbose=False` mode so it logs instead of printing to a
+  terminal nobody's watching) right after device resolution and before
+  the real mic stream opens, and uses that instead — deliberately
+  overriding even an explicit `--mic-gate`/persisted plist value, since
+  the whole point is tracking *current* conditions, not a value frozen
+  from whenever someone last calibrated by hand. `--no-auto-calibrate`
+  is the escape hatch: skips the measurement and the ~2s startup delay,
+  falls back to `--mic-gate`/the compiled-in default exactly as before.
+  The existing "noise gate never calibrated" OpenAI warning now only
+  fires when auto-calibration was explicitly disabled AND no
+  `--mic-gate` was given either — calibrating every boot makes the old
+  "never calibrated" framing wrong otherwise.
+  **Known trade-off, accepted**: the underlying algorithm takes a single
+  ~2s window's peak x1.5 — one bad transient right at boot (a door, a
+  bark) could inflate that boot's gate until the next restart. Clamped
+  to `[MIC_GATE_MIN, MIC_GATE_MAX]` as before; not otherwise mitigated
+  (no averaging across repeats) — revisit if this causes real
+  mis-calibrations in practice.
+
 ## [3.27.5] — 2026-10-05
 
 ### Changed

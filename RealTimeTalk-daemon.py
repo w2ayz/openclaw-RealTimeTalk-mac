@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.27.5"
+__version__ = "3.27.6"
 
 import argparse
 import asyncio
@@ -8758,9 +8758,15 @@ async def main(http_port: int, input_device=None, output_device=None,
     log.info("Daemon stopped.")
 
 
-def calibrate_mic(input_device=None, duration: float = 3.0) -> int:
-    """Record ambient noise and return a recommended MIC_GATE_PEAK value (2× noise peak)."""
-    print(f"Calibrating mic — measuring ambient noise for {duration:.0f}s. Stay quiet.")
+def calibrate_mic(input_device=None, duration: float = 3.0, verbose: bool = True) -> int:
+    """Record ambient noise and return a recommended MIC_GATE_PEAK value (1.5x noise peak).
+
+    verbose=False is used by the automatic startup calibration (see
+    __main__'s --no-auto-calibrate handling below) — no point printing
+    "stay quiet" to a terminal nobody's watching in a background daemon;
+    the caller logs the result itself instead."""
+    if verbose:
+        print(f"Calibrating mic — measuring ambient noise for {duration:.0f}s. Stay quiet.")
     peaks = []
     def cb(indata, frames, t, s):
         raw = indata[::RESAMPLE_RATIO, 0]
@@ -8772,7 +8778,8 @@ def calibrate_mic(input_device=None, duration: float = 3.0) -> int:
     peaks = peaks[2:]  # discard first two frames (hardware warmup)
     noise_peak = max(peaks) if peaks else 0
     recommended = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.5)))
-    print(f"Noise floor peak: {noise_peak}  →  recommended MIC_GATE_PEAK: {recommended} (clamped {MIC_GATE_MIN}–{MIC_GATE_MAX})")
+    if verbose:
+        print(f"Noise floor peak: {noise_peak}  →  recommended MIC_GATE_PEAK: {recommended} (clamped {MIC_GATE_MIN}–{MIC_GATE_MAX})")
     return recommended
 
 
@@ -8794,7 +8801,15 @@ if __name__ == "__main__":
     p.add_argument("--mic-gain",        type=float, default=MIC_GAIN,
                    help=f"Software mic gain multiplier (default: {MIC_GAIN})")
     p.add_argument("--mic-gate",        type=int, default=MIC_GATE_PEAK,
-                   help=f"Noise gate threshold — pre-gain peak below this → silence (default: {MIC_GATE_PEAK})")
+                   help=f"Noise gate threshold — pre-gain peak below this → silence (default: {MIC_GATE_PEAK}). "
+                        "Ignored unless --no-auto-calibrate is also set — see that flag.")
+    p.add_argument("--no-auto-calibrate", action="store_true",
+                   help="Skip the automatic ambient-noise mic calibration that normally runs "
+                        "on every startup (~2s, before the mic opens for real) and use "
+                        "--mic-gate (or the compiled-in default) as a fixed value instead. "
+                        "Auto-calibration re-measures every restart specifically so the gate "
+                        "tracks whatever this room/mic sounds like right now — pass this flag "
+                        "to pin a manually-tuned value instead.")
     p.add_argument("--spk-threshold",   type=float, default=None,
                    help=f"Speaker-verification cosine threshold override (default: {SPK_THRESHOLD_DEFAULT})")
     p.add_argument("--agent-name",      type=str, default="Zeebot",
@@ -8951,22 +8966,49 @@ if __name__ == "__main__":
     except Exception:
         pass
 
+    # Automatic ambient-noise calibration — runs on every startup (not just
+    # once) specifically so the gate tracks whatever this room/mic sounds
+    # like right now, rather than a value frozen the one time someone ran
+    # --calibrate by hand (or the compiled-in default, which was tuned for a
+    # different room/mic entirely). Deliberately overrides --mic-gate too
+    # (even a persisted, dashboard-recalibrated plist value) unless
+    # --no-auto-calibrate is passed — that's the escape hatch for pinning a
+    # known-good value and skipping the ~2s startup measurement. Runs here,
+    # sequentially before anything else opens a mic stream: this device
+    # doesn't support two concurrent input streams (see OpenWakeWord's own
+    # Sleeping-only listener window for the same constraint), so calibration
+    # must fully open-measure-close before the daemon's real stream starts.
+    _mic_gate_explicit = any(a == "--mic-gate" or a.startswith("--mic-gate=") for a in sys.argv)
+    if not args.no_auto_calibrate:
+        try:
+            _measured_gate = calibrate_mic(input_device=_selected_input_device[0],
+                                            duration=2.0, verbose=False)
+            MIC_GATE_PEAK = _measured_gate
+            log.info("Auto-calibrated mic gate for this boot: %d "
+                     "(override with --mic-gate, or pass --no-auto-calibrate to stop "
+                     "re-measuring on every restart)", _measured_gate)
+        except Exception as _e:
+            log.warning("Auto-calibration failed (%s) — using %s %d", _e,
+                        "explicit --mic-gate" if _mic_gate_explicit else "compiled-in default",
+                        MIC_GATE_PEAK)
+
     _mic_gate_ref[0] = MIC_GATE_PEAK
     log.info("Audio: in=%s out=%s gain=%.1f gate=%d",
              _device_label(_selected_input_device[0]),
              _device_label(_selected_output_device[0]),
              MIC_GAIN, MIC_GATE_PEAK)
-    # Only warn when nobody ever passed --mic-gate at all — a value <= 80
-    # isn't necessarily wrong (a genuinely quiet room can calibrate lower
-    # than that), so compare presence-on-the-command-line rather than the
-    # resulting number, or a real calibrated value would falsely trip this.
-    _mic_gate_explicit = any(a == "--mic-gate" or a.startswith("--mic-gate=") for a in sys.argv)
-    if load_openai_key() and not _mic_gate_explicit:
-        log.warning("Noise gate (%d) is the compiled-in default -- never calibrated for "
-                     "this room/mic. OpenAI's gpt-live-transcribe has no server-side voice "
-                     "detection (turn_detection: null) -- this gate is the ONLY signal "
-                     "deciding when you've stopped talking. If OpenAI transcripts never "
-                     "finalize (mic seems to 'hang open'), run "
+    # Only warn when calibration never ran AND nobody ever passed --mic-gate
+    # either — a value <= 80 isn't necessarily wrong (a genuinely quiet room
+    # can calibrate lower than that), so compare presence/action rather than
+    # the resulting number, or a real calibrated value would falsely trip
+    # this.
+    if load_openai_key() and args.no_auto_calibrate and not _mic_gate_explicit:
+        log.warning("Noise gate (%d) is the compiled-in default -- auto-calibration is "
+                     "disabled (--no-auto-calibrate) and no --mic-gate was given. "
+                     "OpenAI's gpt-live-transcribe has no server-side voice detection "
+                     "(turn_detection: null) -- this gate is the ONLY signal deciding when "
+                     "you've stopped talking. If OpenAI transcripts never finalize (mic "
+                     "seems to 'hang open'), drop --no-auto-calibrate or run "
                      "'RealTimeTalk-daemon.py --calibrate' for this room/mic and restart "
                      "with the recommended --mic-gate.", MIC_GATE_PEAK)
 
