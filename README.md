@@ -287,7 +287,7 @@ Or via HTTP:
 
 - `GET http://localhost:19000/dashboard` — UI
 - `GET http://localhost:19000/wake` — activate
-- `GET http://localhost:19000/sleep` — deactivate
+- `GET http://localhost:19000/sleep` — Sleeping Mode: fully disconnect the STT session (not just go quiet)
 - `GET http://localhost:19000/restart` — restart daemon
 - `POST http://127.0.0.1:19000/speak` — speak arbitrary text (see below)
 
@@ -296,8 +296,24 @@ default name) while Silent or Monitoring — the agent asks "Yes?" and
 activates only on an affirmative reply ("yes", "ok", "wake up", "好", etc.)
 or a repeated wake phrase within 15s, to avoid self-triggering off its own
 TTS or background chatter. The dashboard Wake button skips this and
-activates immediately. Once active: "\<agent name\> go to sleep",
-"calibrate mic", etc.
+activates immediately. Once active: "\<agent name\> go to sleep" puts it in
+**Sleeping Mode** — a full STT disconnect, not just going quiet (that
+lighter "stay connected but silent" behavior still exists, just not via the
+button or this phrase; see DTMF `321` below). Since the mic isn't being
+transcribed by any cloud STT at all while Sleeping, waking back up by voice
+uses a separate, local, offline detector — [OpenWakeWord](https://github.com/dscripka/openWakeWord)
+listening for the pretrained phrase **"Hey Jarvis"** (no API key, no
+network; models fetched once by the installer, threshold `0.60`). Saying it
+only reconnects STT into Silent — it does **not** activate by itself, since
+a local wake-word model has a real false-positive rate unlike full-sentence
+STT matching; say "\<agent name\> wake up" as normal once reconnected to
+actually activate (same "Yes?" confirmation as any other wake). HTTP
+`/wake` and DTMF still work too, and don't need OpenWakeWord. Same design
+and threshold on both forks — the Pi fork keeps its OpenWakeWord listener
+running continuously the whole time the daemon is up (PipeWire supports
+multiple simultaneous mic consumers), while this fork only opens its own
+listener stream during the window it's actually Sleeping (this USB device
+doesn't support a second concurrent input stream).
 
 ### Pushing text from OpenClaw (or any local process)
 

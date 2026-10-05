@@ -104,6 +104,14 @@ echo "Installing Python deps (see requirements.txt)..."
 green "  ✓ venv ready"
 echo
 
+echo "Fetching OpenWakeWord models (Sleeping Mode local wake-word detection)..."
+if "$VENV_PY" -c "import openwakeword; openwakeword.utils.download_models()" >/dev/null 2>&1; then
+    green "  ✓ OpenWakeWord models ready"
+else
+    yellow "  → OpenWakeWord model download failed — Sleeping Mode will only wake via HTTP/DTMF until this is retried"
+fi
+echo
+
 # ── 4. STT keys/engine, TTS keys/engine order, STT vocabulary ────────────────
 # Keys live in openclaw.json (talk.providers.<name>.apiKey). Engine/order
 # choices live in the daemon's own config files

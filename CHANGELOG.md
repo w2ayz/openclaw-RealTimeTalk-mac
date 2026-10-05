@@ -1,5 +1,64 @@
 # Changelog
 
+## [3.26.0] — 2026-10-04
+
+### Changed
+
+- **Sleeping Mode: the dashboard Sleep button and the "`<agent name>` go to
+  sleep" voice phrase now fully disconnect the STT session** (same as DTMF
+  `987`), instead of just going quiet while staying connected (that lighter
+  behavior — still billing, still listening — is now only reachable via
+  DTMF `321`, unchanged). Both call sites now just set
+  `_dtmf_force_deepsleep[0] = True`, reusing `_apply_dtmf_flags`'s existing
+  close-the-websocket path (polled by `_send_mic` at least every 0.5s) —
+  same pattern `_wake_activate` already used across DTMF and HTTP. Ported
+  the equivalent change to the Pi fork in lockstep (same version) — its
+  `/sleep` and SLEEP_PHRASES were doing the same old light-sleep thing.
+
+### Added
+
+- **Local OpenWakeWord wake-word detection (`_oww_listener`) covers voice
+  wake while fully asleep**, where previously only HTTP `/wake` or DTMF
+  could reconnect — the main session's mic capture doesn't exist at all
+  during a full STT disconnect, so no cloud phrase-matching was possible.
+  Runs a pretrained `hey_jarvis` ONNX model (no API key, no network) on its
+  own short-lived `sd.InputStream`, strictly sequential with the main
+  session's mic stream (only opens while `_is_sleeping` and no session owns
+  the device — unlike the Pi fork, which keeps its OWW listener running
+  continuously the whole time the daemon is up, concurrent with the main
+  capture stream; PipeWire supports that multi-client, CoreAudio/PortAudio
+  on this USB device does not, confirmed by this fork's existing
+  single-consumer mic design elsewhere). Detection wakes to **Silent only**
+  (reconnects STT, same as any wake with no `_wake_activate`) — never
+  straight to Active; the user still has to say "`<agent name>` wake up"
+  once reconnected, going through the normal wake-phrase + "Yes?"
+  confirmation. This matches the Pi fork's own design exactly, found
+  *after* building an independent (worse) design here first — see note
+  below. Threshold `0.60`, also matching Pi, raised from openwakeword's
+  library default of `0.50` after Pi logged a real false positive from
+  ambient conversation (Pi commit `7dd503c`, 2026-05-30) — not re-tuned
+  independently here. New dependency: `openwakeword` (see
+  `requirements.txt`); models fetched once via
+  `openwakeword.utils.download_models()` (now part of the installer).
+
+  **Build note:** the Pi fork already had its own independent OpenWakeWord
+  integration before any of this — missed entirely before writing the
+  first version of this entry, because only Pi's recent commit log was
+  checked, not its actual code (the OWW work predates the commits looked
+  at). First Mac version activated straight to Active on a bare "Hey
+  Jarvis" via a dedicated confirm task; reworked to match Pi's
+  wake-to-Silent design once this was caught, which is also simply less
+  code. Separately, the dashboard Sleep button's hint text had a real bug
+  from writing this without reference to Pi: it embedded literal
+  `"Hey Jarvis"` (with literal double quotes) inside an already
+  double-quoted `data-hint="..."` HTML attribute, silently truncating the
+  tooltip at the first embedded quote (visible live: "Sleeping Mode:
+  disconnect STT entirely. Say" and nothing after). Fixed by switching to
+  Pi's exact hint wording, which avoids quoting "Hey Jarvis" at all. Also
+  added a persistent dashboard banner while actually Sleeping, matching
+  Pi's `_idle_disconnected` banner — Mac had no equivalent at all before
+  this.
+
 ## [3.25.6] — 2026-10-02
 
 ### Added

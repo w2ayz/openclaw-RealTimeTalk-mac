@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.25.6"
+__version__ = "3.26.0"
 
 import argparse
 import asyncio
@@ -213,6 +213,23 @@ DEFAULT_HTTP_PORT = 19000
 RECONNECT_DELAY   = 5
 AGENT_TIMEOUT_S   = 90
 AUTO_SLEEP_SECS   = 600          # go silent after 10 min of no interaction
+
+# OpenWakeWord: local, offline wake-word detection used ONLY while fully
+# asleep (STT disconnected — see Sleeping Mode / _dtmf_force_deepsleep).
+# No pretrained model exists for the agent's own name, so this only wakes
+# to Silent (reconnects STT, same as any other wake with no _wake_activate)
+# — NOT directly to Active. The real "<agent name> wake up" + "Yes?"
+# confirmation still happens the normal way once reconnected. Matches the
+# Pi fork's design exactly (ported from there, not the other way around —
+# see CHANGELOG): a bare "Hey Jarvis" from ambient noise only reconnects,
+# it can't talk its way into Active on its own.
+OWW_ENABLED       = True         # set False (or --no-oww) to disable if the model/package misbehaves
+OWW_WAKE_MODEL    = "hey_jarvis"
+OWW_THRESHOLD     = 0.60         # matches the Pi fork — raised from the library default of 0.50
+                                  # after a real false-positive there (ambient conversation, logged
+                                  # at 14:23 on 2026-05-30); see Pi commit 7dd503c
+OWW_SAMPLE_RATE   = 16000        # fixed by the pretrained models' training data, not a user choice
+OWW_CHUNK         = 1280         # 80 ms at 16 kHz — openwakeword's own recommended chunk size
 # Languages accepted in multi-lang WHITELIST mode (langdetect codes + script tokens).
 MULTILANG_WHITELIST_LANGS: list = ["en", "zh-cn", "zh-tw", "zh", "ko", "ja", "es", "ms"]
 MIC_GAIN          = 5.0
@@ -967,6 +984,82 @@ def _stop_radio_monitor() -> None:
                 pass
         _radio_monitor_out_dev[0] = None
         _radio_rx_tap_release()
+
+
+def _oww_listener(session_ref: list) -> None:
+    """Background thread: local OpenWakeWord wake-word detection, active ONLY
+    while the daemon is in Sleeping Mode (STT fully disconnected — see
+    _dtmf_force_deepsleep) with no session owning the mic. Lets a spoken
+    wake phrase reconnect without an always-on, always-billing STT
+    connection. Opens its own short-lived sd.InputStream, strictly
+    sequential with the main session's mic stream — never concurrent, since
+    it only runs during the window where session_ref[0] is None.
+
+    On detection this wakes to Silent only (reconnects STT, same as any
+    other wake with no _wake_activate) — never straight to Active. Matches
+    the Pi fork's design: a local wake-word model has a real false-positive
+    rate, unlike full-sentence STT matching, so ambient noise saying "Hey
+    Jarvis" can only reconnect, never talk its way into Active on its own.
+    The user still has to say "<agent name> wake up" once reconnected,
+    which goes through the normal wake-phrase + "Yes?" confirmation."""
+    if not OWW_ENABLED:
+        return
+    import time as _oww_time
+    try:
+        from openwakeword.model import Model as _OWWModel
+    except Exception as e:
+        log.warning("OpenWakeWord not installed — Sleeping Mode will only wake via HTTP/DTMF (%s)", e)
+        return
+    try:
+        model = _OWWModel(wakeword_models=[OWW_WAKE_MODEL], inference_framework="onnx")
+    except Exception as e:
+        log.warning("OpenWakeWord model load failed — Sleeping Mode will only wake via HTTP/DTMF (%s)", e)
+        return
+    log.info("OpenWakeWord ready (%s, threshold %.2f) — will listen locally while Sleeping",
+              OWW_WAKE_MODEL, OWW_THRESHOLD)
+    while True:
+        if not (_is_sleeping[0] and session_ref[0] is None):
+            _oww_time.sleep(0.5)
+            continue
+        # Just entered (or already in) Sleeping Mode with nothing holding the
+        # mic — listen locally until the phrase fires or we wake some other way.
+        hit = threading.Event()
+
+        def _cb(indata, frames, t, status, _hit=hit, _model=model):
+            if _hit.is_set():
+                return
+            try:
+                scores = _model.predict(indata[:, 0])
+            except Exception:
+                return
+            if scores.get(OWW_WAKE_MODEL, 0.0) >= OWW_THRESHOLD:
+                _hit.set()
+
+        try:
+            with sd.InputStream(samplerate=OWW_SAMPLE_RATE, channels=CHANNELS, dtype="int16",
+                                 blocksize=OWW_CHUNK, callback=_cb,
+                                 device=_selected_input_device[0]):
+                while not hit.is_set():
+                    if not (_is_sleeping[0] and session_ref[0] is None):
+                        break   # woke via HTTP/DTMF/restored state while we were listening
+                    _oww_time.sleep(0.1)
+        except Exception as e:
+            log.warning("OpenWakeWord mic stream failed (%s) — retrying in 5s", e)
+            _oww_time.sleep(5)
+            continue
+        model.reset()  # clear rolling buffers so a stale partial match can't bleed into the next listen
+        if not hit.is_set():
+            continue   # exited for another reason — loop back and re-check the gate
+        log.info("OpenWakeWord %r detected — reconnecting to Silent from Sleeping Mode", OWW_WAKE_MODEL)
+        _log_entry("system", f"\"{OWW_WAKE_MODEL.replace('_', ' ').title()}\" detected — reconnecting. "
+                              f"Say \"{AGENT_NAME} wake up\" to activate.")
+        _last_interaction[0] = _oww_time.time()
+        if _wake_event[0] and _event_loop[0]:
+            _event_loop[0].call_soon_threadsafe(_wake_event[0].set)
+        # Give the main loop a few seconds to actually reconnect and open its
+        # own mic stream before this thread's gate re-checks, so it doesn't
+        # race to reopen its own InputStream on the same device mid-handoff.
+        _oww_time.sleep(3.0)
 
 
 def _radio_rx_tap_watchdog() -> None:
@@ -4904,22 +4997,26 @@ class BaseVoiceSession:
                 _busy_clear()
             return
 
-        # Sleep phrase — only meaningful when active
+        # Sleep phrase — only meaningful when active. Goes to Sleeping Mode
+        # (full STT disconnect, same as DTMF 987) rather than just going
+        # quiet while still connected — _apply_dtmf_flags (polled by
+        # _send_mic) does the actual disconnect once this returns.
+        # OpenWakeWord covers voice-triggered wake while STT is down.
         if _matches_phrase_exact(normalized, SLEEP_PHRASES):
             if self._active:
-                self._active = False
-                _persist_active[0] = False
-                self._monitoring = False
-                _persist_monitoring[0] = False
-                log.info("Sleep phrase detected — going silent")
-                _log_entry("system", "Voice silenced")
+                log.info("Sleep phrase detected — entering Sleeping Mode")
+                _log_entry("system", "Voice silenced — Sleeping Mode")
                 self._busy.set()
                 try:
                     await asyncio.get_running_loop().run_in_executor(
-                        None, speak, f"Going silent now. Say {AGENT_NAME} wake up to resume.", self.alsa_output
+                        None, speak,
+                        f"Going to sleep now. Say Hey Jarvis, then {AGENT_NAME} wake up, "
+                        "or press Wake, to resume.",
+                        self.alsa_output
                     )
                 finally:
                     _busy_clear()
+                _dtmf_force_deepsleep[0] = True
             return
 
         # Calibration — works in both modes (audio feedback either way)
@@ -5725,6 +5822,11 @@ def _dashboard_dynamic(sess) -> dict:
             f'{_current_input_device_name()!r} &mdash; accepting ALL speakers on it. '
             '<a href="/voice-enroll" style="color:#f59e0b">Enroll</a></div>'
         )
+    elif _is_sleeping[0] and not sess:
+        device_banner = (
+            '<div id="dbanner" style="color:#475569;font-style:italic;">'
+            'Say &#8220;Hey Jarvis&#8221; or press Wake to resume.</div>'
+        )
     else:
         # Always emit the wrapper (even empty) so /dashboard-frag polling
         # can reliably find and replace #dbanner via outerHTML — a bare ""
@@ -5746,7 +5848,7 @@ def _dashboard_dynamic(sess) -> dict:
     }
     _hints = {
         "wake":    "Activate voice — the agent will listen and respond",
-        "sleep":   "Silence voice and stop monitoring. Say the wake phrase or press Wake to resume" if monitoring else "Silence voice. Say the wake phrase or press Wake to resume",
+        "sleep":   "Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume",
         "monitor": "Now: Monitoring ON. Click → stop monitoring" if monitoring else "Now: OFF. Click → start passive monitoring (transcribes without routing to agent)",
         "multilang": _ml_desc.get(multilang, "Toggle multi-language mode"),
         "ownermode": ("Now: Owner-only — only the enrolled voice is obeyed. Click → listen to everyone" if owner_only
@@ -6027,12 +6129,15 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                 self.send_header("Location", "/log")
                 self.end_headers()
             elif self.path == "/sleep":
+                # Sleeping Mode: full STT disconnect, same as DTMF 987 — not
+                # just going quiet while still connected (that's /monitor's
+                # job, or DTMF 321 for a session that wants to stay reachable
+                # by voice). _apply_dtmf_flags (polled by _send_mic at least
+                # every 0.5s) does the actual close; OpenWakeWord then covers
+                # voice-triggered wake while the STT connection is down.
                 if sess and (sess._active or sess._monitoring):
-                    sess._active = False
-                    _persist_active[0] = False
-                    sess._monitoring = False
-                    _persist_monitoring[0] = False
-                    log.info("HTTP sleep (active + monitoring cleared)")
+                    _dtmf_force_deepsleep[0] = True
+                    log.info("HTTP sleep — Sleeping Mode (disconnecting)")
                 self.send_response(302)
                 self.send_header("Location", "/log")
                 self.end_headers()
@@ -8378,6 +8483,7 @@ async def main(http_port: int, input_device=None, output_device=None,
     session_ref: list = [None]
     start_http_server(http_port, lambda: loop.call_soon_threadsafe(stop_event.set), session_ref, loop=loop)
     _threading.Thread(target=_radio_hotplug_watcher, args=(session_ref,), daemon=True, name="radio-hotplug").start()
+    _threading.Thread(target=_oww_listener, args=(session_ref,), daemon=True, name="oww-listener").start()
     _threading.Thread(target=_echotest_worker, daemon=True, name="echotest-worker").start()
     _threading.Thread(target=_radio_rx_tap_watchdog, daemon=True, name="radio-rx-tap-watchdog").start()
     _threading.Thread(target=_dtmf_listener, daemon=True, name="dtmf-radio").start()
@@ -8549,7 +8655,13 @@ if __name__ == "__main__":
                    help="Measure ambient noise and print recommended --mic-gate value, then exit")
     p.add_argument("--stt-engine",      type=str, default=None,
                    help="STT engine: openai, gemini, openai,gemini, gemini,openai, or auto")
+    p.add_argument("--no-oww",          action="store_true",
+                   help="Disable local OpenWakeWord listening in Sleeping Mode "
+                        "(wake stays possible via HTTP /wake or DTMF)")
     args = p.parse_args()
+
+    if args.no_oww:
+        OWW_ENABLED = False   # module-level: this whole block runs under __main__, not inside a function
 
     # --- Agent name / wake phrase configuration ---
     _agent_name    = args.agent_name.strip()
