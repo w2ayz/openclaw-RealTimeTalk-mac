@@ -1,5 +1,22 @@
 # Changelog
 
+## [3.27.3] — 2026-10-05
+
+### Changed
+
+- **The daemon now always boots into Sleeping Mode**, regardless of
+  whatever was persisted from the previous run. Previously it restored
+  `rtt_sleep_state.json`'s last-written value at startup — so a service
+  restart (bounce, mic device change, crash recovery) while already
+  Active or Silent came back the same way with no re-confirmation at all,
+  silently defeating the whole step-1/step-2 wake gate for however long
+  until the next deliberate sleep. Removed the now-dead
+  `_load_sleep_state` (startup no longer reads the file at all);
+  `_save_sleep_state` calls elsewhere are unchanged and still keep the
+  file accurate for diagnostics. Matches the Pi fork's intent, though
+  confirmed live that fork has the identical restore-on-restart code
+  path — see its own v3.27.3 changelog entry.
+
 ## [3.27.2] — 2026-10-05
 
 ### Fixed

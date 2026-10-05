@@ -81,7 +81,7 @@ safe to delete to reset that specific piece of state:
 | `rtt_voice_profiles.json` | Owner-only voice enrollment, keyed by device name (one entry per mic + one for the radio, if enrolled) |
 | `rtt_voice_mode.json` | Owner-only on/off + similarity threshold |
 | `rtt_dtmf_profiles.json` | Learned DTMF tone frequencies (Radio Mode) |
-| `rtt_sleep_state.json` | Whether the daemon was asleep at last shutdown (restored on restart) |
+| `rtt_sleep_state.json` | Tracks live sleep state for diagnostics; no longer read at startup (v3.27.3+) — the daemon always boots into Sleeping Mode regardless of what this says |
 | `rtt_stt_config.json` | Which STT engine to use and (optionally) the fallback: `{"provider": "gemini", "fallback": "openai"}`. Written by the installer; edit this file to switch engines (v3.22.4+). Never put this in `openclaw.json` — the gateway strips unknown `talk.*` keys. |
 
 ---

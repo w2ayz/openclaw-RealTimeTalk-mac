@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.27.2"
+__version__ = "3.27.3"
 
 import argparse
 import asyncio
@@ -2457,21 +2457,16 @@ def _save_device_prefs(output_name: str = None, input_name: str = None) -> None:
         log.warning("Could not save device prefs: %s", e)
 
 def _save_sleep_state(sleeping: bool) -> None:
-    """Persist sleep state to disk so it survives daemon/service restarts."""
+    """Persist sleep state to disk. Not read back at startup (the daemon
+    always boots into Sleeping Mode regardless — see main()); this just
+    keeps SLEEP_STATE_FILE accurate for anything inspecting it externally
+    (e.g. while diagnosing a restart)."""
     try:
         os.makedirs(os.path.dirname(SLEEP_STATE_FILE), exist_ok=True)
         with open(SLEEP_STATE_FILE, "w") as f:
             json.dump({"sleeping": sleeping}, f)
     except Exception as e:
         log.warning("Could not save sleep state: %s", e)
-
-def _load_sleep_state() -> bool:
-    """Return True if the daemon was sleeping when it last stopped."""
-    try:
-        with open(SLEEP_STATE_FILE) as f:
-            return bool(json.load(f).get("sleeping", False))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return False
 
 # ── Speaker verification (owner-only mode) ───────────────────────────────────
 
@@ -8594,13 +8589,20 @@ async def main(http_port: int, input_device=None, output_device=None,
     _threading.Thread(target=_echotest_worker, daemon=True, name="echotest-worker").start()
     _threading.Thread(target=_radio_rx_tap_watchdog, daemon=True, name="radio-rx-tap-watchdog").start()
     _threading.Thread(target=_dtmf_listener, daemon=True, name="dtmf-radio").start()
-    log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say '%s wake up' to activate)", AGENT_NAME)
+    log.info("OpenClaw RealTimeTalk daemon starting — Sleeping Mode (say 'Hey Jarvis', then "
+              "'%s wake up', or press Wake, to activate)", AGENT_NAME)
 
-    # Restore sleep state persisted across daemon/service restarts (e.g. mic device change).
-    if _load_sleep_state():
-        _is_sleeping[0] = True
-        _sleep_requested[0] = True
-        log.info("Restored sleep state from disk — waiting for wake signal…")
+    # Always boot into Sleeping Mode, regardless of whatever was persisted
+    # from the previous run — a restart (service bounce, mic device change,
+    # crash recovery) is exactly the moment nobody is necessarily in the
+    # room to notice it reconnected Active/Silent on its own. Previously
+    # this read SLEEP_STATE_FILE (via the now-removed _load_sleep_state)
+    # and restored whatever was last written, which meant a restart while
+    # already Active/Silent came back the same way with no re-confirmation
+    # at all. _save_sleep_state calls elsewhere are unaffected.
+    _is_sleeping[0] = True
+    _sleep_requested[0] = True
+    _save_sleep_state(True)
 
     # Speaker verification: restore mode/threshold and all per-device profiles.
     _load_voice_mode()
@@ -8621,7 +8623,7 @@ async def main(http_port: int, input_device=None, output_device=None,
     while not stop_event.is_set():
         _woke_from_sleep = False
         if _sleep_requested[0]:
-            # Sleeping (auto-sleep, or restored from disk): wait for /wake before connecting.
+            # Sleeping (auto-sleep, or just booted — always starts here now): wait for /wake before connecting.
             _sleep_requested[0] = False
             log.info("Sleeping. Waiting for /wake to reconnect…")
             _wake_event[0].clear()
