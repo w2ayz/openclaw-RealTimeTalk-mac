@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.27.0"
+__version__ = "3.27.1"
 
 import argparse
 import asyncio
@@ -5028,12 +5028,18 @@ class BaseVoiceSession:
             return
 
         # Wake phrase — always checked regardless of active/monitoring state.
-        # Already active → simple acknowledgement. Silent or monitoring → ask for
-        # confirmation before activating (avoids self-triggering off Zeebot's own TTS
-        # or background chatter that happens to include the wake phrase) —
-        # UNLESS owner-only mode already biometrically verified this transcript
-        # came from the enrolled voice (via _verify_speaker above), in which
-        # case the confirmation round-trip is redundant and skipped.
+        # Already active → simple acknowledgement. Silent or monitoring →
+        # always ask for confirmation before activating (avoids
+        # self-triggering off Zeebot's own TTS or background chatter that
+        # happens to include the wake phrase). Owner-voice verification (via
+        # _verify_speaker above) used to skip this round-trip entirely —
+        # removed: confirmed live that it let Zeebot go straight to Active
+        # on just hearing its name from the owner's voice, with no
+        # "<AgentName>?" reconfirmation at all. In a multi-agent room that's
+        # exactly the ambiguity step 2 exists to resolve, so owner
+        # verification no longer bypasses it — it only gates who's allowed
+        # to speak commands at all (see _verify_speaker), not whether this
+        # specific wake still gets reconfirmed.
         if _matches_phrase(normalized, WAKE_PHRASES):
             # This agent's own name was heard — the step-1→step-2 shared
             # "Hey Jarvis" deadline (if one was armed) is satisfied; the
@@ -5045,23 +5051,6 @@ class BaseVoiceSession:
                     log.info("Wake phrase detected — already active")
                     await asyncio.get_running_loop().run_in_executor(
                         None, speak, "Yes, I'm here.", self.alsa_output
-                    )
-                finally:
-                    _busy_clear()
-                return
-            if _owner_only[0] and _verification_available(_current_input_device_name()):
-                log.info("Wake phrase detected — owner voice verified, activating immediately")
-                _log_entry("system", "Voice activated (owner verified)")
-                self._busy.set()
-                try:
-                    if self._monitoring:
-                        self._monitoring = False
-                        _persist_monitoring[0] = False
-                    self._active = True
-                    _persist_active[0] = True
-                    _last_interaction[0] = _ti.time()
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, speak, "I'm listening.", self.alsa_output
                     )
                 finally:
                     _busy_clear()
