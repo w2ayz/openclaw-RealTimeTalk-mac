@@ -1,5 +1,37 @@
 # Changelog
 
+## [3.27.0] — 2026-10-05
+
+### Changed
+
+- **Step 2 (Silent→Active) now requires this agent's own name, with a 20s
+  deadline, for multi-agent setups sharing "Hey Jarvis" as step 1** — OWW
+  has no per-agent wake-word model, so "Hey Jarvis" necessarily wakes
+  every agent instance on the box to Silent at once (step 1, unchanged).
+  Previously (v3.26.1), `WAKE_PHRASES` also included generic "hey
+  jarvis"/"jarvis"/"hej jarvis"/"hay jarvis" entries so a *repeated* "Hey
+  Jarvis" could satisfy step 2's confirmation too — meaning any agent that
+  woke to Silent could be confirmed Active by a generic utterance that was
+  never actually directed at it. Reverted that: `WAKE_PHRASES` now holds
+  only this agent's own name-derived phrases (plus the misheard-variant
+  and `realtimetalk on`/"real time talk on" entries), both for triggering
+  the step-2 prompt and for accepting the "Yes?" confirmation. New
+  `NAME_WAKE_TIMEOUT` (20s) + `_name_wake_deadline`/`_name_wake_watcher`:
+  `_oww_listener` arms the deadline the moment "Hey Jarvis" wakes this
+  agent to Silent; if its own name phrase isn't heard before the deadline,
+  it drops straight back to full Sleeping Mode instead of lingering in
+  Silent (previously bounded only by the unrelated 10-minute
+  `AUTO_SLEEP_SECS` idle timer). Every explicit/authenticated wake path
+  (DTMF wake/wake-silent/monitor-on, HTTP `/wake` and `/monitor`) clears
+  the deadline instead of being subject to it — the name-check only
+  applies to the shared voice-triggered OWW path.
+- **Step-2 confirmation prompt changed from generic "Yes?" to
+  "`<AgentName>`?"** — e.g. Zeebot now asks "Zeebot?" instead of "Yes?"
+  once it hears its own wake phrase. In a multi-agent room this makes it
+  audible which agent actually responded, and re-confirms out loud that
+  this agent — specifically — is the one being addressed, rather than a
+  prompt any agent could equally have spoken.
+
 ## [3.26.2] — 2026-10-04
 
 ### Fixed
