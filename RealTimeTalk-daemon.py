@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.26.1"
+__version__ = "3.26.2"
 
 import argparse
 import asyncio
@@ -5009,20 +5009,26 @@ class BaseVoiceSession:
         # _send_mic) does the actual disconnect once this returns.
         # OpenWakeWord covers voice-triggered wake while STT is down.
         if _matches_phrase_exact(normalized, SLEEP_PHRASES):
-            if self._active:
-                log.info("Sleep phrase detected — entering Sleeping Mode")
-                _log_entry("system", "Voice silenced — Sleeping Mode")
-                self._busy.set()
-                try:
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, speak,
-                        f"Going to sleep now. Say Hey Jarvis, then {AGENT_NAME} wake up, "
-                        "or press Wake, to resume.",
-                        self.alsa_output
-                    )
-                finally:
-                    _busy_clear()
-                _dtmf_force_deepsleep[0] = True
+            # No active/monitoring guard: a live transcript can only arrive
+            # from a connected session, Active, Silent, or Monitoring — all
+            # three are reachable states to disconnect from now that this
+            # means a full STT disconnect, not just going quiet. (The old
+            # self._active-only guard was correct for the old light-sleep
+            # behavior, where going silent from an already-silent session
+            # was a no-op worth skipping; it isn't anymore.)
+            log.info("Sleep phrase detected — entering Sleeping Mode")
+            _log_entry("system", "Voice silenced — Sleeping Mode")
+            self._busy.set()
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, speak,
+                    f"Going to sleep now. Say Hey Jarvis, then {AGENT_NAME} wake up, "
+                    "or press Wake, to resume.",
+                    self.alsa_output
+                )
+            finally:
+                _busy_clear()
+            _dtmf_force_deepsleep[0] = True
             return
 
         # Calibration — works in both modes (audio feedback either way)
@@ -6141,7 +6147,7 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                 # by voice). _apply_dtmf_flags (polled by _send_mic at least
                 # every 0.5s) does the actual close; OpenWakeWord then covers
                 # voice-triggered wake while the STT connection is down.
-                if sess and (sess._active or sess._monitoring):
+                if sess:
                     _dtmf_force_deepsleep[0] = True
                     log.info("HTTP sleep — Sleeping Mode (disconnecting)")
                 self.send_response(302)

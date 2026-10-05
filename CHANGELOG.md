@@ -1,5 +1,28 @@
 # Changelog
 
+## [3.26.2] — 2026-10-04
+
+### Fixed
+
+- **Sleep button/phrase were a no-op from Silent mode** — the default
+  state on every fresh daemon start (no persisted sleep state), and also
+  where you land after OpenWakeWord's step-1 reconnect. Both the HTTP
+  `/sleep` handler and the SLEEP_PHRASES voice handler kept their old
+  guard (`sess._active or sess._monitoring` / `self._active`) from before
+  v3.26.0, when "Sleep" only meant going quiet while staying connected —
+  skipping an already-silent session made sense then. Now that Sleep means
+  a full STT disconnect, that guard silently blocked the single most
+  common case: clicking Sleep (or saying the sleep phrase) while already
+  Silent did nothing at all — STT stayed connected, pill stayed SILENT, no
+  log line, no feedback. Caught live: asked to restart the daemon, which
+  boots into Silent (not Sleeping — confirmed via `/status` and the sleep
+  state file, `{"sleeping": false}`), then asked "would clicking Sleep now
+  disconnect it?" — answer was no, and testing the code path directly
+  confirmed it. Fixed by dropping the active/monitoring requirement
+  entirely: any connected session (Active, Silent, or Monitoring — the
+  only three reachable from a live STT connection) can now be put to sleep
+  from any of them.
+
 ## [3.26.1] — 2026-10-04
 
 ### Fixed
