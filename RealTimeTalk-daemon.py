@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.27.4"
+__version__ = "3.27.5"
 
 import argparse
 import asyncio
@@ -2052,9 +2052,18 @@ SLEEP_PHRASES    = {"zeebot go to sleep", "real time talk off", "real-time talk 
 # _pending_wake_confirm stuck True — see that filter's comment. Fixed
 # 2026-10-05 after a live mis-fire: user said "Zeebot" back to "Zeebot?"
 # and the daemon ignored it rather than confirming or rejecting it.
+#
+# Deliberately NOT "wake up" / "wake" (removed 2026-10-05, by request):
+# those don't name the agent at all, so in a room with more than one
+# listener/agent a bare "wake up" meant for someone else — or even for a
+# human — would silently confirm this one. Every entry below is a plain
+# yes/no answer to the "<AgentName>?" question, not an action phrase, so
+# none of them need the name repeated. "<AgentName> wake up" itself is
+# still accepted — via _matches_phrase_exact(WAKE_PHRASES) below, which
+# requires the name.
 _WAKE_CONFIRM_AFFIRM = {
     "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "correct", "affirmative",
-    "go ahead", "wake up", "wake", "activate", "please", "do it", "yes please",
+    "go ahead", "activate", "please", "do it", "yes please",
     "好", "是", "对", "好的", "可以", "醒来",
 }
 _WAKE_CONFIRM_TIMEOUT = 15.0  # seconds to wait for confirmation before treating as mis-fire
@@ -5031,10 +5040,24 @@ class BaseVoiceSession:
             if elapsed > _WAKE_CONFIRM_TIMEOUT:
                 log.info("Wake confirmation timed out (%.1fs) — mis-fire: %r", elapsed, transcript)
                 _log_entry("system", "Wake mis-fire (timeout) — staying silent")
-            elif (normalized in _WAKE_CONFIRM_AFFIRM
-                  or normalized == TRANSCRIPTION_PROMPT_NORM               # bare "<AgentName>"
-                  or normalized == f"yes {TRANSCRIPTION_PROMPT_NORM}"      # "yes <AgentName>"
-                  or _matches_phrase(normalized, WAKE_PHRASES)):
+                return
+            # Use _normalize() here, not the shared `normalized` (which only
+            # strips TRAILING punctuation) — "Yes, Zeebot." must collapse to
+            # "yes zeebot" (internal comma too) to match f"yes {NAME}" below.
+            _confirm_norm = _normalize(transcript)
+            if (_confirm_norm in _WAKE_CONFIRM_AFFIRM
+                  or _confirm_norm == TRANSCRIPTION_PROMPT_NORM               # bare "<AgentName>"
+                  or _confirm_norm == f"yes {TRANSCRIPTION_PROMPT_NORM}"      # "yes <AgentName>" / "yes, <AgentName>"
+                  # Exact substring, NOT the fuzzy pass: this check IS the
+                  # confirmation gate (nothing after it), so the ≥60%-of-
+                  # phrase-words fuzzy match is unsafe here — it let a bare
+                  # "wake up" satisfy "<AgentName> wake up" (2 of 3 words)
+                  # without the name ever being said. _matches_phrase's
+                  # fuzzy pass is only safe for a false positive that's
+                  # cheap to recover from (step 1, which just asks "Yes?"
+                  # next); this is step 2 itself, so use the exact-substring
+                  # variant like every other ungated phrase set does.
+                  or _matches_phrase_exact(_confirm_norm, WAKE_PHRASES)):
                 log.info("Wake confirmed — voice active")
                 _log_entry("system", "Voice activated")
                 self._busy.set()

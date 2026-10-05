@@ -1,5 +1,40 @@
 # Changelog
 
+## [3.27.5] — 2026-10-05
+
+### Changed
+
+- **Step-2 wake confirmation tightened to require the agent's own name**,
+  by request. Two separate gaps let a bare `"wake up"` (no name at all)
+  confirm the wake, which defeats the step-2 gate's whole purpose in a
+  multi-agent/multi-listener room:
+  - `_WAKE_CONFIRM_AFFIRM` had `"wake up"` and `"wake"` as literal
+    accepted strings — removed. Every remaining entry is a plain yes/no
+    answer to the `"<AgentName>?"` question (`"yes"`, `"ok"`, `"go
+    ahead"`, …), none of which need the name repeated.
+  - The `WAKE_PHRASES` repeat-the-phrase path used `_matches_phrase`'s
+    fuzzy ≥60%-of-words pass, which let `"wake up"` alone satisfy the
+    3-word default phrase `"zeebot wake up"` (2 of 3 words) without
+    "zeebot" ever being said. Switched to `_matches_phrase_exact` —
+    this check IS the confirmation gate (nothing after it to catch a
+    false positive), so it needs the exact-substring semantics
+    `_matches_phrase_exact`'s own docstring already prescribes for any
+    ungated phrase set, not the fuzzy pass meant for step 1 (safe there
+    only because step 1 is itself gated by this step).
+  - Also fixed, found while testing the above: `"Yes, Zeebot"` (with the
+    comma) didn't match `f"yes {name}"` because the shared `normalized`
+    var only strips *trailing* punctuation. The confirmation check now
+    uses `_normalize()` (strips all punctuation) for its own comparison.
+  - Verified with a standalone harness importing the real module
+    constants/functions (not reimplemented copies): `"wake up"` /
+    `"wake"` / `"why wake up"` correctly rejected; `"zeebot wake up"` /
+    `"zeebot"` / `"yes"` / `"yes, zeebot"` / `"yes zeebot"` /
+    `"activate"` / `"please"` / `"go ahead"` all still accepted. Known,
+    accepted trade-off: a garbled repeat like `"zeebot break up"` (used
+    to fuzzy-match) no longer confirms — bare `"zeebot"` or `"yes"` are
+    the robust fallback for noisy audio instead of hoping the whole
+    phrase transcribes cleanly twice.
+
 ## [3.27.4] — 2026-10-05
 
 ### Changed
