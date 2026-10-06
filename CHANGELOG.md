@@ -1,5 +1,27 @@
 # Changelog
 
+## [3.27.10] — 2026-10-05
+
+### Fixed
+
+- **The v3.27.9 confirm-countdown banner only showed during step 2
+  ("<AgentName>?" asked), never during step 1** (OWW's "Hey Jarvis"
+  reconnected to Silent, this agent's own name not yet heard at all) —
+  which is the half users actually hit most. Confirmed by re-reading the
+  original report: the shared wake word fired, the user said a different
+  agent's name ("Grogu"), this agent's own WAKE_PHRASES never matched, so
+  `_pending_wake_confirm` never went true and no banner ever appeared —
+  even though `_name_wake_deadline` (step 1's own arm) was in fact
+  counting down the whole time. Keyed the banner off that deadline
+  directly instead of `_pending_wake_confirm` alone, with the message
+  text still varying by which half it is. Also fixed the displayed
+  number jumping to the full `NAME_WAKE_TIMEOUT` for an instant on every
+  3s `/dashboard-frag` poll before the next 500ms client tick corrected
+  it — now computed from the live deadline at render time so it starts
+  accurate.
+- Ported the identical fix to the Pi fork (its own v3.27.10) — same gap
+  there, confirmed by reading its actual code before porting.
+
 ## [3.27.9] — 2026-10-05
 
 ### Fixed
