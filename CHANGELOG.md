@@ -1,5 +1,25 @@
 # Changelog
 
+## [3.27.11] — 2026-10-05
+
+### Fixed
+
+- **Dashboard banner stuck on "CONFIRMING … back to sleep in 0s" forever
+  after saying the sleep phrase.** Confirmed live: saying "`<AgentName>`
+  go to sleep" correctly disconnects STT and enters Sleeping Mode, but
+  the voice-phrase sleep path (unlike the DTMF deep-sleep sequence and
+  the HTTP `/sleep` endpoint, both of which already do this) never reset
+  `_name_wake_deadline`. The stale deadline — armed by the last "Hey
+  Jarvis" wake window — was now in the past, and with `active` false the
+  dashboard's `name_wake_pending` check (`_name_wake_deadline and not
+  active`, from v3.27.10) stayed true indefinitely, clamped to 0s by
+  `max(0, …)`, with nothing left to ever clear it short of the next wake
+  cycle re-arming and re-expiring it. The daemon itself was never stuck —
+  only the banner. Fixed by clearing `_name_wake_deadline` in the
+  SLEEP_PHRASES handler too, matching the other two deep-sleep paths.
+  Ported to the Pi fork as its v3.27.11 too (same bug, confirmed
+  byte-for-byte identical there before porting).
+
 ## [3.27.10] — 2026-10-05
 
 ### Fixed
