@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.27.6"
+__version__ = "3.27.7"
 
 import argparse
 import asyncio
@@ -7069,10 +7069,15 @@ function startMicCal(){{
   let secs=3; micinfo.textContent='Stay quiet… '+secs+'s';
   const t=setInterval(()=>{{secs--;micinfo.textContent=secs>0?'Stay quiet… '+secs+'s':'Measuring…';}},1000);
   fetch('/calibrate/run').then(r=>r.json()).then(d=>{{
-    clearInterval(t); calRunning=false;
+    clearInterval(t); calRunning=false; micbtn.disabled=false;
+    if(d.error){{
+      micresult.style.display='none';
+      micinfo.textContent=d.error;
+      return;
+    }}
     micresult.style.display='block';
     micresult.innerHTML='Done! New gate: <b>'+d.gate+'</b> (noise peak: '+d.noise_peak+')';
-    micinfo.textContent='Yellow line updated.'; micbtn.disabled=false;
+    micinfo.textContent='Yellow line updated.';
     // Auto-hide after announcement has played (~4s)
     setTimeout(()=>{{micresult.style.display='none';}},4000);
     // Sync slider to the new gate from auto-calibrate
@@ -7341,6 +7346,24 @@ function setCalMode(mode){{
             elif self.path == "/calibrate/run":
                 if sess:
                     import asyncio as _aio, json as _json, time as _time
+                    # Wait for the mic stream to actually be delivering callbacks before
+                    # sampling. Right after a wake/reconnect, _mic_level_current can still
+                    # hold its stale/zero initial value while the stream is still opening —
+                    # sampling then previously produced a bogus noise_peak=0 → gate clamped
+                    # to MIC_GATE_MIN, which makes the mic "hang open" (picks up everything
+                    # as speech). Same liveness check _watch_mic_stream() uses.
+                    waited = 0.0
+                    while _time.time() - _last_mic_cb[0] >= 1.0 and waited < 5.0:
+                        _time.sleep(0.1)
+                        waited += 0.1
+                    if _time.time() - _last_mic_cb[0] >= 1.0:
+                        resp = _json.dumps({"error": "mic stream not live yet — try again in a moment"}).encode()
+                        self.send_response(503)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(resp)))
+                        self.end_headers()
+                        self.wfile.write(resp)
+                        return
                     # collect 3s of mic samples (audio thread already fills _mic_level_current)
                     peaks = []
                     for _ in range(30):

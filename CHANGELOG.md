@@ -1,5 +1,29 @@
 # Changelog
 
+## [3.27.7] — 2026-10-05
+
+### Fixed
+
+- **`/calibrate/run` (the dashboard's manual recalibrate button) could
+  measure a false silent room and tank the gate to `MIC_GATE_MIN`.**
+  Found live: triggering it right after a wake/reconnect — while the
+  session was still mid-handshake to the STT engine — sampled
+  `_mic_level_current` for 3s before the mic's `sd.InputStream` callback
+  had fired even once, so every sample was its stale zero init value:
+  `noise_peak=0 → gate=15`. A gate that low makes the mic "hang open"
+  (every ambient sound reads as speech — see the `MIC_GATE_MIN` comment
+  this endpoint already clamps to). The handler only ever checked
+  `if sess:`, never whether the stream was actually delivering audio.
+  Now waits (up to 5s, polling the same `_last_mic_cb` staleness check
+  `_watch_mic_stream()`'s hot-plug watchdog already uses) for a mic
+  callback within the last second before sampling; returns a 503
+  `{"error": ...}` instead of a bogus reading if the stream never comes
+  up in time. Dashboard JS (`startMicCal()`) now surfaces that `error`
+  field instead of rendering `undefined` into the gate/peak display.
+  **Follow-up, not done here**: this bug lives in the HTTP handler shared
+  conceptually with the Pi fork if it exposes the same endpoint — the Pi
+  repo isn't checked out in this environment to verify/port.
+
 ## [3.27.6] — 2026-10-05
 
 ### Added
