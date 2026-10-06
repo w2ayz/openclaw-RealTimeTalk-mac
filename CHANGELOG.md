@@ -1,5 +1,32 @@
 # Changelog
 
+## [3.27.8] — 2026-10-05
+
+### Fixed
+
+- **`/calibration` page showed `peak:0` and Auto-calibrate couldn't
+  measure anything while Sleeping.** Found live: the only mic consumer
+  during Sleeping Mode is `_oww_wakeword_listener`'s own `sd.InputStream`
+  callback (wake-word detection), which never wrote to `_mic_level_current`
+  — the global both the dashboard's `/levels` SSE meter and `/calibrate/run`
+  read from. That global, and `_last_mic_cb` (used by v3.27.7's liveness
+  check), are now also updated from the OWW listener's callback — ported
+  from the Pi fork, which already did this (`_oww_wakeword_listener`'s `_cb`
+  there has fed the meter "so calibration page stays alive during sleep"
+  since it was written; confirmed by reading Pi's actual code, not assumed).
+  `/calibrate/run`'s sampling is no longer gated on `if sess:` either — it
+  now runs unconditionally and relies on v3.27.7's liveness wait, which
+  works whether the live callback is the main session's `_mic_cb` (awake)
+  or OWW's (asleep). Only the spoken "Noise gate set to N" confirmation
+  stays behind `if sess:` (nothing to speak through when there's no
+  session) — mirrors Pi's existing `if sess and ...` gate on that same
+  announcement. Verified live: woke the daemon, let it auto-sleep, watched
+  `/calibration`'s peak reading move with real ambient sound while asleep,
+  then called `/calibrate/run` from that state and got a real non-zero
+  gate back instead of the old "No active session" 503.
+- **Pi fork: no code change** — already had this design; CHANGELOG/version
+  bumped to stay in lockstep (see its own entry).
+
 ## [3.27.7] — 2026-10-05
 
 ### Fixed

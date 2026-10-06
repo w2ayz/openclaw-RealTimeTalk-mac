@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.27.7"
+__version__ = "3.27.8"
 
 import argparse
 import asyncio
@@ -1046,6 +1046,15 @@ def _oww_listener(session_ref: list) -> None:
         hit = threading.Event()
 
         def _cb(indata, frames, t, status, _hit=hit, _model=model):
+            import time as _owwcb_time
+            _last_mic_cb[0] = _owwcb_time.time()
+            # Feed the mic level meter (dashboard /levels SSE + /calibrate/run)
+            # so the calibration page stays alive and Auto-calibrate works
+            # while Sleeping, same as the main session's _mic_cb does while
+            # awake — ported from the Pi fork, which already did this here.
+            raw_peak = int(np.max(np.abs(indata[:, 0])))
+            with _mic_level_lock:
+                _mic_level_current[0] = raw_peak
             if _hit.is_set():
                 return
             try:
@@ -7344,52 +7353,60 @@ function setCalMode(mode){{
                 self.wfile.write(resp)
 
             elif self.path == "/calibrate/run":
-                if sess:
-                    import asyncio as _aio, json as _json, time as _time
-                    # Wait for the mic stream to actually be delivering callbacks before
-                    # sampling. Right after a wake/reconnect, _mic_level_current can still
-                    # hold its stale/zero initial value while the stream is still opening —
-                    # sampling then previously produced a bogus noise_peak=0 → gate clamped
-                    # to MIC_GATE_MIN, which makes the mic "hang open" (picks up everything
-                    # as speech). Same liveness check _watch_mic_stream() uses.
-                    waited = 0.0
-                    while _time.time() - _last_mic_cb[0] >= 1.0 and waited < 5.0:
-                        _time.sleep(0.1)
-                        waited += 0.1
-                    if _time.time() - _last_mic_cb[0] >= 1.0:
-                        resp = _json.dumps({"error": "mic stream not live yet — try again in a moment"}).encode()
-                        self.send_response(503)
-                        self.send_header("Content-Type", "application/json")
-                        self.send_header("Content-Length", str(len(resp)))
-                        self.end_headers()
-                        self.wfile.write(resp)
-                        return
-                    # collect 3s of mic samples (audio thread already fills _mic_level_current)
-                    peaks = []
-                    for _ in range(30):
-                        _time.sleep(0.1)
-                        with _mic_level_lock:
-                            peaks.append(_mic_level_current[0])
-                    peaks = peaks[2:]
-                    noise_peak = max(peaks) if peaks else 0
-                    new_gate = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.5)))
-                    _mic_gate_ref[0] = new_gate
-                    MIC_GATE_PEAK = new_gate
-                    log.info("HTTP calibration: noise_peak=%d → gate=%d", noise_peak, new_gate)
-                    _update_service_gate(new_gate)
-                    # speak confirmation in background thread (we're already in HTTP thread)
-                    import threading as _t
-                    _t.Thread(target=speak,
-                              args=(f"Noise gate set to {new_gate}.", sess.alsa_output),
-                              daemon=True).start()
-                    resp = _json.dumps({"gate": new_gate, "noise_peak": noise_peak}).encode()
-                    self.send_response(200)
+                import asyncio as _aio, json as _json, time as _time
+                # Wait for *a* live mic callback before sampling — either the main
+                # session's _mic_cb (while awake) or the OWW listener's _cb (while
+                # Sleeping — it now feeds _last_mic_cb/_mic_level_current too, same
+                # as Pi's always had). Right after a wake/reconnect, _mic_level_current
+                # can still hold its stale/zero initial value while the stream is
+                # still opening — sampling then previously produced a bogus
+                # noise_peak=0 → gate clamped to MIC_GATE_MIN, which makes the mic
+                # "hang open" (picks up everything as speech). Same liveness check
+                # _watch_mic_stream() uses. No longer gated on `if sess:` — Sleeping
+                # Mode has no session, but OWW's stream is live, so sampling works
+                # there too now.
+                waited = 0.0
+                while _time.time() - _last_mic_cb[0] >= 1.0 and waited < 5.0:
+                    _time.sleep(0.1)
+                    waited += 0.1
+                if _time.time() - _last_mic_cb[0] >= 1.0:
+                    resp = _json.dumps({"error": "mic stream not live yet — try again in a moment"}).encode()
+                    self.send_response(503)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(resp)))
                     self.end_headers()
                     self.wfile.write(resp)
-                else:
-                    _html(self, 503, "<h2>No active session</h2>")
+                    return
+                # collect 3s of mic samples (audio thread already fills _mic_level_current,
+                # whether that's the main session's stream or the Sleeping-mode OWW listener)
+                peaks = []
+                for _ in range(30):
+                    _time.sleep(0.1)
+                    with _mic_level_lock:
+                        peaks.append(_mic_level_current[0])
+                peaks = peaks[2:]
+                noise_peak = max(peaks) if peaks else 0
+                new_gate = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.5)))
+                _mic_gate_ref[0] = new_gate
+                MIC_GATE_PEAK = new_gate
+                log.info("HTTP calibration: noise_peak=%d → gate=%d", noise_peak, new_gate)
+                _update_service_gate(new_gate)
+                # Speak confirmation only if a session is actually up to speak through —
+                # while Sleeping there's no session (and no in-progress STT to interrupt),
+                # so skip the announcement; the JSON response still reports the real
+                # measured result either way. Matches Pi's existing `if sess and ...` gate
+                # on this same announcement.
+                if sess:
+                    import threading as _t
+                    _t.Thread(target=speak,
+                              args=(f"Noise gate set to {new_gate}.", sess.alsa_output),
+                              daemon=True).start()
+                resp = _json.dumps({"gate": new_gate, "noise_peak": noise_peak}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
 
             elif self.path == "/speaker-cal":
                 is_headset = _detect_headset()
