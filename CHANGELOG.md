@@ -1,5 +1,40 @@
 # Changelog
 
+## [3.27.9] — 2026-10-05
+
+### Fixed
+
+- **A mis-addressed step-2 wake ("<AgentName>?" asked, no valid reply)
+  never fell back to Sleep in the ~20s users expect — it lingered in
+  Silent (STT connected, API meter running) until the full 10-minute
+  idle timeout.** Found live: the shared "Hey Jarvis" picked up someone
+  addressing a different agent by name ("Grogu"); the resulting mis-fire
+  was correctly detected and logged, but nothing then dropped back to
+  Sleep. Root cause: the WAKE_PHRASES branch in `_handle_transcript`
+  cleared `_name_wake_deadline` to `0.0` the instant a wake phrase was
+  heard, on the assumption that the separate `_WAKE_CONFIRM_TIMEOUT`
+  round-trip "takes over" enforcement from there — it doesn't on its
+  own: that check only runs *reactively*, when the next transcript
+  happens to arrive, so an unanswered confirmation (nobody says anything
+  else at all) had no timer watching it either. `_name_wake_watcher`
+  (already polling this same deadline every 1s for step 1) now gets it
+  re-armed, fresh, at step-2 entry too — one mechanism now covers both
+  "never said my name" and "said my name but never confirmed."
+- **Pi fork: checked, had the identical bug** — ported and pushed
+  separately (its own v3.27.9, github.com/w2ayz/openclaw-RealTimeTalk).
+
+### Added
+
+- **The dashboard now shows a live countdown during step-2 confirmation**,
+  by request: a `<AgentName>?`-waiting banner with a `back to sleep in
+  Ns if not heard` counter, ticking down every 500ms from
+  `NAME_WAKE_TIMEOUT` (reusing the deadline the fix above re-arms) — same
+  live-counter pattern the existing "thinking…" duration display already
+  uses (`.tctr`), mirrored here as `.cctr`. The state pill also gets a
+  new `CONFIRMING` value/color so it's visible at a glance, not just in
+  the banner. Resets correctly on every `/dashboard-frag` poll since it's
+  driven by an absolute epoch, not an elapsed counter.
+
 ## [3.27.8] — 2026-10-05
 
 ### Fixed
