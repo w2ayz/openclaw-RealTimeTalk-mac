@@ -1,5 +1,41 @@
 # Changelog
 
+## [3.27.12] — 2026-10-07
+
+### Fixed
+
+- **Multi-agent wake isolation, reported live by Victor**: saying "Hey
+  Jarvis" correctly sends every co-located agent into step 1 (shared OWW
+  wake word, by design — each then waits to hear its OWN name). But
+  saying e.g. "Zeebot wake up" to pick one of them was ALSO sending
+  every other agent into its own step-2 "<Name>?" confirmation —
+  "Grogu", "Jarvis", etc. all asking to be confirmed off Zeebot's wake
+  phrase. Root cause: `_matches_phrase`'s fuzzy pass (word overlap ≥60%
+  of a *phrase*'s words) never required the matching agent's own name to
+  be one of the overlapping words — "zeebot wake up" vs. Grogu's own
+  default phrase "grogu wake up" share 2 of 3 words ("wake", "up"),
+  clearing the 60% bar for Grogu too, regardless of whose name was
+  actually said. `_matches_phrase` now takes a `require_words` param;
+  WAKE_PHRASES' one call site passes this agent's own name, so the fuzzy
+  pass still tolerates garbling of the *other* words ("zeebot wake up" →
+  "zeebot break up") but can no longer fire on a phrase that never
+  mentioned this agent at all. Verified against the real functions (not
+  reimplemented copies): "Zeebot wake up" now matches only an agent
+  literally named Zeebot, not one named Grogu.
+- **Step-2 confirmation no longer accepts a bare "yes"/"ok"/etc. with no
+  name**, by the same request: with multiple agents potentially
+  mid-confirmation together, a plain affirmative doesn't say which one
+  it answers. `_WAKE_CONFIRM_AFFIRM` (a flat set of standalone-acceptable
+  phrases) is replaced by `_WAKE_CONFIRM_WORDS`/`_WAKE_CONFIRM_IDIOMS`
+  plus a combination check in `_handle_transcript`: accepted replies are
+  now the bare agent name alone ("Zeebot"), the name combined with any
+  confirmative word/idiom in either order ("Yes Zeebot", "Zeebot yes",
+  "Only Zeebot", "Zeebot only", "Zeebot, go ahead", ...), or a repeat of
+  the full wake phrase ("Zeebot wake up") — never a bare confirmative
+  alone. Verified with the same harness: "yes"/"yeah"/"ok" alone now
+  correctly rejected; name+affirm combinations in both orders, "only"
+  forms, and the bare name all still accepted.
+
 ## [3.27.11] — 2026-10-05
 
 ### Fixed
