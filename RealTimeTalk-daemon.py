@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.27.13"
+__version__ = "3.27.14"
 
 import argparse
 import asyncio
@@ -4727,6 +4727,7 @@ class BaseVoiceSession:
             log.info("Auto-sleep: idle %d min — disconnecting %s", mins,
                      (_active_stt_engine[0] or _cli_stt_engine[0] or "openai").upper())
             self._active = False
+            _name_wake_deadline[0] = 0.0   # no pending name-check once back in Sleeping Mode
             _persist_active[0] = False
             if self._monitoring:
                 self._monitoring = False
@@ -5111,6 +5112,7 @@ class BaseVoiceSession:
                         self._monitoring = False
                         _persist_monitoring[0] = False
                     self._active = True
+                    _name_wake_deadline[0] = 0.0   # confirmed — step-2 window satisfied, don't leave it armed
                     _persist_active[0] = True
                     _last_interaction[0] = _ti.time()
                     await asyncio.get_running_loop().run_in_executor(

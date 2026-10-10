@@ -1,5 +1,19 @@
 # Changelog
 
+## [3.27.14] — 2026-10-10
+
+### Fixed
+
+- **Dashboard banner stuck on "CONFIRMING … back to sleep in 0s" after
+  auto-sleep, reported live by Victor.** Same class as the v3.27.11 fix.
+  A successful step-2 wake confirmation re-arms `_name_wake_deadline`
+  (see the WAKE_PHRASES branch in `_handle_transcript`) but never cleared
+  it once the confirmation succeeded; the banner ignores it while Active
+  (`not active`), so nothing looked wrong. When the 10-min idle auto-sleep
+  then set `_active = False` — also without clearing the deadline — the
+  stale, long-expired deadline made `name_wake_pending` true forever.
+  Both spots now clear it. The daemon itself was never stuck, only the banner.
+
 ## [3.27.13] — 2026-10-10
 
 ### Fixed
