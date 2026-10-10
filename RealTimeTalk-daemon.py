@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.27.12"
+__version__ = "3.27.13"
 
 import argparse
 import asyncio
@@ -5143,7 +5143,24 @@ class BaseVoiceSession:
         # verification no longer bypasses it — it only gates who's allowed
         # to speak commands at all (see _verify_speaker), not whether this
         # specific wake still gets reconfirmed.
-        if _matches_phrase(normalized, WAKE_PHRASES, require_words=set(TRANSCRIPTION_PROMPT_NORM.split())):
+        # While already Active, a hit here is NOT cheap to recover from: the
+        # branch below returns immediately with "Yes, I'm here." and drops
+        # the transcript entirely — no confirmation round-trip, no fallback
+        # to normal routing like the Silent/Monitoring branch has. That
+        # makes _matches_phrase's 60%-word-overlap fuzzy pass unsafe here
+        # specifically: an ordinary command containing the agent's name plus
+        # any one wake-phrase word ("Zeebot, can you clean UP the...")
+        # cleared the 60%-of-3-words bar and got swallowed instead of
+        # routed — confirmed live on the Pi fork 2026-10-10, ported here.
+        # Require an exact phrase match once already active; the fuzzy pass
+        # still applies for Silent/Monitoring→Active below, where a
+        # mis-fire only costs a "<Name>?" that self-corrects.
+        if self._active:
+            wake_hit = _matches_phrase_exact(normalized, WAKE_PHRASES)
+        else:
+            wake_hit = _matches_phrase(normalized, WAKE_PHRASES,
+                                        require_words=set(TRANSCRIPTION_PROMPT_NORM.split()))
+        if wake_hit:
             if self._active:
                 # Already active — nothing pending to bound, no fallback needed.
                 _name_wake_deadline[0] = 0.0
@@ -5502,6 +5519,15 @@ class BaseVoiceSession:
             # break cleanly and drop the still-pending text.
             speaker.reset()
             _http_interrupt[0] = False   # reset() arms the flag; clear it so the apology isn't cut
+            # Unlike a `replace` event (which explicitly clears _live_speech
+            # itself, above), a timeout means no rewritten answer is ever
+            # coming — this turn is abandoned, not restarted. reset() alone
+            # only pauses the stale read-along (st["running"] = False, text
+            # left intact); without this it's left frozen on the abandoned
+            # partial reply indefinitely — confirmed live on the Pi fork
+            # 2026-10-10, ported here.
+            with _live_speech_lock:
+                _live_speech[0] = None
             _log_entry("zeebot", "")                  # clears the thinking counter on dashboard
             await asyncio.get_running_loop().run_in_executor(
                 None, speak, "Sorry, I timed out on that.", self.alsa_output

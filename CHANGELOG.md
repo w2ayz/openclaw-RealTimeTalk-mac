@@ -1,5 +1,32 @@
 # Changelog
 
+## [3.27.13] — 2026-10-10
+
+### Fixed
+
+- **Ported from the Pi fork (confirmed live there 2026-10-10)**: dashboard
+  read-along banner stuck on a stale partial reply forever after an agent
+  timeout. The `TimeoutError` handler in `_consume_stream` calls
+  `speaker.reset()`, which only pauses `_live_speech` (leaves its stale
+  text in place) rather than clearing it — correct for the `replace`
+  event, which already explicitly clears `_live_speech` itself right
+  above and expects a fresh frame momentarily, but wrong for a timeout:
+  the turn is abandoned, not restarted, so nothing ever posts that fresh
+  frame. The timeout handler now clears `_live_speech[0]` itself too.
+- **Ported from the Pi fork (confirmed live there 2026-10-10)**: saying
+  the agent's name together with any wake-phrase word (e.g. "up") while
+  already Active silently dropped the whole command. `_matches_phrase`'s
+  60%-word-overlap fuzzy pass on `WAKE_PHRASES` is only safe when a false
+  positive is cheap to recover from — true for Silent/Monitoring→Active,
+  which just asks "<Name>?" and self-corrects on a mis-fire, but NOT true
+  once already Active: that branch returns immediately with "Yes, I'm
+  here." and drops the transcript with no confirmation round-trip and no
+  fallback to normal routing. E.g. "Zeebot, can you clean up the..."
+  shares 2 of "zeebot wake up"'s 3 words and got swallowed as a redundant
+  wake phrase instead of routed. Wake-phrase matching now requires an
+  exact substring (`_matches_phrase_exact`) once already Active; the
+  fuzzy pass still applies for the Silent/Monitoring→Active transition.
+
 ## [3.27.12] — 2026-10-07
 
 ### Fixed
