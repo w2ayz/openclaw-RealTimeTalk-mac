@@ -16,7 +16,7 @@ internals, see [SKILL.md](SKILL.md).
 | Requirement | Notes |
 |---|---|
 | [OpenClaw](https://openclaw.ai) gateway running | `openclaw gateway start`. RealTimeTalk talks to your agent through this — it won't start without it. |
-| STT provider key (OpenAI **and/or** Gemini) | Either one works on its own; with both configured you can pick the engine and a boot-time fallback (§3.2). OpenAI: regular `sk-...` key in `~/.openclaw/openclaw.json`, **not** the `openai-codex` OAuth profile (the Realtime API rejects it). Gemini: `AQ....` key (usually 53 characters) or legacy `AIza...` key from AI Studio. See §3. |
+| STT provider key (OpenAI, Gemini **and/or** Muse) | Any one works on its own; with several configured you can pick the engine and a boot-time fallback (§3.2). OpenAI: regular `sk-...` key in `~/.openclaw/openclaw.json`, **not** the `openai-codex` OAuth profile (the Realtime API rejects it). Gemini: `AQ....` key (usually 53 characters) or legacy `AIza...` key from AI Studio. Muse: a Meta Model API key (`LLM_...`). See §3. |
 | ElevenLabs API key (optional) | Primary TTS voice for all replies. Falls back to Edge TTS → OpenAI TTS → `say` if unset. |
 
 ### System
@@ -93,10 +93,10 @@ Two independent things to configure:
 1. **Provider keys** (one or both) → `~/.openclaw/openclaw.json` under `talk.providers.*.apiKey`
 2. **Which engine to use** (and the fallback) → `~/.openclaw/workspace/rtt_stt_config.json`
 
-### 3.1. STT provider key(s) — OpenAI and/or Gemini
+### 3.1. STT provider key(s) — OpenAI, Gemini and/or Muse
 
-Either provider works on its own. Configure both and the daemon uses the
-second one as an automatic failover when the primary fails.
+Any one provider works on its own. Configure several and the daemon uses
+the configured fallback when the primary's key is missing (§3.2).
 
 Use the Python one-liner below — it merges safely into the existing JSON
 without disturbing other keys, and avoids the character-corruption risk
@@ -108,6 +108,7 @@ import json, sys
 
 KEY    = "sk-..."          # your regular OpenAI key (sk-proj-... or sk-...), or ""
 GEMKEY = ""                # your Gemini API key (AQ.... or legacy AIza...), or ""
+MUSEKEY = ""               # your Meta Model API key (LLM_...) for Muse Voice Transcribe, or ""
 ELKEY  = ""                # optional ElevenLabs key, or leave blank
 
 path = __import__("os").path.expanduser("~/.openclaw/openclaw.json")
@@ -117,6 +118,8 @@ if KEY:
     p.setdefault("openai", {})["apiKey"] = KEY
 if GEMKEY:
     p.setdefault("gemini", {})["apiKey"] = GEMKEY
+if MUSEKEY:
+    p.setdefault("muse", {})["apiKey"] = MUSEKEY
 if ELKEY:
     p.setdefault("elevenlabs", {})["apiKey"] = ELKEY
 json.dump(d, open(path, "w"), indent=2)
@@ -131,6 +134,12 @@ PY
 > **Gemini key format:** an `AQ....` key (usually 53 characters) or legacy
 > `AIza...` key (39 characters) from [AI Studio](https://aistudio.google.com/apikey).
 > The daemon connects to `gemini-3.5-transcribe-live` over WebSocket.
+>
+> **Muse key format:** a Meta Model API key starting `LLM_`. The daemon connects
+> to `muse-voice-transcribe-1.0` at `wss://api.meta.ai/v1/asr/realtime` (raw
+> 24 kHz audio, no resampling; Mandarin + English with code-switching; billed
+> by audio hour). It can't be pre-verified by the installer (WebSocket-only
+> handshake) — a rejected key shows up in the daemon log.
 
 `elevenlabs` is optional — omit or leave blank and it falls back to
 OpenAI TTS for Chinese/mixed content.
@@ -147,12 +156,13 @@ disappearing).
 { "provider": "gemini", "fallback": "openai" }
 ```
 
-- `provider` — the engine to boot with: `openai` (Realtime transcription)
-  or `gemini` (Gemini 3.5 Transcribe Live).
+- `provider` — the engine to boot with: `openai` (Realtime transcription),
+  `gemini` (Gemini 3.5 Transcribe Live) or `muse` (Meta Muse Voice
+  Transcribe, opt-in — never chosen implicitly when several keys exist).
 - `fallback` — used when `provider` is set but its key is missing: the daemon
   boots on the fallback provider instead (resolved at startup and on each
   wake from sleep). It is **not** a live-failure failover mid-session.
-- `"vocabulary": [...]` — optional custom vocabulary hints (Gemini engine).
+- `"vocabulary": [...]` — optional custom vocabulary hints (all engines: Gemini `custom_vocabulary`, Muse and OpenAI `keywords`).
   Read once at startup — restart to apply changes.
 
 Resolution order: `--stt-engine` CLI flag > this file > legacy
@@ -224,7 +234,7 @@ The installer:
 1. `brew install`s `portaudio`, `ffmpeg`, `node`, `hidapi`
 2. Resolves the Edge TTS skill (sibling → `$OPENCLAW_WORKSPACE` → official path), runs `npm install` in its `scripts/` if needed, and records the path for the plist — warns and continues if the skill is absent
 3. Creates a Python venv at `venv/` and installs everything in `requirements.txt`
-4. Prompts for STT provider keys — OpenAI and/or Gemini (choice menu: [1] OpenAI / [2] Gemini / [3] both / [4] keep existing). Each key is verified against its provider API before being written to `openclaw.json`, and the engine choice goes to `~/.openclaw/workspace/rtt_stt_config.json` (§3.2). With both keys you pick the default engine; with one it's chosen automatically. Exits with instructions if neither key ends up configured
+4. Prompts for STT provider keys — OpenAI, Gemini and/or Muse (choice menu: [1] OpenAI / [2] Gemini / [3] Muse / [4] choose the default STT engine / [5] keep existing / [6] skip, TTS-only). OpenAI and Gemini keys are verified against their provider API before being written to `openclaw.json` (Muse keys can't be pre-verified); the engine choice goes to `~/.openclaw/workspace/rtt_stt_config.json` (§3.2). [4] sets up any of the three, then asks which configured engine is the default — the next configured one becomes the fallback; picking 1-3 alone makes that engine the default. Exits with instructions if no key ends up configured
 5. Lists CoreAudio devices and prompts for:
    - Input device index (Enter for system default)
    - Output device index (Enter for system default)

@@ -5,7 +5,8 @@
 #   1. Verify Homebrew dependencies (portaudio, ffmpeg, node)
 #   2. Resolve the Edge TTS skill (first TTS fallback) and prepare its node deps
 #   3. Create Python venv and install dependencies
-#   4. STT keys/engine, TTS keys/engine order, and STT vocabulary — delegated
+#   4. STT keys/engine (OpenAI / Gemini / Muse; menu [1]-[6]), TTS keys/engine
+#      order, and STT vocabulary — delegated
 #      to RealTimeTalk-config-lib.sh's run_stt_setup/run_tts_setup/
 #      run_vocabulary_setup (same functions RTT-Config.sh uses to
 #      re-run this later without repeating steps 1-3, 5-7)
@@ -120,6 +121,9 @@ echo
 # there gets stripped by gateway config rewrites and fails
 # `openclaw config validate`. The daemon still reads a legacy openclaw.json
 # talk.stt block as a fallback source, but this installer never writes one.
+#
+# STT providers: OpenAI Realtime, Gemini Transcribe Live, Muse Voice
+# Transcribe (Meta) — menu [4] picks the default engine among those with keys.
 #
 # All three interview steps live in RealTimeTalk-config-lib.sh so
 # RTT-Config.sh can re-run them later without repeating the rest

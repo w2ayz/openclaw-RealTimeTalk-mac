@@ -215,7 +215,7 @@ The installer:
 1. `brew install`s portaudio, ffmpeg, node (skipped if already present)
 2. Creates a Python venv at `./venv` and installs `sounddevice`, `websockets`, `numpy`, `zhconv`
 3. STT keys/engine, TTS keys/engine order, and STT vocabulary — a choice
-   menu (OpenAI / Gemini / both / keep existing / **skip for TTS-only**),
+   menu (OpenAI / Gemini / Muse / **choose the default engine** / keep existing / **skip for TTS-only**),
    hidden key input verified against each provider's API, an ElevenLabs key
    prompt, and a reorderable/droppable TTS engine chain. These three steps
    live in `RealTimeTalk-config-lib.sh` so you can re-run just this part

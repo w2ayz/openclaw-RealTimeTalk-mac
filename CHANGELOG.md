@@ -1,5 +1,26 @@
 # Changelog
 
+## [3.28.1] — 2026-10-21
+
+### Changed
+
+- **`RTT-Config.sh` STT menu reordered, per Victor:** Muse is now item [3]
+  (was [6]); the old "Both" item becomes **[4] Choose the default STT
+  engine** — it sets up any of OpenAI / Gemini / Muse (Enter keeps an
+  existing key, empty skips), then asks which configured engine is the
+  default (a single configured engine is chosen automatically). The next
+  configured engine, in openai → gemini → muse order, is written as the
+  fallback. "Keep existing" moves to [5] (still the Enter default) and
+  "Skip — TTS-only" to [6]. Picking [1]/[2]/[3] alone now also records the
+  other configured engine as fallback via the same rule, so a Gemini + Muse
+  setup no longer needs OpenAI to have a fallback. Installer
+  (`RealTimeTalk-install-mac.sh` §4 calls the same `run_stt_setup`),
+  `DEPLOYMENT.md` (requirements, §3.1 key snippet with `MUSEKEY`, §3.2
+  engine list, installer step 4) and README updated to match. Menu logic
+  verified with scripted runs against throwaway config files (all-three +
+  explicit default, two-of-three + Enter default, single engine, keep,
+  skip); the interactive prompts themselves were not exercised on a TTY.
+
 ## [3.28.0] — 2026-10-21
 
 ### Added
