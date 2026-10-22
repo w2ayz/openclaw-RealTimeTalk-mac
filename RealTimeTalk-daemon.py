@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.29.3"
+__version__ = "3.29.4"
 
 import argparse
 import asyncio
@@ -2711,12 +2711,13 @@ async def _meeting_optimize():
     try:
         with _meeting_lock:
             entries = [e for e in MEETING_LOG if "id" in e]
-        segs = [sg for sg in _meeting_segments(entries)
-                if (tuple(e["id"] for e in sg), _opt_langkey()) not in _OPT_DONE]
-        need_overall = bool(entries) and (MEETING_OVERALL.get("count") != len(entries)
-                                          or MEETING_OVERALL.get("key") != _opt_langkey())
-        if not segs and not need_overall:
-            _opt_state["msg"] = "Nothing new to optimize"
+        # Pressing the button always redoes everything with the CURRENT settings
+        # (summary languages, new lines, or just another try for different
+        # wording) — earlier summaries are replaced, corrections are re-checked.
+        segs = _meeting_segments(entries)
+        need_overall = bool(entries)
+        if not entries:
+            _opt_state["msg"] = "No notes to optimize yet"
             return
         batches, cur, size = [], [], 0
         for sg in segs:
@@ -7542,6 +7543,8 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                 elif _u.path == "/meeting/optlang":
                     _opt_state["en"] = _qs.get("en", ["0"])[0] == "1"
                     _opt_state["zh"] = _qs.get("zh", ["0"])[0] == "1"
+                    if not _opt_state["busy"]:
+                        _opt_state["msg"] = "settings changed — press to regenerate"
                     self.send_response(204)
                     self.end_headers()
                 elif _u.path == "/meeting/optimize":
@@ -9714,7 +9717,10 @@ setInterval(function(){{
   function setLang(en,zh,send){{
     curEn=!!en; curZh=!!zh;
     if(langBox) langBox.querySelectorAll('.lgb').forEach(function(b){{b.classList.toggle('on',b.dataset.l==='en'?curEn:curZh);}});
-    if(send) fetch('/meeting/optlang?en='+(curEn?1:0)+'&zh='+(curZh?1:0));
+    if(send){{
+      fetch('/meeting/optlang?en='+(curEn?1:0)+'&zh='+(curZh?1:0));
+      if(optBtn&&!optBtn.classList.contains('busy')) optBtn.textContent='✨ Optimize notes — settings changed, press to regenerate';
+    }}
   }}
   window._meetingUpdate=function(m){{
     liveOn=!!(m&&m.monitoring);

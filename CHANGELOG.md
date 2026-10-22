@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.29.4] — 2026-10-22
+
+### Changed
+
+- **Optimize notes can be pressed again at any time.** Each press redoes the
+  corrections, segment summaries and whole-meeting summary with the current
+  settings, so changing the English / 中文 toggles (or just retrying)
+  regenerates the summary instead of answering "Nothing new". Toggling
+  changes the button label to "settings changed, press to regenerate".
+  Earlier summaries are replaced, not kept alongside.
+
 ## [3.29.3] — 2026-10-22
 
 ### Added
