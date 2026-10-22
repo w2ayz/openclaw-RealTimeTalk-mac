@@ -1,5 +1,35 @@
 # Changelog
 
+## [3.28.0] — 2026-10-21
+
+### Added
+
+- **Meta Muse Voice Transcribe as the third STT engine** (`--stt-engine muse`,
+  or `"provider": "muse"` / `"fallback": "muse"` in `rtt_stt_config.json`).
+  New `MuseTranscribeSession` speaks the Meta Model API realtime protocol
+  (`wss://api.meta.ai/v1/asr/realtime`, model `muse-voice-transcribe-1.0`):
+  bearer token in the first JSON handshake frame (the HTTP Authorization
+  header is ignored), wait for the `{"sessionId"}` ack, then raw 24 kHz int16
+  mono binary frames — the daemon's native capture rate, so no resampling.
+  ENDPOINTING mode: `speechStart` / `speechEnd` / `speechComplete` map onto
+  the same `_on_speech_started` / `_on_speech_stopped` / `_on_transcript`
+  hooks the OpenAI and Gemini sessions use; partials are ignored. Shared STT
+  vocabulary becomes `keywords`; the Gemini language list becomes
+  `languageBias` (English, Mandarin Chinese, Korean, Japanese, Spanish,
+  Malay). Proactive reconnect at 55 min (server cap is 60), 80 ms silence
+  keepalive when idle, `endStream` on shutdown. Key: `talk.providers.muse.apiKey`
+  (`load_muse_key()`). Opt-in: with several keys and no configured provider
+  the default stays OpenAI. `_resolve_stt_engine()` now takes a third key and
+  resolves provider → fallback → only-available-key generically.
+- `RTT-Config.sh` STT menu gains "[6] Muse Voice Transcribe".
+- Eval tool renamed `test-gemini-transcribe.py` → `Test-STT-Transcribe.py`;
+  `--compare --muse` adds Muse as a third engine (key from env
+  `MUSE_API_KEY`), WER is scored per character for CJK, and the per-utterance
+  table handles any number of engines. First synthetic-clip results (EN + ZH,
+  clean TTS audio): all three accurate; Muse's final arrived at about the end
+  of the audio vs ~1.2 s (Gemini) / ~1.3-1.7 s (OpenAI) after. Not a
+  noisy-room or live-mic result.
+
 ## [3.27.14] — 2026-10-10
 
 ### Fixed

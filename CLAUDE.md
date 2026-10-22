@@ -10,7 +10,7 @@
   user-configurable (`rtt_tts_config.json`'s `"order"`, resolved once at
   startup into `TTS_ORDER` — see `_resolve_tts_order()`), and STT is
   optional (`rtt_stt_config.json`'s `"provider": "none"`, or simply no
-  OpenAI/Gemini key at all, resolves to `STT_ENGINE_NONE` — TTS-only, no
+  OpenAI/Gemini/Muse key at all, resolves to `STT_ENGINE_NONE` — TTS-only, no
   mic/wake-word session; `/speak` still works). Both are set via
   `RTT-Config.sh` (re-runnable anytime) or the installer's §4,
   which now just calls into `RealTimeTalk-config-lib.sh`'s
@@ -61,7 +61,7 @@
   keep *locally, untracked*, but never stage or commit it here.
 
 - No test suite exists yet beyond two standalone eval scripts
-  (`test-gemini-transcribe.py`, `test_speak.py`). Verify runtime behavior
+  (`Test-STT-Transcribe.py`, `test_speak.py`). Verify runtime behavior
   manually: `RealTimeTalk-toggle.sh restart` + `tail -f
   /tmp/openclaw/realtimetalk.log`, or `venv/bin/python
   RealTimeTalk-daemon.py --list-devices` as a cheap "does it even import"

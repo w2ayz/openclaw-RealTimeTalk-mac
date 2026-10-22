@@ -144,11 +144,11 @@ New HTTP endpoints: `/ownermode[/on|/off]`, `/ownermode/threshold?value=N`,
 
 ## API key requirements
 
-The daemon reads `talk.providers.{openai,gemini,elevenlabs}.apiKey` from
-`~/.openclaw/openclaw.json`. All three are optional:
+The daemon reads `talk.providers.{openai,gemini,muse,elevenlabs}.apiKey` from
+`~/.openclaw/openclaw.json`. All are optional:
 
-- **STT** (mic/wake-word listening): needs an OpenAI key, a Gemini key, or
-  both (see README's "STT engine selection" for provider/fallback). With
+- **STT** (mic/wake-word listening): needs an OpenAI key, a Gemini key, a Muse (Meta Model API)
+  key, or any combination (see README's "STT engine selection" for provider/fallback). With
   neither configured, `_resolve_stt_engine()` resolves to `STT_ENGINE_NONE`
   and the daemon runs TTS-only — no mic session at all, but the HTTP
   dashboard and `POST /speak` (OpenClaw pushing text to read aloud) still
@@ -164,12 +164,13 @@ The daemon reads `talk.providers.{openai,gemini,elevenlabs}.apiKey` from
   "providers": {
     "openai":     { "apiKey": "sk-..." },
     "gemini":     { "apiKey": "AIza..." },
+    "muse":       { "apiKey": "LLM_..." },
     "elevenlabs": { "apiKey": "..." }
   }
 }
 ```
 
-`load_openai_key()` / `load_gemini_key()` / `load_elevenlabs_key()` all
+`load_openai_key()` / `load_gemini_key()` / `load_muse_key()` / `load_elevenlabs_key()` all
 return `""` (not an error) if unset.
 
 Run `bash RTT-Config.sh` anytime (re-runnable, no

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test-gemini-transcribe.py — standalone eval of gemini-3.5-transcribe-live
+Test-STT-Transcribe.py — standalone eval of gemini-3.5-transcribe-live
 as a potential STT backup for RealTimeTalk (RTT).
 
 Eval tooling ONLY, by design: this file never imports or touches
@@ -31,6 +31,14 @@ Two modes:
                 end-of-speech→final latency, time-to-first-partial, and
                 (with --reference) WER against a known transcript.
 
+  --muse        Add Meta's muse-voice-transcribe-1.0 as a third engine in
+                --compare (same 24 kHz mic/file stream, no resampling). Key from
+                env MUSE_API_KEY or META_MODEL_API_KEY (the OpenClaw secret
+                store is write-only, so export it for the run) or
+                talk.providers.muse.apiKey. --muse-mode ENDPOINTING (default,
+                model-detected turns) or PUSH_TO_TALK. --language/--vocab map
+                to languageBias/keywords.
+
 Scoring (compare mode):
   latency       end→final: VAD end (speech_stopped / ACTIVITY_END) to
                 final transcript arrival — what the daemon pays before
@@ -49,18 +57,18 @@ raw mic passthrough, so noisy-room tests measure the engines' own
 robustness, not RTT's signal processing.
 
 Usage:
-    ./venv/bin/python test-gemini-transcribe.py --list-devices
-    ./venv/bin/python test-gemini-transcribe.py                       # Gemini only
-    ./venv/bin/python test-gemini-transcribe.py --compare             # vs OpenAI
-    ./venv/bin/python test-gemini-transcribe.py --duration 120        # auto-stop after 2 min
-    ./venv/bin/python test-gemini-transcribe.py --language "en-US,zh-CN"
-    ./venv/bin/python test-gemini-transcribe.py --smart               # SMART vs VERBATIM
-    ./venv/bin/python test-gemini-transcribe.py --vocab "OpenClaw,Zeebot,sherpa-onnx"
-    ./venv/bin/python test-gemini-transcribe.py --input-device 2
+    ./venv/bin/python Test-STT-Transcribe.py --list-devices
+    ./venv/bin/python Test-STT-Transcribe.py                       # Gemini only
+    ./venv/bin/python Test-STT-Transcribe.py --compare             # vs OpenAI
+    ./venv/bin/python Test-STT-Transcribe.py --duration 120        # auto-stop after 2 min
+    ./venv/bin/python Test-STT-Transcribe.py --language "en-US,zh-CN"
+    ./venv/bin/python Test-STT-Transcribe.py --smart               # SMART vs VERBATIM
+    ./venv/bin/python Test-STT-Transcribe.py --vocab "OpenClaw,Zeebot,sherpa-onnx"
+    ./venv/bin/python Test-STT-Transcribe.py --input-device 2
     # Scored A/B: latency + WER vs a reference transcript
-    ./venv/bin/python test-gemini-transcribe.py --compare --file /tmp/x.wav \
+    ./venv/bin/python Test-STT-Transcribe.py --compare --file /tmp/x.wav \
         --reference "the quick brown fox" --vocab "OpenClaw,Zeebot" --json /tmp/ab.json
-    ./venv/bin/python test-gemini-transcribe.py --compare --duration 300 --no-prompt
+    ./venv/bin/python Test-STT-Transcribe.py --compare --duration 300 --no-prompt
 
 Requires (eval-only deps; intentionally NOT in requirements.txt):
     ./venv/bin/pip install numpy sounddevice websockets
@@ -108,16 +116,29 @@ OPENAI_TAIL_GRACE      = 5.0   # secs to keep the socket open after EOF so
                                # transcription.completed (trails item.done) lands
 OPENAI_BLOCKSIZE       = 2400        # 100 ms at 24 kHz
 
+# Muse leg — Meta Model API realtime ASR (docs: dev.meta.ai/docs/speech-to-text).
+# Handshake is a JSON text frame carrying the bearer token (the HTTP
+# Authorization header is ignored); raw 24 kHz PCM follows as binary frames.
+MUSE_WS_URL         = "wss://api.meta.ai/v1/asr/realtime"
+MUSE_MODEL          = "muse-voice-transcribe-1.0"
+MUSE_SAMPLE_RATE    = 24000
+MUSE_TAIL_GRACE     = 5.0
+MUSE_LANG_NAMES     = {"en": "English", "zh": "Mandarin Chinese", "ko": "Korean",
+                       "ja": "Japanese", "es": "Spanish", "ms": "Malay",
+                       "fr": "French"}
+
 # Compare-mode scoring. Records are appended per utterance by the two legs;
 # print_summary() turns them into the latency/WER table at shutdown.
-RESULTS = {"Gemini": [], "OpenAI": []}
+RESULTS = {"Gemini": [], "OpenAI": [], "Muse": []}
 
 
 def _wer(ref: str, hyp: str) -> float:
     """Word error rate via Levenshtein distance on word tokens (no deps)."""
     import re as _re
-    rw = _re.findall(r"\w+", ref.lower(), _re.UNICODE)
-    hw = _re.findall(r"\w+", hyp.lower(), _re.UNICODE)
+    # CJK has no word spaces: score per character there (CER), per word elsewhere.
+    tok = r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]|\w+"
+    rw = _re.findall(tok, ref.lower(), _re.UNICODE)
+    hw = _re.findall(tok, hyp.lower(), _re.UNICODE)
     if not rw:
         return 0.0 if not hw else 1.0
     prev = list(range(len(hw) + 1))
@@ -142,24 +163,34 @@ def _pct(vals):
     return med, p95
 
 
-def _pair_utterances(g_rec, o_rec, max_gap: float = 2.5):
-    """Greedy-match Gemini and OpenAI utterances by speech-start time so the
-    table can show both engines' output for the same spoken utterance."""
-    pairs, used_o = [], set()
-    for g in sorted(g_rec, key=lambda r: r["t_start"] if r["t_start"] is not None else 1e18):
-        best, best_dt = None, max_gap
-        for j, o in enumerate(o_rec):
-            if j in used_o or o["t_start"] is None or g["t_start"] is None:
-                continue
-            dt = abs(o["t_start"] - g["t_start"])
-            if dt < best_dt:
-                best, best_dt = j, dt
-        used_o.add(best if best is not None else -1)
-        pairs.append((g, o_rec[best] if best is not None else None))
-    for j, o in enumerate(o_rec):
-        if j not in used_o:
-            pairs.append((None, o))
-    return pairs
+def _pair_utterances(results, max_gap: float = 2.5):
+    """Greedy-match utterances across engines by speech-start time so the table
+    can show every engine's output for the same spoken utterance. The engine
+    with the most finals anchors the rows; returns a list of {engine: rec}."""
+    engines = [e for e in results if results[e]]
+    if not engines:
+        return []
+    anchor = max(engines, key=lambda e: len(results[e]))
+    key = lambda r: r["t_start"] if r["t_start"] is not None else 1e18
+    rows = [{anchor: r} for r in sorted(results[anchor], key=key)]
+    for eng in engines:
+        if eng == anchor:
+            continue
+        used = set()
+        for row in rows:
+            a = row[anchor]
+            best, best_dt = None, max_gap
+            for j, o in enumerate(results[eng]):
+                if j in used or o["t_start"] is None or a["t_start"] is None:
+                    continue
+                dt = abs(o["t_start"] - a["t_start"])
+                if dt < best_dt:
+                    best, best_dt = j, dt
+            if best is not None:
+                used.add(best)
+                row[eng] = results[eng][best]
+        rows += [{eng: o} for j, o in enumerate(results[eng]) if j not in used]
+    return rows
 
 
 def print_summary(results, args):
@@ -167,7 +198,9 @@ def print_summary(results, args):
     print(f"\n{_ts()} ── Compare summary " + "─" * 40)
     ref = (args.reference or "").strip()
     wer_by_engine = {}
-    for eng in ("Gemini", "OpenAI"):
+    engines = [e for e in ("Gemini", "OpenAI", "Muse")
+               if e != "Muse" or getattr(args, "muse", False)]
+    for eng in engines:
         recs = results.get(eng, [])
         if not recs:
             print(f"{eng:>7}: no finals captured")
@@ -194,24 +227,21 @@ def print_summary(results, args):
             wer_by_engine[eng] = w
             print(f"{'':>7}  WER vs reference: {w * 100:.1f}%   "
                   f"got: {joined[:90]!r}")
-    if ref and not wer_by_engine:
-        pass
     # Side-by-side rows (paired by speech-start proximity).
-    pairs = _pair_utterances(results.get("Gemini", []), results.get("OpenAI", []))
-    if pairs:
+    rows = _pair_utterances({e: results.get(e, []) for e in engines})
+    if rows:
         print(f"\n{'':>7}  per-utterance (start→final lag in s):")
-        for i, (g, o) in enumerate(pairs, 1):
-            g_txt = (g or {}).get("text", "—")
-            o_txt = (o or {}).get("text", "—")
-            g_lag = (f"{g['lag_start_to_final']:.2f}" if g and g["lag_start_to_final"] is not None else "n/a")
-            o_lag = (f"{o['lag_start_to_final']:.2f}" if o and o["lag_start_to_final"] is not None else "n/a")
-            print(f"{'':>7}   #{i}  Gemini [{g_lag}] {g_txt}")
-            print(f"{'':>7}       OpenAI [{o_lag}] {o_txt}")
+        for i, row in enumerate(rows, 1):
+            for n, eng in enumerate(engines):
+                r = row.get(eng)
+                lag = (f"{r['lag_start_to_final']:.2f}"
+                       if r and r["lag_start_to_final"] is not None else "n/a")
+                lead = f"#{i}" if n == 0 else ""
+                print(f"{'':>7}   {lead:<3} {eng:>6} [{lag}] {r['text'] if r else '—'}")
     if getattr(args, "json", None):
-        out = {"gemini": results.get("Gemini", []),
-               "openai": results.get("OpenAI", []),
-               "reference": ref or None,
-               "wer": {k: v for k, v in wer_by_engine.items()}}
+        out = {e.lower(): results.get(e, []) for e in engines}
+        out["reference"] = ref or None
+        out["wer"] = {k: v for k, v in wer_by_engine.items()}
         try:
             with open(args.json, "w") as f:
                 json.dump(out, f, indent=1, ensure_ascii=False)
@@ -237,6 +267,24 @@ def load_provider_key(name: str) -> str:
     sys.exit(f"Missing talk.providers.{name}.apiKey in {OPENCLAW_CONFIG}.\n"
              f"Add it as a plain string, e.g.: \"talk\": {{\"providers\": "
              f"{{\"{name}\": {{\"apiKey\": \"...\"}}}}}}")
+
+
+def load_muse_key() -> str:
+    """Muse key: env MUSE_API_KEY / META_MODEL_API_KEY, else plain
+    talk.providers.muse.apiKey. (`openclaw secrets store` is write-only, so
+    the stored META_MODEL_API_KEY can't be read back from here.)"""
+    for var in ("MUSE_API_KEY", "META_MODEL_API_KEY"):
+        if os.environ.get(var, "").strip():
+            return os.environ[var].strip()
+    try:
+        with open(OPENCLAW_CONFIG) as f:
+            key = (((json.load(f).get("talk") or {}).get("providers") or {})
+                   .get("muse") or {}).get("apiKey", "")
+        if isinstance(key, str) and key.strip():
+            return key.strip()
+    except (OSError, ValueError):
+        pass
+    sys.exit("No Muse key: export MUSE_API_KEY (or META_MODEL_API_KEY) and retry.")
 
 
 def list_devices() -> None:
@@ -763,6 +811,129 @@ async def openai_leg(api_key: str, q: asyncio.Queue,
         await asyncio.sleep(RECONNECT_DELAY)
 
 
+# ── Muse leg (Meta Model API realtime ASR) ───────────────────────────────────
+
+def muse_handshake(key: str, args) -> dict:
+    hs = {"authorization": {"accessToken": f"Bearer {key}"},
+          "audioEncoding": "PCM_24KHZ", "model": MUSE_MODEL,
+          "mode": args.muse_mode, "partialMode": "CUMULATIVE",
+          "emitAudioProgress": False}
+    langs = []
+    for c in (args.language or "").split(","):
+        name = MUSE_LANG_NAMES.get(c.strip().split("-")[0].lower())
+        if name and name not in langs:
+            langs.append(name)
+    if langs:
+        hs["languageBias"] = langs
+    vocab = [v.strip() for v in (args.vocab or "").split(",") if v.strip()]
+    if vocab:
+        hs["keywords"] = vocab
+    return hs
+
+
+async def muse_leg(key: str, args, q: asyncio.Queue, shutdown: asyncio.Event,
+                   label: str = "Muse", records: list = None,
+                   ready: asyncio.Event = None):
+    """One Muse realtime session per run (60-min cap; eval runs are shorter).
+    Events: speechStart → transcript(final:false partials) → speechEnd →
+    speechComplete(turnId, transcript). In PUSH_TO_TALK there is no
+    speechComplete; a transcript with final:true completes the turn instead."""
+    while True:
+        print(f"{_ts()} -- {label}: session connecting")
+        try:
+            async with websockets.connect(MUSE_WS_URL, ping_interval=20,
+                                          ping_timeout=10, open_timeout=15) as ws:
+                await ws.send(json.dumps(muse_handshake(key, args)))
+                ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+                if "sessionId" not in ack:
+                    print(f"{_ts()} [{label}] unexpected ack: {ack}")
+                    return
+                print(f"{_ts()} -- {label}: session active ({args.muse_mode})")
+                if ready is not None:
+                    ready.set()
+
+                ended = False       # endStream sent → server closes 1000 by design
+
+                async def sender():
+                    nonlocal ended
+                    while not shutdown.is_set():
+                        try:
+                            chunk = await asyncio.wait_for(q.get(), timeout=0.5)
+                        except asyncio.TimeoutError:
+                            continue
+                        if chunk is None:
+                            ended = True
+                            await ws.send(json.dumps({"type": "endStream"}))
+                            await asyncio.sleep(MUSE_TAIL_GRACE)
+                            return
+                        await ws.send(chunk)
+
+                async def receiver():
+                    turns = {}          # turnId → timing record
+                    cur = None
+                    def finish(turn_id, text):
+                        nonlocal cur
+                        text = (text or "").strip()
+                        t = turns.pop(turn_id, None) or cur or {}
+                        if not text:
+                            return
+                        now = time.monotonic()
+                        ts, te, tp = t.get("t_start"), t.get("t_end"), t.get("t_first_partial")
+                        print(f"{_ts()} [{label}] {text}")
+                        if records is not None:
+                            records.append({"t_start": ts, "t_end": te,
+                                            "t_first_partial": tp, "t_final": now,
+                                            "text": text,
+                                            "lag_end_to_final": (now - te) if te else None,
+                                            "lag_start_to_partial": (tp - ts) if tp and ts else None,
+                                            "lag_start_to_final": (now - ts) if ts else None})
+                        cur = None
+                    try:
+                        async for raw in ws:
+                            if isinstance(raw, bytes):
+                                continue
+                            msg = json.loads(raw)
+                            t = msg.get("type", "")
+                            now = time.monotonic()
+                            if t == "speechStart":
+                                cur = {"t_start": now, "t_end": None, "t_first_partial": None}
+                                turns[msg.get("turnId")] = cur
+                            elif t == "speechEnd" and cur is not None:
+                                cur["t_end"] = now
+                            elif t == "transcript":
+                                if cur is not None and cur["t_first_partial"] is None \
+                                        and msg.get("transcript"):
+                                    cur["t_first_partial"] = now
+                                if msg.get("final") and args.muse_mode == "PUSH_TO_TALK":
+                                    finish(None, msg.get("transcript"))
+                            elif t == "speechComplete":
+                                finish(msg.get("turnId"), msg.get("transcript"))
+                            elif t == "error":
+                                print(f"{_ts()} [{label}] error: {msg.get('message', msg)}")
+                    except websockets.exceptions.ConnectionClosed as e:
+                        print(f"{_ts()} -- {label}: receiver closed: {e.code} {e.reason}")
+
+                s = asyncio.create_task(sender())
+                r = asyncio.create_task(receiver())
+                done, pending = await asyncio.wait(
+                    [s, r], return_when=asyncio.FIRST_COMPLETED)
+                eof = ended or s in done
+                if eof:                        # EOF: let trailing events land
+                    try:
+                        await asyncio.wait_for(r, timeout=MUSE_TAIL_GRACE)
+                    except (asyncio.TimeoutError, Exception):
+                        pass
+                for t in (s, r):
+                    t.cancel()
+                if eof:
+                    return
+        except Exception as e:
+            print(f"{_ts()} -- {label}: connect failed: {e}")
+        if shutdown.is_set():
+            break
+        await asyncio.sleep(RECONNECT_DELAY)
+
+
 # ── Modes ─────────────────────────────────────────────────────────────────────
 
 async def run_gemini_only(args):
@@ -816,6 +987,7 @@ async def run_gemini_only(args):
 async def run_compare(args):
     gemini_key = load_provider_key("gemini")
     openai_key = load_provider_key("openai")
+    muse_key = load_muse_key() if args.muse else None
     loop = asyncio.get_running_loop()
     shutdown = asyncio.Event()
     feeder = None
@@ -828,6 +1000,7 @@ async def run_compare(args):
         feeder = FileFeeder(args.file, OPENAI_SAMPLE_RATE, OPENAI_BLOCKSIZE)
         q_openai = feeder.add_queue()
         q_gemini = feeder.add_queue()
+        q_muse = feeder.add_queue() if args.muse else None
         print(f"{_ts()} Compare mode — file={args.file}, 24 kHz fanned to "
               f"OpenAI ({OPENAI_TRANSCRIBE_MODEL}) and Gemini ({GEMINI_MODEL}, "
               f"downsampled 24k→16k). Finals only, labeled.")
@@ -835,6 +1008,7 @@ async def run_compare(args):
         mic = MicFanout(loop, OPENAI_SAMPLE_RATE, OPENAI_BLOCKSIZE, args.input_device)
         q_openai = mic.add_queue()
         q_gemini = mic.add_queue()
+        q_muse = mic.add_queue() if args.muse else None
         print(f"{_ts()} Compare mode — one mic @ {OPENAI_SAMPLE_RATE} Hz fanned to "
               f"OpenAI ({OPENAI_TRANSCRIBE_MODEL}) and Gemini ({GEMINI_MODEL}, "
               f"downsampled 24k→16k). Finals only, labeled. Ctrl-C to stop.")
@@ -873,7 +1047,8 @@ async def run_compare(args):
                 shutdown.set()
         return asyncio.create_task(_feeder_done())
 
-    ready_openai, ready_gemini = asyncio.Event(), asyncio.Event()
+    ready_openai, ready_gemini, ready_muse = (asyncio.Event(), asyncio.Event(),
+                                              asyncio.Event())
     legs = [
         asyncio.create_task(openai_leg(
             openai_key, q_openai, shutdown,
@@ -885,10 +1060,15 @@ async def run_compare(args):
                                        records=RESULTS["Gemini"],
                                        ready=ready_gemini)),
     ]
+    if args.muse:
+        legs.append(asyncio.create_task(muse_leg(
+            muse_key, args, q_muse, shutdown, records=RESULTS["Muse"],
+            ready=ready_muse)))
     # Hold audio until both engines can actually transcribe — the scored
     # comparison is unfair otherwise (engine that connects late misses audio).
     async def _both_ready():
-        await asyncio.gather(ready_openai.wait(), ready_gemini.wait())
+        await asyncio.gather(ready_openai.wait(), ready_gemini.wait(),
+                             *([ready_muse.wait()] if args.muse else []))
     try:
         await asyncio.wait_for(_both_ready(), timeout=15.0)
         if feeder is not None:
@@ -915,6 +1095,8 @@ async def run_compare(args):
         shutdown.set()
         q_openai.put_nowait(None)
         q_gemini.put_nowait(None)
+        if q_muse is not None:
+            q_muse.put_nowait(None)
         if feeder_task:
             feeder_task.cancel()
         await asyncio.gather(*legs, pump_task, return_exceptions=True)
@@ -964,6 +1146,12 @@ def main():
                              "leg (it biases toward wake-word-only transcripts)")
     parser.add_argument("--json", default=None, metavar="PATH",
                         help="Write per-utterance records + metrics JSON to PATH")
+    parser.add_argument("--muse", action="store_true",
+                        help="Add Meta muse-voice-transcribe-1.0 as a third "
+                             "engine in --compare (key: env MUSE_API_KEY)")
+    parser.add_argument("--muse-mode", default="ENDPOINTING",
+                        choices=["ENDPOINTING", "PUSH_TO_TALK"],
+                        help="Muse turn handling (default ENDPOINTING)")
     parser.add_argument("--debug", action="store_true",
                         help="Print every OpenAI-leg event type (diagnose silent legs)")
     args = parser.parse_args()

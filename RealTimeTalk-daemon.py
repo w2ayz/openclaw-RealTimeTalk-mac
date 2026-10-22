@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.27.14"
+__version__ = "3.28.0"
 
 import argparse
 import asyncio
@@ -179,10 +179,27 @@ GEMINI_CUSTOM_VOCABULARY: list = []       # populated at startup with agent name
 # offending terms are filtered out (with a warning) rather than shared as-is.
 OPENAI_TRANSCRIPTION_KEYWORDS: list = []  # populated at startup, see main()
 
+# Muse Voice Transcribe (Meta Model API) — third STT engine, added v3.28.0.
+# Realtime WebSocket (docs: dev.meta.ai/docs/speech-to-text). Auth is a bearer
+# token in the first JSON handshake frame (the HTTP Authorization header is
+# ignored); audio is raw 24 kHz int16 mono binary frames — the same 24 kHz
+# capture the daemon already makes, so no resampling. ENDPOINTING mode: the
+# model emits speechStart / speechEnd / speechComplete (final text), the same
+# shape of events the daemon consumes from OpenAI and Gemini.
+MUSE_MODEL              = "muse-voice-transcribe-1.0"
+MUSE_WS_URL             = "wss://api.meta.ai/v1/asr/realtime"
+MUSE_MODE               = "ENDPOINTING"
+MUSE_SESSION_RESET_SECS = 55 * 60       # proactive reconnect before the 60-min cap
+MUSE_HANDSHAKE_TIMEOUT  = 10.0          # server requires the handshake within 10 s
+MUSE_LANGUAGE_NAMES     = {"en": "English", "zh": "Mandarin Chinese", "ko": "Korean",
+                           "ja": "Japanese", "es": "Spanish", "ms": "Malay",
+                           "fr": "French"}
+
 # STT engine selection. CLI --stt-engine overrides the daemon-owned config file
 # (rtt_stt_config.json) and the legacy openclaw.json `talk.stt` block.
 STT_ENGINE_OPENAI  = "openai"
 STT_ENGINE_GEMINI  = "gemini"
+STT_ENGINE_MUSE    = "muse"
 STT_ENGINE_NONE    = "none"     # no provider key configured — TTS-only, no mic/STT session
 DEFAULT_STT_ENGINE = STT_ENGINE_OPENAI
 # Engine settings live in the daemon's OWN config file, not openclaw.json:
@@ -2362,6 +2379,15 @@ def load_gemini_key() -> str:
         return _resolve_provider_api_key(_load_json(OPENCLAW_CONFIG), "gemini")
     except Exception as e:
         log.warning("Could not load Gemini key: %s", e)
+        return ""
+
+def load_muse_key() -> str:
+    """Returns the Meta Model API key (talk.providers.muse.apiKey) if present,
+    else "". Muse is optional — STT falls back to OpenAI/Gemini without it."""
+    try:
+        return _resolve_provider_api_key(_load_json(OPENCLAW_CONFIG), "muse")
+    except Exception as e:
+        log.warning("Could not load Muse key: %s", e)
         return ""
 
 def load_elevenlabs_key() -> str:
@@ -5944,6 +5970,168 @@ class GeminiTranscribeSession(BaseVoiceSession):
             elif vtype == "ACTIVITY_END":
                 self._on_speech_stopped()
 
+class MuseTranscribeSession(BaseVoiceSession):
+    """Meta Muse Voice Transcribe raw WebSocket session (ENDPOINTING mode).
+
+    Audio goes out exactly as captured (24 kHz int16 mono, binary frames).
+    Events map onto the same hooks the other engines use: speechStart →
+    _on_speech_started, speechEnd → _on_speech_stopped, speechComplete (the
+    post-processed final text for the turn) → _on_transcript. Partial
+    `transcript` events are ignored — the daemon only acts on finals.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._session_no = 0
+        self._shutdown = asyncio.Event()
+
+    def engine_name(self) -> str:
+        return "Muse Voice Transcribe"
+
+    def _handshake_payload(self) -> dict:
+        hs = {
+            "authorization": {"accessToken": f"Bearer {self.api_key}"},
+            "audioEncoding": "PCM_24KHZ",
+            "model": MUSE_MODEL,
+            "mode": MUSE_MODE,
+            "partialMode": "CUMULATIVE",
+            "emitAudioProgress": False,
+        }
+        langs = []
+        for code in GEMINI_LANGUAGE_CODES:      # same bilingual hint list as Gemini
+            name = MUSE_LANGUAGE_NAMES.get(code.split("-")[0].lower())
+            if name and name not in langs:
+                langs.append(name)
+        if langs:
+            hs["languageBias"] = langs
+        vocab = [v.strip() for v in GEMINI_CUSTOM_VOCABULARY if v.strip()]
+        if vocab:
+            hs["keywords"] = vocab
+        return hs
+
+    async def _connect_and_run(self):
+        self._shutdown.clear()
+        while not self.stop_event.is_set() and not self._shutdown.is_set():
+            self._session_no += 1
+            log.info("Muse session %d connecting (model=%s, reset every %d min)",
+                     self._session_no, MUSE_MODEL, MUSE_SESSION_RESET_SECS // 60)
+            try:
+                async with websockets.connect(MUSE_WS_URL, ping_interval=20,
+                                              ping_timeout=10,
+                                              open_timeout=15) as ws:
+                    await ws.send(json.dumps(self._handshake_payload()))
+                    # The ack is {"sessionId": ...} with no "type"; audio must
+                    # wait for it. Anything else here (e.g. an error frame for
+                    # a rejected key) is fatal for this attempt.
+                    ack = json.loads(await asyncio.wait_for(
+                        ws.recv(), timeout=MUSE_HANDSHAKE_TIMEOUT))
+                    if "sessionId" not in ack:
+                        raise RuntimeError(f"Muse handshake rejected: "
+                                           f"{ack.get('message', ack)}")
+                    log.info("Muse session active — speak now (routed through %s / OpenClaw)",
+                             AGENT_NAME)
+                    tasks = [
+                        asyncio.create_task(self._muse_sender(ws)),
+                        asyncio.create_task(self._muse_receiver(ws)),
+                        asyncio.create_task(self._watch_mic_stream()),
+                        asyncio.create_task(self._idle_watcher(ws)),
+                        asyncio.create_task(self._name_wake_watcher(ws)),
+                    ]
+                    done, pending = await asyncio.wait(
+                        tasks, return_when=asyncio.FIRST_COMPLETED)
+                    for task in pending:
+                        task.cancel()
+
+                    # Same auto-sleep / name-wake-timeout contract as Gemini:
+                    # main() holds at the /wake gate, so don't reconnect here.
+                    if _sleep_requested[0]:
+                        return
+
+            except Exception as e:
+                log.error("Muse session error: %s", e)
+                raise
+
+            # Proactive reset (or server close): drop stale audio so the
+            # fresh session doesn't receive a burst.
+            while not self._mic_q.empty():
+                try:
+                    self._mic_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+    async def _muse_sender(self, ws):
+        started = time.monotonic()
+        last_send = time.monotonic()
+        silence = b"\x00" * (SAMPLE_RATE // 1000 * 80 * 2)   # 80 ms keepalive frame
+        end = json.dumps({"type": "endStream"})
+        while not self.stop_event.is_set() and not self._shutdown.is_set():
+            if await self._apply_dtmf_flags(ws):
+                return
+            try:
+                chunk = await asyncio.wait_for(self._mic_q.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                now = time.monotonic()
+                try:
+                    if self.stop_event.is_set():
+                        await ws.send(end)
+                        return
+                    if now - started > MUSE_SESSION_RESET_SECS:
+                        await ws.send(end)
+                        log.info("Muse proactive session reset (before 60-min cap)")
+                        return
+                    if now - last_send > 0.5:     # keepalive for idle sessions
+                        await ws.send(silence)
+                        last_send = now
+                except websockets.exceptions.ConnectionClosed:
+                    return
+                continue
+            try:
+                if chunk is None:
+                    await ws.send(end)
+                    return
+                await ws.send(chunk)
+            except websockets.exceptions.ConnectionClosed:
+                return
+            last_send = time.monotonic()
+
+    async def _muse_receiver(self, ws):
+        while not self.stop_event.is_set() and not self._shutdown.is_set():
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
+            except asyncio.TimeoutError:
+                continue
+            except websockets.exceptions.ConnectionClosed as e:
+                log.info("Muse receiver closed: %s", e)
+                return
+            if isinstance(raw, bytes):
+                continue
+            await self._handle_engine_message(ws, raw)
+
+    async def _send_audio_chunk(self, ws, chunk: bytes):
+        # _muse_sender consumes the queue directly (proactive reset, keepalive);
+        # _send_mic is not used for Muse.
+        pass
+
+    async def _clear_audio_buffer(self, ws):
+        # No buffer-clear message exists; TTS-interrupt echoes rely on the
+        # transcript-level _busy / _is_speaking discard, as with Gemini.
+        pass
+
+    async def _handle_engine_message(self, ws, raw):
+        msg = json.loads(raw)
+        t = msg.get("type", "")
+        if t == "speechStart":
+            self._on_speech_started()
+        elif t == "speechEnd":
+            self._on_speech_stopped()
+        elif t == "speechComplete":
+            text = (msg.get("transcript") or "").strip()
+            if text:
+                self._on_transcript(text)
+        elif t == "error":
+            log.error("Muse error: %s", msg.get("message", msg))
+        # transcript (partials), speaker, audioProgress, unknown types: ignored
+
 # ── HTTP toggle server ────────────────────────────────────────────────────────
 
 def _switch_mic_stream(session, new_idx: int) -> None:
@@ -8687,45 +8875,42 @@ def _resolve_elevenlabs_model() -> str:
     return DEFAULT_ELEVENLABS_MODEL
 
 
-def _resolve_stt_engine(openai_key: str, gemini_key: str) -> str:
+def _resolve_stt_engine(openai_key: str, gemini_key: str, muse_key: str = "") -> str:
     """Pick the active STT engine from CLI arg, config, or key availability."""
     stt_cfg = _load_stt_settings()
     configured = stt_cfg.get("provider", "").strip().lower()
     fallback = stt_cfg.get("fallback", "").strip().lower()
+    keys = {STT_ENGINE_OPENAI: openai_key, STT_ENGINE_GEMINI: gemini_key,
+            STT_ENGINE_MUSE: muse_key}
 
     # CLI override wins
     if _cli_stt_engine[0]:
         return _cli_stt_engine[0]
 
     # No usable key at all — TTS-only, regardless of what "provider" says
-    # (a stale "openai"/"gemini" left over from a since-removed key must not
-    # attempt a connection). Also honors an explicit "none" from the
+    # (a stale "openai"/"gemini"/"muse" left over from a since-removed key must
+    # not attempt a connection). Also honors an explicit "none" from the
     # configure script's Skip option.
-    if not openai_key and not gemini_key:
+    if not any(keys.values()):
         return STT_ENGINE_NONE
     if configured == STT_ENGINE_NONE:
         return STT_ENGINE_NONE
 
-    # Configured primary, if key exists
+    # Configured primary, if key exists; else the configured fallback
     if configured:
-        if configured == STT_ENGINE_GEMINI and gemini_key:
-            return STT_ENGINE_GEMINI
-        if configured == STT_ENGINE_OPENAI and openai_key:
-            return STT_ENGINE_OPENAI
-        # If primary key missing but fallback key exists, use fallback
-        if fallback:
-            if fallback == STT_ENGINE_GEMINI and gemini_key:
-                return STT_ENGINE_GEMINI
-            if fallback == STT_ENGINE_OPENAI and openai_key:
-                return STT_ENGINE_OPENAI
+        if keys.get(configured):
+            return configured
+        if fallback and keys.get(fallback):
+            return fallback
 
     # Auto: use the only available key
-    if openai_key and not gemini_key:
-        return STT_ENGINE_OPENAI
-    if gemini_key and not openai_key:
-        return STT_ENGINE_GEMINI
+    available = [e for e in (STT_ENGINE_OPENAI, STT_ENGINE_GEMINI, STT_ENGINE_MUSE)
+                 if keys[e]]
+    if len(available) == 1:
+        return available[0]
 
-    # Both present or neither: default to OpenAI for backward compatibility
+    # Several keys present, none configured: default to OpenAI for backward
+    # compatibility (Muse is opt-in, never an implicit default).
     return DEFAULT_STT_ENGINE
 
 
@@ -8745,6 +8930,7 @@ async def main(http_port: int, input_device=None, output_device=None,
 
     openai_key = load_openai_key()
     gemini_key = load_gemini_key()
+    muse_key = load_muse_key()
     try:
         gw_token = load_gateway_token()
     except Exception as e:
@@ -8834,7 +9020,7 @@ async def main(http_port: int, input_device=None, output_device=None,
             _log_entry("system", "Reconnecting…")
             _woke_from_sleep = True
 
-        engine_name = _resolve_stt_engine(openai_key, gemini_key)
+        engine_name = _resolve_stt_engine(openai_key, gemini_key, muse_key)
         _active_stt_engine[0] = engine_name   # dashboard #dp shows the real engine, not just the CLI flag
 
         if engine_name == STT_ENGINE_NONE:
@@ -8855,7 +9041,17 @@ async def main(http_port: int, input_device=None, output_device=None,
         if _woke_from_sleep:
             log.info("Wake received — connecting to the %s STT engine…",
                      engine_name.upper())
-        if engine_name == STT_ENGINE_GEMINI:
+        if engine_name == STT_ENGINE_MUSE:
+            if not muse_key:
+                log.error("Muse STT requested but no Muse API key configured")
+                sys.exit(1)
+            session = MuseTranscribeSession(
+                api_key=muse_key, loop=loop, gw=gw,
+                stop_event=stop_event,
+                input_device=_selected_input_device[0], alsa_output=alsa_output,
+                session_key=session_key,
+            )
+        elif engine_name == STT_ENGINE_GEMINI:
             if not gemini_key:
                 log.error("Gemini STT requested but no Gemini API key configured")
                 sys.exit(1)
@@ -8968,7 +9164,7 @@ if __name__ == "__main__":
     p.add_argument("--calibrate",       action="store_true",
                    help="Measure ambient noise and print recommended --mic-gate value, then exit")
     p.add_argument("--stt-engine",      type=str, default=None,
-                   help="STT engine: openai, gemini, openai,gemini, gemini,openai, or auto")
+                   help="STT engine: openai, gemini, muse, or auto")
     p.add_argument("--no-oww",          action="store_true",
                    help="Disable local OpenWakeWord listening in Sleeping Mode "
                         "(wake stays possible via HTTP /wake or DTMF)")

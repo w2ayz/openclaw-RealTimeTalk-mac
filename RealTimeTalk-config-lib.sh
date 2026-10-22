@@ -29,7 +29,7 @@ PY
 }
 
 has_any_stt_key() {
-    _has_provider_key openai || _has_provider_key gemini
+    _has_provider_key openai || _has_provider_key gemini || _has_provider_key muse
 }
 
 # ensure_provider_key <provider> <prefix-regex-or-empty> <env-var> [<env-var-2>] [<hint>]
@@ -102,12 +102,17 @@ ensure_provider_key() {
         gemini)
             http=$(curl -s -o /dev/null -w "%{http_code}" -m 10 \
                 https://generativelanguage.googleapis.com/v1beta/models -H "x-goog-api-key: $KEY" || echo 000) ;;
+        muse)
+            # No cheap REST probe for the realtime ASR key (WebSocket-only
+            # handshake) — saved unverified; the daemon logs a rejected key.
+            http=skip ;;
         elevenlabs)
             http=$(curl -s -o /dev/null -w "%{http_code}" -m 10 \
                 https://api.elevenlabs.io/v1/user -H "xi-api-key: $KEY" || echo 000) ;;
         *) http=000 ;;
     esac
     case "$http" in
+        skip)    yellow "  → $prov keys can't be pre-verified here — saving; the daemon logs if it is rejected" ;;
         200)     green "  ✓ $prov key verified against the provider API" ;;
         000)     yellow "  → could not reach the $prov API to verify (offline?) — continuing" ;;
         401|403) red   "  ✗ $prov key was REJECTED by the provider (HTTP $http) — not saving it"
@@ -168,7 +173,7 @@ run_stt_setup() {
 import json
 cfg = json.load(open("$OPENCLAW_JSON"))
 prov = cfg.get("talk", {}).get("providers", {})
-for name in ("openai", "gemini"):
+for name in ("openai", "gemini", "muse"):
     k = (prov.get(name) or {}).get("apiKey", "")
     print(f"  {name:8s} {'configured' if k else '- not set'}")
 PY
@@ -180,14 +185,15 @@ PY
     echo "    [4] Keep existing configuration"
     echo "    [5] Skip — no STT, TTS-only (text-only) mode. OpenClaw can still push text to"
     echo "        RealTimeTalk to read aloud (POST /speak) — there's just no mic/wake-word listening."
+    echo "    [6] Muse Voice Transcribe  (Meta Model API key, LLM_...; Mandarin + English)"
     echo "  (Enter to keep existing configuration; nothing here is final — re-run this anytime.)"
     echo
     local STT_CHOICE
     while true; do
-        read -r -p "  Choice [1/2/3/4/5, Enter = keep existing]: " STT_CHOICE
+        read -r -p "  Choice [1/2/3/4/5/6, Enter = keep existing]: " STT_CHOICE
         STT_CHOICE="${STT_CHOICE:-4}"
-        case "$STT_CHOICE" in 1|2|3|4|5) break ;; esac
-        yellow "  → enter 1, 2, 3, 4 or 5"
+        case "$STT_CHOICE" in 1|2|3|4|5|6) break ;; esac
+        yellow "  → enter 1, 2, 3, 4, 5 or 6"
     done
 
     case "$STT_CHOICE" in
@@ -220,6 +226,14 @@ PY
                 yellow "  → 'Both' needs both keys — set the engine manually in $STT_CFG"
             fi
             ;;
+        6)
+            ensure_provider_key muse "^LLM_" META_MODEL_API_KEY MUSE_API_KEY "LLM_..." || true
+            if _has_provider_key muse; then
+                if _has_provider_key openai; then write_stt_engine muse openai
+                elif _has_provider_key gemini; then write_stt_engine muse gemini
+                else write_stt_engine muse ""; fi
+            fi
+            ;;
         4) green "  ✓ keeping existing configuration" ;;
         5)
             write_stt_engine none ""
@@ -229,7 +243,7 @@ PY
     esac
 
     if [[ "$STT_CHOICE" != "4" ]] && ! has_any_stt_key; then
-        yellow "  → No STT provider key ended up configured (openai or gemini)."
+        yellow "  → No STT provider key ended up configured (openai, gemini or muse)."
         local CONT_TEXT_ONLY
         read -r -p "  Continue anyway in TTS-only (no STT) mode? [Y/n]: " CONT_TEXT_ONLY
         if [[ "$CONT_TEXT_ONLY" =~ ^[Nn] ]]; then

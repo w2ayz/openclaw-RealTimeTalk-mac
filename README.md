@@ -6,7 +6,7 @@ Real-time voice conversations with your OpenClaw agent (default name
 to run on a Mac Mini.
 
 ```
-Mic → OpenAI Realtime API or Gemini 3.5 Transcribe Live (VAD + STT)
+Mic → OpenAI Realtime API, Gemini 3.5 Transcribe Live, or Meta Muse Voice Transcribe (VAD + STT)
        ↓
     OpenClaw gateway → Agent → TTS → Speaker
 ```
@@ -59,7 +59,7 @@ verbatim from the Pi version.
 | Dependency                  | Install                                    |
 |-----------------------------|--------------------------------------------|
 | [OpenClaw](https://openclaw.ai) gateway running | platform requirement (`openclaw gateway start`) |
-| STT provider key(s) in `~/.openclaw/openclaw.json` (optional) | OpenAI (`talk.providers.openai.apiKey`, regular `sk-...` key, **not** the openai-codex OAuth profile) and/or Gemini (`talk.providers.gemini.apiKey`, `AQ....` or legacy `AIza...` from AI Studio) — either works on its own; with neither, RealTimeTalk runs TTS-only (no mic/wake-word listening — see "STT engine selection" below) |
+| STT provider key(s) in `~/.openclaw/openclaw.json` (optional) | OpenAI (`talk.providers.openai.apiKey`, regular `sk-...` key, **not** the openai-codex OAuth profile) and/or Gemini (`talk.providers.gemini.apiKey`, `AQ....` or legacy `AIza...` from AI Studio) and/or Muse (`talk.providers.muse.apiKey`, a Meta Model API key) — any one works on its own; with none, RealTimeTalk runs TTS-only (no mic/wake-word listening — see "STT engine selection" below) |
 | [Edge TTS skill](https://github.com/w2ayz/openclaw-edge-tts) (first TTS fallback — optional) | install at the official path `~/.openclaw/workspace/skills/edge-tts/` (`npm install` in `scripts/`); the installer resolves it and prepares its deps |
 | Homebrew + portaudio + ffmpeg + node | `brew install portaudio ffmpeg node`     |
 | `hidapi` (only for Radio Mode's AIOC hardware-revision detection — cosmetic, everything else works without it) | `brew install hidapi` |
@@ -92,7 +92,8 @@ config file (next section)**:
 "talk": {
   "providers": {
     "openai": { "apiKey": "sk-..." },
-    "gemini": { "apiKey": "..." }
+    "gemini": { "apiKey": "..." },
+    "muse":   { "apiKey": "LLM_..." }
   }
 }
 ```
@@ -114,17 +115,21 @@ hot-reloads, and fails `openclaw config validate`:
 
 The default engine is OpenAI Realtime. To make Gemini the default, set
 `provider` to `"gemini"` (and optionally `fallback` to `"openai"`).
-You can also pass `--stt-engine gemini` to override at startup. The legacy
+Meta's Muse Voice Transcribe (`muse-voice-transcribe-1.0`, $0.18/hour,
+Mandarin + English with code-switching, keyword biasing) is the third
+option: set `provider` to `"muse"`. It is opt-in — with several keys
+present and nothing configured the default stays OpenAI.
+You can also pass `--stt-engine gemini` (or `muse`) to override at startup. The legacy
 `openclaw.json` `talk.stt` block is still read if the daemon config file is
 absent, so old configs keep working until migrated.
 
 Set `"provider": "none"` (what `RTT-Config.sh`'s Skip option
 writes) to run TTS-only on purpose even if a key is configured. With
-neither an OpenAI nor a Gemini key present at all, the daemon resolves to
+no OpenAI, Gemini, or Muse key present at all, the daemon resolves to
 this same TTS-only mode automatically regardless of what `"provider"` says.
 
-`"vocabulary"` is a **single shared list sent to both engines** — Gemini's
-`custom_vocabulary` and OpenAI's `keywords` (OpenAI's `gpt-live-transcribe`
+`"vocabulary"` is a **single shared list sent to all engines** — Gemini's
+`custom_vocabulary`, Muse's `keywords`, and OpenAI's `keywords` (OpenAI's `gpt-live-transcribe`
 model only; the daemon always uses that model for this reason). Add proper
 nouns, names, or jargon that either engine tends to mishear. Both treat it
 as a *hint*, not a guarantee — it measurably helps common misspellings but
