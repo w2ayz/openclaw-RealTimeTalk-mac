@@ -1,5 +1,36 @@
 # Changelog
 
+## [3.29.3] — 2026-10-22
+
+### Added
+
+- **Notes optimizer** (`✨ Optimize notes` in the Meeting Notes panel).
+  OpenClaw re-reads the transcript, corrects recognition errors from context
+  (originals kept in `entry["orig"]`), and writes a one-sentence main point
+  for each speaker segment — a segment ends at a speaker change or a pause
+  over 10 s (measured from speech start/end). Summaries show between
+  segments in the log in their own font. English / 中文 toggles pick the
+  summary language(s); both on = both, both off = as spoken.
+- **Whole-meeting summary at the top of the `.md` download**: date, time,
+  duration, participants (lines + speaking time), languages, then overview,
+  key concepts, key facts, decisions, action items, open questions (written
+  by OpenClaw at the end of an Optimize run; chunked + merged for long
+  meetings). Download is `.md` only.
+- **Agent-assisted speaker naming**: "this is Sarah", "I'm Dr. Lee",
+  "我是小王" etc. trigger a review by OpenClaw (own session, tool-free,
+  transcript treated as data) that names the speaker label; `🔎 Identify
+  names` runs it on demand. Typed names always win.
+- Live box shows at most 5 lines; once a turn grows long, its finished
+  sentences (`.` `?` `!` `。` `？` `！`) move to the log (as "Speaker …", labelled
+  when the turn ends) and the box keeps only the unfinished tail.
+
+### Changed
+
+- A turn that Muse closes mid-sentence no longer becomes its own log line:
+  the unfinished tail is carried into the same speaker's next turn (7 s
+  limit), so log lines end at full stops.
+- Live box hides when Monitoring is off.
+
 ## [3.29.2] — 2026-10-22
 
 ### Added
