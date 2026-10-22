@@ -1,5 +1,28 @@
 # Changelog
 
+## [3.28.2] — 2026-10-21
+
+### Fixed
+
+- **Rewritten agent answer cut off ~2 s into playback, whole reply parked
+  behind Continue (reported live by Victor; seen 3x on 2026-10-21 — 16:36
+  on Gemini, 22:55 and 22:59 on Muse, so engine-independent).** When the
+  agent restarts its answer (gateway `replace` event), `StreamingSpeaker.reset()`
+  arms the global `_http_interrupt` flag to cut any audio that is mid-playback.
+  If nothing was playing yet (the usual case — the first draft hadn't produced
+  a sentence), nothing consumed the flag; the rewritten answer's first
+  sentence then started and the playback loop saw the stale flag and stopped
+  it: `HTTP interrupt — stopping TTS (during guard)` / `N/N chars remain for
+  Continue`, dashboard stuck on Paused. Whether it fired depended on timing
+  (3 of 6 resets today). `reset()` now also sets a new `_reset_armed` marker;
+  the new generation's `_playback_worker` clears a reset-armed flag right
+  before it plays, while the `/interrupt` route and `StreamingSpeaker.interrupt()`
+  clear the marker, so a real Stop is never mistaken for a stale flag.
+  Audio that WAS mid-playback at reset time is still cut as before. Regression
+  test (reset while idle → new generation must not see the flag; reset then
+  Stop → it must) failed before and passes after; not yet confirmed live
+  across many real replies.
+
 ## [3.28.1] — 2026-10-21
 
 ### Changed

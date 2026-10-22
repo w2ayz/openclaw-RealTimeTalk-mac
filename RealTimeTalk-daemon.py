@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.28.1"
+__version__ = "3.28.2"
 
 import argparse
 import asyncio
@@ -471,6 +471,10 @@ _paused_speech: list = [None]   # {"remaining","full","alsa"} dict saved on TTS 
                                  # (resumable=True); None otherwise
 _post_busy_until:  list = [0.0] # timestamp; mic sends silence until this time after busy clears
 _http_interrupt:   list = [False]  # set by /interrupt HTTP route to cut TTS mid-playback
+_reset_armed:      list = [False]  # True when the _http_interrupt flag was armed by
+                                   # StreamingSpeaker.reset() (agent rewrote its answer),
+                                   # NOT by an explicit Stop — the next generation's
+                                   # playback worker clears such a flag before playing.
 _is_speaking:      list = [False]  # True while speak() is playing audio
 _last_tts_engine:  list = [""]     # human label ("ElevenLabs"/"Edge"/"OpenAI"/"say") of the
                                  # engine that produced the most recent audio — shown in the
@@ -3913,6 +3917,12 @@ class StreamingSpeaker:
         current generation; a fresh pipeline starts on the next feed()."""
         self._gen_stop.set()
         _http_interrupt[0] = True       # cut any part that is mid-playback right now
+        # If nothing was mid-playback the flag stays armed and used to cut the
+        # REWRITTEN answer's first sentence ~2 s later ("HTTP interrupt —
+        # stopping TTS (during guard)", whole reply parked behind Continue).
+        # Mark it as reset-armed so the new generation's playback worker can
+        # tell it apart from a real Stop and clear it before it plays.
+        _reset_armed[0] = True
         self._drain()
         with self._lock:
             self._buffered = ""
@@ -3942,6 +3952,7 @@ class StreamingSpeaker:
         state for the interrupted sentence (matching today's speak() behavior)."""
         self._gen_stop.set()
         _http_interrupt[0] = True       # stop any part that is mid-playback right now
+        _reset_armed[0] = False         # an explicit Stop must never be cleared as stale
 
     def wait(self):
         for t in self._threads[:]:
@@ -4109,6 +4120,12 @@ class StreamingSpeaker:
                 if not (isinstance(item, tuple) and len(item) == 6):
                     continue
                 pcm, sr, seg_text, seg_start, lead, tail = item
+                if _reset_armed[0]:
+                    # Stale flag from reset() (see StreamingSpeaker.reset): any
+                    # audio it was meant to cut is already gone, so don't let it
+                    # cut this fresh generation. A real Stop clears _reset_armed.
+                    _reset_armed[0] = False
+                    _http_interrupt[0] = False
                 try:
                     inter, played_b, cp = _play_audio(
                         pcm, sr, self.alsa_output,
@@ -6527,6 +6544,7 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                     loop.call_soon_threadsafe(task.cancel)
                 # Stop TTS if speaking
                 _http_interrupt[0] = True
+                _reset_armed[0] = False   # explicit Stop — never clear it as stale
                 if sess:
                     sess._busy.clear()
                     sess._active = True   # ensure back in listening mode
