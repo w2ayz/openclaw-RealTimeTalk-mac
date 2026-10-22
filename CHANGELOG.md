@@ -1,5 +1,40 @@
 # Changelog
 
+## [3.29.0] — 2026-10-22
+
+### Added
+
+- **Monitoring mode is now a meeting note-taker (Muse engine).** Turning
+  Monitoring on makes `MuseTranscribeSession` reconnect in Muse's
+  `DIARIZATION` mode (the mode is fixed per session, so on/off is applied
+  by a reconnect in `_muse_sender`); turning it off reconnects in
+  `ENDPOINTING` again, since diarization is not tuned for voice commands.
+  `speaker` events are attached to their turn (latest `speechStart`'s
+  `turnId`) and delivered with the `speechComplete` text.
+- Every monitored utterance goes into a new uncapped `MEETING_LOG`
+  (separate from the 40-entry `CONVERSATION_LOG`, and not wiped by "Clear
+  Log"). A **Meeting notes** panel on the dashboard (outside `#log`, so the
+  3 s refresh can't wipe typing) explains what's happening, asks the user to
+  **name each speaker** (`A`, `B`, … — names apply retroactively to the
+  whole transcript), and offers **Download .txt / .md** plus **New meeting**.
+  Routes: `/meeting/name?label=&name=`, `/meeting/download?fmt=txt|md`,
+  `/meeting/clear`. Other STT engines still record notes, but unlabelled,
+  and the panel says to switch to Muse for speaker labels.
+
+### Changed
+
+- In Monitoring, voices that fail the owner-only check are now recorded as
+  notes (they previously vanished) but still never reach the control-phrase
+  checks.
+- Diarized monitoring refreshes `_last_interaction`, so auto-sleep no longer
+  ends a meeting 10 min in while people are still talking. Plain
+  (undiarized) monitoring stays passive and still auto-sleeps.
+
+Verified: meeting store/export, Muse event-to-speaker mapping and the HTTP
+routes against a stub; **not yet verified live against the real Muse
+API** (reconnect on mode change, real `speaker` event timing). Pi fork:
+see its matching entry.
+
 ## [3.28.2] — 2026-10-21
 
 ### Fixed

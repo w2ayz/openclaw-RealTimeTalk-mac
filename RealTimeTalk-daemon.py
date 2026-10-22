@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.28.2"
+__version__ = "3.29.0"
 
 import argparse
 import asyncio
@@ -189,6 +189,7 @@ OPENAI_TRANSCRIPTION_KEYWORDS: list = []  # populated at startup, see main()
 MUSE_MODEL              = "muse-voice-transcribe-1.0"
 MUSE_WS_URL             = "wss://api.meta.ai/v1/asr/realtime"
 MUSE_MODE               = "ENDPOINTING"
+MUSE_MODE_MONITOR       = "DIARIZATION"  # used while Monitoring (meeting notes) is on
 MUSE_SESSION_RESET_SECS = 55 * 60       # proactive reconnect before the 60-min cap
 MUSE_HANDSHAKE_TIMEOUT  = 10.0          # server requires the handshake within 10 s
 MUSE_LANGUAGE_NAMES     = {"en": "English", "zh": "Mandarin Chinese", "ko": "Korean",
@@ -2037,13 +2038,98 @@ def run_speaker_calibration(alsa_output: str = None,
 _cal_sw_volume: float = 1.0   # updated after calibration; used by speak() for normal TTS
 MAX_LOG_ENTRIES = 40
 
-def _log_entry(role: str, text: str):
+def _log_entry(role: str, text: str, speaker: str | None = None):
     now = datetime.datetime.now()
     ts  = now.strftime("%H:%M:%S")
-    CONVERSATION_LOG.append({"role": role, "text": text, "ts": ts,
-                              "epoch": now.timestamp()})
+    entry = {"role": role, "text": text, "ts": ts, "epoch": now.timestamp()}
+    if speaker:
+        entry["speaker"] = speaker
+    CONVERSATION_LOG.append(entry)
     if len(CONVERSATION_LOG) > MAX_LOG_ENTRIES:
         CONVERSATION_LOG.pop(0)
+
+# ── Meeting notes (Monitoring mode + Muse diarization) ───────────────────────
+# Monitoring captures every utterance here as well as in CONVERSATION_LOG.
+# CONVERSATION_LOG is capped at MAX_LOG_ENTRIES and wiped by "Clear Log";
+# a meeting runs for an hour or more, so it gets its own uncapped store,
+# cleared only by the explicit "New meeting" button. Speaker labels ("A",
+# "B", …) come from Muse's DIARIZATION mode and are only meaningful within
+# one Muse session — SPEAKER_NAMES maps them to user-supplied names.
+MEETING_LOG:    list[dict] = []   # {"epoch","ts","speaker" (label or None),"text"}
+SPEAKER_NAMES:  dict       = {}   # label -> display name
+_meeting_lock = _threading.Lock()
+UNKNOWN_SPEAKER = "?"             # engine gave no speaker label (non-diarizing STT)
+
+def _meeting_add(text: str, speaker: str | None):
+    now = datetime.datetime.now()
+    with _meeting_lock:
+        MEETING_LOG.append({"epoch": now.timestamp(),
+                            "ts": now.strftime("%H:%M:%S"),
+                            "speaker": speaker or UNKNOWN_SPEAKER,
+                            "text": text})
+
+def _meeting_set_name(label: str, name: str):
+    name = " ".join(name.split())[:40]
+    with _meeting_lock:
+        if name:
+            SPEAKER_NAMES[label] = name
+        else:
+            SPEAKER_NAMES.pop(label, None)
+
+def _meeting_clear():
+    with _meeting_lock:
+        MEETING_LOG.clear()
+        SPEAKER_NAMES.clear()
+
+def _speaker_display(label: str | None) -> str:
+    if not label or label == UNKNOWN_SPEAKER:
+        return "Speaker"
+    return SPEAKER_NAMES.get(label) or f"Speaker {label}"
+
+def _meeting_speakers() -> list[dict]:
+    """Labels seen so far, in first-appearance order, with utterance counts."""
+    with _meeting_lock:
+        seen: dict = {}
+        for e in MEETING_LOG:
+            seen[e["speaker"]] = seen.get(e["speaker"], 0) + 1
+        return [{"label": k, "name": SPEAKER_NAMES.get(k, ""), "count": v}
+                for k, v in seen.items()]
+
+def _meeting_export(fmt: str = "txt") -> str:
+    """Render the meeting as plain text ("txt") or Markdown ("md"). Merges
+    consecutive utterances by the same speaker into one paragraph."""
+    with _meeting_lock:
+        entries = list(MEETING_LOG)
+    if not entries:
+        return "No meeting notes captured yet.\n"
+    start = datetime.datetime.fromtimestamp(entries[0]["epoch"])
+    end   = datetime.datetime.fromtimestamp(entries[-1]["epoch"])
+    mins  = max(1, round((end - start).total_seconds() / 60))
+    names = []
+    for s in _meeting_speakers():
+        n = _speaker_display(s["label"])
+        if n not in names:
+            names.append(n)
+    blocks: list[dict] = []
+    for e in entries:
+        if blocks and blocks[-1]["speaker"] == e["speaker"]:
+            blocks[-1]["text"] += " " + e["text"]
+        else:
+            blocks.append({"speaker": e["speaker"], "ts": e["ts"], "text": e["text"]})
+    md = fmt == "md"
+    out = []
+    out.append("# Meeting notes" if md else "MEETING NOTES")
+    out.append(("**Date:** " if md else "Date: ") + start.strftime("%Y-%m-%d %H:%M")
+               + f" (~{mins} min)")
+    out.append(("**Participants:** " if md else "Participants: ") + ", ".join(names))
+    out.append("")
+    for b in blocks:
+        who = _speaker_display(b["speaker"])
+        out.append(f"**[{b['ts']}] {who}:** {b['text']}" if md
+                   else f"[{b['ts']}] {who}: {b['text']}")
+        if md:
+            out.append("")
+    return "\n".join(out).rstrip() + "\n"
 
 CALIBRATE_PHRASES = {
     "calibrate mic", "calibrate microphone", "calibrate noise",
@@ -5027,7 +5113,7 @@ class BaseVoiceSession:
         log.info("Voice check REJECT %.3f (%.1fs) [%s]: %r", score, secs, device_key, transcript[:60])
         return False
 
-    async def _handle_transcript(self, transcript: str):
+    async def _handle_transcript(self, transcript: str, speaker: str | None = None):
         # Apply DTMF force flags (belt-and-suspenders alongside _send_mic —
         # that poll runs at least every 0.5s, almost always faster, so this
         # is only relevant on the unlikely chance a transcript raced it).
@@ -5173,6 +5259,14 @@ class BaseVoiceSession:
         # comment). Dashboard HTTP buttons remain ungated fallbacks by
         # design (they never reach this method).
         if not _speaker_verified:
+            # Meeting notes capture everyone, not just the enrolled owner —
+            # but only as notes: an unverified voice still must not reach the
+            # control-phrase checks below, so record and stop here.
+            if self._monitoring:
+                _t = transcript.strip()
+                if _t:
+                    _log_entry("monitor", _t, speaker)
+                    _meeting_add(_t, speaker)
             return
 
         # Wake phrase — always checked regardless of active/monitoring state.
@@ -5372,8 +5466,15 @@ class BaseVoiceSession:
         if self._monitoring:
             t = transcript.strip()
             if t:
-                log.info("Monitor: %s", t)
-                _log_entry("monitor", t)
+                log.info("Monitor: %s%s", f"[{speaker}] " if speaker else "", t)
+                _log_entry("monitor", t, speaker)
+                _meeting_add(t, speaker)
+                if speaker:
+                    # Diarized meeting capture: live conversation is not "idle".
+                    # Without this, AUTO_SLEEP_SECS ends a meeting 10 min in even
+                    # while people are talking. Plain (undiarized) monitoring
+                    # stays passive and still auto-sleeps.
+                    _last_interaction[0] = __import__("time").time()
             return
 
         # Language gate: drop non-EN/ZH (or off-whitelist) before routing to Zeebot.
@@ -5610,11 +5711,11 @@ class BaseVoiceSession:
                 (_tss.time(), b"".join(self._capture_buf)))
         self._capture_buf = None
 
-    def _on_transcript(self, transcript: str):
+    def _on_transcript(self, transcript: str, speaker: str | None = None):
         transcript = transcript.strip()
         if transcript and not self._busy.is_set():
             log.info("You: %s", transcript)
-            asyncio.create_task(self._handle_transcript(transcript))
+            asyncio.create_task(self._handle_transcript(transcript, speaker))
 
     async def _open_mic_stream(self):
         """Start the sounddevice InputStream shared by all engines."""
@@ -6001,16 +6102,22 @@ class MuseTranscribeSession(BaseVoiceSession):
         super().__init__(*args, **kwargs)
         self._session_no = 0
         self._shutdown = asyncio.Event()
+        self._conn_mode = MUSE_MODE      # mode of the live connection (fixed per session)
+        self._open_turn = None           # turnId of the most recent speechStart
+        self._turn_speaker: dict = {}    # turnId -> diarization label
 
     def engine_name(self) -> str:
         return "Muse Voice Transcribe"
+
+    def _wanted_mode(self) -> str:
+        return MUSE_MODE_MONITOR if self._monitoring else MUSE_MODE
 
     def _handshake_payload(self) -> dict:
         hs = {
             "authorization": {"accessToken": f"Bearer {self.api_key}"},
             "audioEncoding": "PCM_24KHZ",
             "model": MUSE_MODEL,
-            "mode": MUSE_MODE,
+            "mode": self._conn_mode,
             "partialMode": "CUMULATIVE",
             "emitAudioProgress": False,
         }
@@ -6030,8 +6137,14 @@ class MuseTranscribeSession(BaseVoiceSession):
         self._shutdown.clear()
         while not self.stop_event.is_set() and not self._shutdown.is_set():
             self._session_no += 1
-            log.info("Muse session %d connecting (model=%s, reset every %d min)",
-                     self._session_no, MUSE_MODEL, MUSE_SESSION_RESET_SECS // 60)
+            # The mode is fixed once a Muse session starts, so Monitoring
+            # on/off is applied by reconnecting (see _muse_sender).
+            self._conn_mode = self._wanted_mode()
+            self._open_turn = None
+            self._turn_speaker.clear()
+            log.info("Muse session %d connecting (model=%s, mode=%s, reset every %d min)",
+                     self._session_no, MUSE_MODEL, self._conn_mode,
+                     MUSE_SESSION_RESET_SECS // 60)
             try:
                 async with websockets.connect(MUSE_WS_URL, ping_interval=20,
                                               ping_timeout=10,
@@ -6083,6 +6196,14 @@ class MuseTranscribeSession(BaseVoiceSession):
         end = json.dumps({"type": "endStream"})
         while not self.stop_event.is_set() and not self._shutdown.is_set():
             if await self._apply_dtmf_flags(ws):
+                return
+            if self._wanted_mode() != self._conn_mode:
+                log.info("Muse mode change %s -> %s — reconnecting",
+                         self._conn_mode, self._wanted_mode())
+                try:
+                    await ws.send(end)
+                except websockets.exceptions.ConnectionClosed:
+                    pass
                 return
             try:
                 chunk = await asyncio.wait_for(self._mic_q.get(), timeout=0.1)
@@ -6138,16 +6259,24 @@ class MuseTranscribeSession(BaseVoiceSession):
         msg = json.loads(raw)
         t = msg.get("type", "")
         if t == "speechStart":
+            self._open_turn = msg.get("turnId")
             self._on_speech_started()
         elif t == "speechEnd":
             self._on_speech_stopped()
+        elif t == "speaker":
+            # Labels the audio since the previous speechStart/speaker event;
+            # one per turn. Attach it to the turn opened by the latest
+            # speechStart (speaker events carry no turnId).
+            if self._open_turn is not None and msg.get("label"):
+                self._turn_speaker[self._open_turn] = str(msg["label"])
         elif t == "speechComplete":
             text = (msg.get("transcript") or "").strip()
+            speaker = self._turn_speaker.pop(msg.get("turnId"), None)
             if text:
-                self._on_transcript(text)
+                self._on_transcript(text, speaker)
         elif t == "error":
             log.error("Muse error: %s", msg.get("message", msg))
-        # transcript (partials), speaker, audioProgress, unknown types: ignored
+        # transcript (partials), audioProgress, unknown types: ignored
 
 # ── HTTP toggle server ────────────────────────────────────────────────────────
 
@@ -6319,7 +6448,10 @@ def _dashboard_dynamic(sess) -> dict:
         elif e["role"] == "zeebot":
             rows += f'<div class="zeebot">{ts_span}<b>{AGENT_NAME}:</b> {e["text"]}</div>'
         elif e["role"] == "monitor":
-            rows += f'<div class="mon">{ts_span}{e["text"]}</div>'
+            _sp = e.get("speaker")
+            _who = (f'<b class="spk">{__import__("html").escape(_speaker_display(_sp))}:</b> '
+                    if _sp else "")
+            rows += f'<div class="mon">{ts_span}{_who}{e["text"]}</div>'
         elif e["role"] == "thinking":
             ep  = e.get("epoch", 0.0)
             dur = thinking_dur.get(ep)
@@ -6423,6 +6555,13 @@ def _dashboard_dynamic(sess) -> dict:
         "speaking_banner":  speaking_banner,
         "rows":             rows if rows else "<div class='sys'>No conversation yet</div>",
         "nav_html":         nav_html,
+        "meeting": {
+            "show":       bool(monitoring or MEETING_LOG),
+            "monitoring": bool(monitoring),
+            "diarized":   _active_stt_engine[0] == STT_ENGINE_MUSE,
+            "entries":    len(MEETING_LOG),
+            "speakers":   _meeting_speakers(),
+        },
     }
 
 
@@ -6635,6 +6774,36 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
+            elif self.path.startswith("/meeting/"):
+                import urllib.parse as _up
+                _u  = _up.urlparse(self.path)
+                _qs = _up.parse_qs(_u.query)
+                if _u.path == "/meeting/name":
+                    _lbl = (_qs.get("label", [""])[0] or "").strip()[:8]
+                    if _lbl:
+                        _meeting_set_name(_lbl, _qs.get("name", [""])[0])
+                        log.info("Meeting speaker %s named %r", _lbl, SPEAKER_NAMES.get(_lbl, ""))
+                    self.send_response(204)
+                    self.end_headers()
+                elif _u.path == "/meeting/download":
+                    _fmt  = "md" if _qs.get("fmt", ["txt"])[0] == "md" else "txt"
+                    _data = _meeting_export(_fmt).encode("utf-8")
+                    _fn   = datetime.datetime.now().strftime(f"meeting-notes-%Y%m%d-%H%M.{_fmt}")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Disposition", f'attachment; filename="{_fn}"')
+                    self.send_header("Content-Length", str(len(_data)))
+                    self.end_headers()
+                    self.wfile.write(_data)
+                elif _u.path == "/meeting/clear":
+                    _meeting_clear()
+                    log.info("Meeting notes cleared")
+                    self.send_response(302)
+                    self.send_header("Location", "/dashboard")
+                    self.end_headers()
+                else:
+                    self.send_response(404)
+                    self.end_headers()
             elif self.path == "/multilang":
                 # Cycle: off → en-zh → whitelist → any → off
                 _MULTILANG_CYCLE = ("off", "en-zh", "whitelist", "any")
@@ -8609,6 +8778,18 @@ a.rpl{{color:var(--you);background:var(--yb);border:1px solid var(--you);border-
 a.rpl:hover{{background:var(--you);color:#000;}}
 a.cnl{{color:var(--mu);background:var(--sf2);border:1px solid var(--mu);border-radius:4px;padding:2px 8px;font-size:.82em;font-style:normal;text-decoration:none;margin-left:8px;}}
 a.cnl:hover{{background:var(--mu);color:#000;}}
+#meeting{{flex-shrink:0;margin:6px 14px 0;padding:10px 12px;background:var(--mb);border:1px solid var(--mon);border-radius:var(--r);font-size:14px;line-height:1.5;}}
+#meeting[hidden]{{display:none;}}
+#meeting .mh{{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--mon);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;}}
+#meeting .mp{{color:var(--tx);margin-bottom:6px;}}
+#meeting .mp.warn{{color:var(--bot);}}
+#meeting .spkrow{{display:flex;align-items:center;gap:8px;margin:4px 0;flex-wrap:wrap;}}
+#meeting .spkrow label{{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--mon);min-width:78px;}}
+#meeting input{{flex:1;min-width:120px;max-width:260px;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:5px 8px;font:inherit;font-size:14px;}}
+#meeting input:focus{{outline:none;border-color:var(--mon);}}
+#meeting .cnt{{font-size:12px;color:var(--mu);}}
+#meeting .macts{{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;}}
+.mon .spk{{color:var(--mon);}}
 #nowreading{{flex-shrink:0;margin:6px 14px 0;padding:8px 12px;background:var(--sf2);border:1px solid var(--di);border-radius:var(--r);font-size:14px;line-height:1.55;}}
 #nowreading[hidden]{{display:none;}}
 #nowreading .nrw{{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:4px;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:.08em;}}
@@ -8623,6 +8804,7 @@ a.cnl:hover{{background:var(--mu);color:#000;}}
 <div class="nav" id="navbar">{nav_html}</div>
 {device_panel}{device_banner}<div id="hzone" style="min-height:28px;padding:5px 10px;border-radius:8px;background:var(--sf2);border:1px solid var(--bd);color:var(--mu);font-size:15px;opacity:0;transition:opacity .15s;pointer-events:none;">&nbsp;</div></div>
 <div id="nowreading" hidden></div>
+<div id="meeting" hidden></div>
 <div id="log">{speaking_banner}{rows}</div>
 <script>
 setInterval(function(){{
@@ -8672,9 +8854,74 @@ setInterval(function(){{
       if(db) db.outerHTML=d.device_banner;
       var log=document.getElementById('log');
       if(log) log.innerHTML=d.speaking_banner+d.rows;
+      if(window._meetingUpdate) window._meetingUpdate(d.meeting);
     }}).catch(function(){{}});
   }}
   setInterval(_refresh,3000);
+}})();
+(function(){{
+  // ── Meeting notes panel (Monitoring mode) ───────────────────────────────
+  // Lives OUTSIDE #log like #nowreading: the 3s /dashboard-frag poll replaces
+  // #log's innerHTML, which would wipe a half-typed speaker name. The speaker
+  // rows are only rebuilt when the set of labels changes, and never while one
+  // of the inputs has focus.
+  var el=document.getElementById('meeting');
+  if(!el) return;
+  var sig='', box=null;
+  function mk(tag,cls,txt){{var n=document.createElement(tag);if(cls)n.className=cls;if(txt!=null)n.textContent=txt;return n;}}
+  function saveName(label,name){{
+    fetch('/meeting/name?label='+encodeURIComponent(label)+'&name='+encodeURIComponent(name));
+  }}
+  function build(m){{
+    el.textContent='';
+    el.appendChild(mk('div','mh','📝 Meeting notes'));
+    var p=mk('div','mp');
+    if(m.diarized){{
+      p.textContent=m.monitoring
+        ? 'Taking notes: everything said is transcribed and each speaker is labelled automatically. Give each speaker a name below — the names are applied to the whole transcript, including the download.'
+        : 'Monitoring is off. Your notes are kept — download them below, or start a new meeting.';
+    }}else{{
+      p.className='mp warn';
+      p.textContent='Everything said is transcribed, but this speech engine cannot tell speakers apart. Switch to Muse Voice Transcribe (RTT-Config.sh → STT) to get per-speaker labels and names.';
+    }}
+    el.appendChild(p);
+    if(m.diarized) m.speakers.forEach(function(s){{
+      if(s.label==='?') return;
+      var row=mk('div','spkrow');
+      row.appendChild(mk('label',null,'Speaker '+s.label));
+      var inp=document.createElement('input');
+      inp.type='text'; inp.maxLength=40; inp.placeholder='Name (e.g. Alice)'; inp.value=s.name||'';
+      inp.dataset.label=s.label;
+      var send=function(){{saveName(s.label,inp.value);}};
+      inp.addEventListener('change',send);
+      inp.addEventListener('keydown',function(e){{if(e.key==='Enter'){{send();inp.blur();}}}});
+      row.appendChild(inp);
+      row.appendChild(mk('span','cnt',s.count+' utterance'+(s.count===1?'':'s')));
+      el.appendChild(row);
+    }});
+    var acts=mk('div','macts');
+    [['⬇ Download .txt','/meeting/download?fmt=txt'],['⬇ Download .md','/meeting/download?fmt=md']].forEach(function(a){{
+      var l=mk('a','btn',a[0]); l.href=a[1]; acts.appendChild(l);
+    }});
+    var nm=mk('a','btn danger','New meeting (clears notes)'); nm.href='/meeting/clear';
+    nm.addEventListener('click',function(e){{if(!confirm('Clear all meeting notes and speaker names?')) e.preventDefault();}});
+    acts.appendChild(nm);
+    el.appendChild(acts);
+  }}
+  window._meetingUpdate=function(m){{
+    if(!m||!m.show){{el.hidden=true;return;}}
+    el.hidden=false;
+    var s=[m.monitoring,m.diarized,m.speakers.map(function(x){{return x.label;}}).join(',')].join('|');
+    var typing=el.contains(document.activeElement)&&document.activeElement.tagName==='INPUT';
+    if(s!==sig&&!typing){{sig=s;build(m);}}
+    else{{ // refresh counts only
+      var cs=el.querySelectorAll('.spkrow');
+      m.speakers.filter(function(x){{return x.label!=='?';}}).forEach(function(x,i){{
+        var c=cs[i]&&cs[i].querySelector('.cnt'); if(c) c.textContent=x.count+' utterance'+(x.count===1?'':'s');
+      }});
+    }}
+  }};
+  fetch('/dashboard-frag').then(function(r){{return r.json();}}).then(function(d){{window._meetingUpdate(d.meeting);}}).catch(function(){{}});
 }})();
 (function(){{
   // ── Live read-along ("now reading") ─────────────────────────────────────
