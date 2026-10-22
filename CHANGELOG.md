@@ -1,5 +1,36 @@
 # Changelog
 
+## [3.29.1] — 2026-10-22
+
+### Fixed
+
+- **Meeting notes appeared only after a whole turn ended, several seconds
+  late, then up to 3 s more.** Measured against the real Muse API with a
+  paced two-voice clip: Muse emits partial (cumulative) text ~0.1-0.3 s
+  behind the speech and the turn's `speaker` label ~0.5 s after the last
+  word — but the daemon ignored every partial and the dashboard polled every
+  3 s, so a 17 s turn showed up ~17-20 s late. Now partials feed a live line
+  (`MEETING_LIVE`) and a new `#mtx` transcript box polls
+  `/meeting/live?since=N` every 300 ms (finalized lines, the live partial,
+  and the speaker-name map so renames apply instantly).
+- **Speaker label could attach to the wrong turn.** It was bound to "the
+  latest speechStart"; Muse emits `speaker` just before its turn's
+  `speechEnd`, and turns may overlap, so a next turn that had already opened
+  stole the label. Now bound at `speechEnd` by `turnId`.
+
+### Notes
+
+- Measured, not assumed: Muse itself splits turns and labels speakers
+  correctly with no pause between them (A,B,A,B,A on five back-to-back
+  clips), and running the same clips through this daemon's gate +
+  WebRTC + resample chain did not change the labels. The speaker label
+  can't appear mid-sentence — Muse resolves it at the end of the turn — so
+  the live line shows text first and the name attaches when the turn closes.
+- Not fixed / unverified: in a live session every voice (including a
+  different voice from a speaker/TV) was labelled `A`. Not reproducible
+  with synthetic voices, so likely acoustic (far-field, similar voices);
+  needs a real two-person test.
+
 ## [3.29.0] — 2026-10-22
 
 ### Added

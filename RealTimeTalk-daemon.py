@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.29.0"
+__version__ = "3.29.1"
 
 import argparse
 import asyncio
@@ -2060,8 +2060,29 @@ SPEAKER_NAMES:  dict       = {}   # label -> display name
 _meeting_lock = _threading.Lock()
 UNKNOWN_SPEAKER = "?"             # engine gave no speaker label (non-diarizing STT)
 
+MEETING_LIVE = {"text": "", "t": 0.0}   # in-progress (partial) text of the open turn
+MEETING_LIVE_STALE_SECS = 4.0           # hide a partial this long without an update
+
+def _meeting_live_set(text: str):
+    MEETING_LIVE["text"] = text.strip()
+    MEETING_LIVE["t"] = time.monotonic()
+
+def _meeting_feed(since: int) -> dict:
+    """Incremental feed for the dashboard's fast poll: entries after `since`,
+    the open turn's partial text (if fresh), and the label->name map (names
+    can change retroactively, so the client re-renders them every poll)."""
+    with _meeting_lock:
+        entries = [dict(e) for e in MEETING_LOG[since:]]
+        names = dict(SPEAKER_NAMES)
+        total = len(MEETING_LOG)
+    live = ""
+    if time.monotonic() - MEETING_LIVE["t"] < MEETING_LIVE_STALE_SECS:
+        live = MEETING_LIVE["text"]
+    return {"entries": entries, "names": names, "total": total, "live": live}
+
 def _meeting_add(text: str, speaker: str | None):
     now = datetime.datetime.now()
+    MEETING_LIVE["text"] = ""    # the turn's final text replaces its partial
     with _meeting_lock:
         MEETING_LOG.append({"epoch": now.timestamp(),
                             "ts": now.strftime("%H:%M:%S"),
@@ -6104,6 +6125,7 @@ class MuseTranscribeSession(BaseVoiceSession):
         self._shutdown = asyncio.Event()
         self._conn_mode = MUSE_MODE      # mode of the live connection (fixed per session)
         self._open_turn = None           # turnId of the most recent speechStart
+        self._pending_speaker = None     # latest `speaker` label, bound at speechEnd
         self._turn_speaker: dict = {}    # turnId -> diarization label
 
     def engine_name(self) -> str:
@@ -6141,6 +6163,7 @@ class MuseTranscribeSession(BaseVoiceSession):
             # on/off is applied by reconnecting (see _muse_sender).
             self._conn_mode = self._wanted_mode()
             self._open_turn = None
+            self._pending_speaker = None
             self._turn_speaker.clear()
             log.info("Muse session %d connecting (model=%s, mode=%s, reset every %d min)",
                      self._session_no, MUSE_MODEL, self._conn_mode,
@@ -6261,14 +6284,26 @@ class MuseTranscribeSession(BaseVoiceSession):
         if t == "speechStart":
             self._open_turn = msg.get("turnId")
             self._on_speech_started()
+        elif t == "transcript":
+            # Partial (cumulative) text of the open turn. Normal operation
+            # only acts on finals; while Monitoring it feeds the dashboard's
+            # live line so notes appear mid-sentence (~0.1-0.3 s behind
+            # speech) instead of after the turn closes.
+            if self._monitoring and msg.get("transcript"):
+                _meeting_live_set(_to_simplified(msg["transcript"]))
         elif t == "speechEnd":
+            # The turn's `speaker` event is emitted just BEFORE its speechEnd
+            # (measured live: speaker -> speechEnd -> speechComplete, same
+            # instant). Bind it here by turnId rather than to "the latest
+            # speechStart", which is wrong when the next turn has already
+            # opened (turns may overlap).
+            if self._pending_speaker is not None:
+                self._turn_speaker[msg.get("turnId")] = self._pending_speaker
+                self._pending_speaker = None
             self._on_speech_stopped()
         elif t == "speaker":
-            # Labels the audio since the previous speechStart/speaker event;
-            # one per turn. Attach it to the turn opened by the latest
-            # speechStart (speaker events carry no turnId).
-            if self._open_turn is not None and msg.get("label"):
-                self._turn_speaker[self._open_turn] = str(msg["label"])
+            if msg.get("label"):
+                self._pending_speaker = str(msg["label"])
         elif t == "speechComplete":
             text = (msg.get("transcript") or "").strip()
             speaker = self._turn_speaker.pop(msg.get("turnId"), None)
@@ -6276,7 +6311,7 @@ class MuseTranscribeSession(BaseVoiceSession):
                 self._on_transcript(text, speaker)
         elif t == "error":
             log.error("Muse error: %s", msg.get("message", msg))
-        # transcript (partials), audioProgress, unknown types: ignored
+        # audioProgress, unknown types: ignored
 
 # ── HTTP toggle server ────────────────────────────────────────────────────────
 
@@ -6785,6 +6820,12 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                         log.info("Meeting speaker %s named %r", _lbl, SPEAKER_NAMES.get(_lbl, ""))
                     self.send_response(204)
                     self.end_headers()
+                elif _u.path == "/meeting/live":
+                    try:
+                        _since = max(0, int(_qs.get("since", ["0"])[0]))
+                    except ValueError:
+                        _since = 0
+                    _send_json(self, 200, _meeting_feed(_since))
                 elif _u.path == "/meeting/download":
                     _fmt  = "md" if _qs.get("fmt", ["txt"])[0] == "md" else "txt"
                     _data = _meeting_export(_fmt).encode("utf-8")
@@ -8790,6 +8831,12 @@ a.cnl:hover{{background:var(--mu);color:#000;}}
 #meeting .cnt{{font-size:12px;color:var(--mu);}}
 #meeting .macts{{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;}}
 .mon .spk{{color:var(--mon);}}
+#mtx{{flex-shrink:0;margin:6px 14px 0;max-height:34vh;overflow-y:auto;padding:8px 12px;background:var(--sf);border:1px solid var(--bd);border-radius:var(--r);font-size:15px;line-height:1.5;}}
+#mtx[hidden]{{display:none;}}
+#mtx .ml{{margin:2px 0;}}
+#mtx .ml .t{{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--mu);margin-right:6px;}}
+#mtx .ml .w{{font-weight:600;color:var(--mon);margin-right:4px;}}
+#mtx .live{{color:var(--mu);font-style:italic;}}
 #nowreading{{flex-shrink:0;margin:6px 14px 0;padding:8px 12px;background:var(--sf2);border:1px solid var(--di);border-radius:var(--r);font-size:14px;line-height:1.55;}}
 #nowreading[hidden]{{display:none;}}
 #nowreading .nrw{{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:4px;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:.08em;}}
@@ -8805,6 +8852,7 @@ a.cnl:hover{{background:var(--mu);color:#000;}}
 {device_panel}{device_banner}<div id="hzone" style="min-height:28px;padding:5px 10px;border-radius:8px;background:var(--sf2);border:1px solid var(--bd);color:var(--mu);font-size:15px;opacity:0;transition:opacity .15s;pointer-events:none;">&nbsp;</div></div>
 <div id="nowreading" hidden></div>
 <div id="meeting" hidden></div>
+<div id="mtx" hidden></div>
 <div id="log">{speaking_banner}{rows}</div>
 <script>
 setInterval(function(){{
@@ -8921,6 +8969,38 @@ setInterval(function(){{
       }});
     }}
   }};
+  // ── Fast live feed ──────────────────────────────────────────────────────
+  // The 3 s /dashboard-frag poll is far too slow for live notes, so while the
+  // panel is visible this polls /meeting/live every 300 ms: new finalized
+  // lines (cursor-based), the open turn's partial text, and the speaker-name
+  // map (so a rename shows up immediately in already-rendered lines).
+  var mtx=document.getElementById('mtx'), cursor=0, names={{}}, liveEl=null;
+  function nm(l){{return l==='?'?'Speaker':(names[l]||('Speaker '+l));}}
+  function addLine(e){{
+    var d=mk('div','ml'); d.dataset.label=e.speaker;
+    d.appendChild(mk('span','t',e.ts));
+    d.appendChild(mk('span','w',nm(e.speaker)+':'));
+    d.appendChild(document.createTextNode(e.text));
+    mtx.insertBefore(d,liveEl);
+  }}
+  function poll(){{
+    if(el.hidden){{mtx.hidden=true;setTimeout(poll,1500);return;}}
+    fetch('/meeting/live?since='+cursor).then(function(r){{return r.json();}}).then(function(d){{
+      mtx.hidden=false;
+      if(d.total<cursor){{cursor=0;mtx.textContent='';liveEl=null;}}
+      if(!liveEl){{liveEl=mk('div','ml live');mtx.appendChild(liveEl);}}
+      var stick=mtx.scrollHeight-mtx.scrollTop-mtx.clientHeight<40;
+      names=d.names||{{}};
+      d.entries.forEach(addLine);
+      cursor=d.total;
+      mtx.querySelectorAll('.ml[data-label] .w').forEach(function(w){{
+        w.textContent=nm(w.parentNode.dataset.label)+':';
+      }});
+      liveEl.textContent=d.live?('\u2026 '+d.live):'';
+      if(stick) mtx.scrollTop=mtx.scrollHeight;
+    }}).catch(function(){{}}).then(function(){{setTimeout(poll,300);}});
+  }}
+  poll();
   fetch('/dashboard-frag').then(function(r){{return r.json();}}).then(function(d){{window._meetingUpdate(d.meeting);}}).catch(function(){{}});
 }})();
 (function(){{
