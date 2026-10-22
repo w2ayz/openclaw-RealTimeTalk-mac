@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.29.1"
+__version__ = "3.29.2"
 
 import argparse
 import asyncio
@@ -279,6 +279,9 @@ MIC_GAIN          = 5.0
 MIC_GATE_PEAK     = 80           # noise gate — pre-gain peak below this → silence
 MIC_GATE_MIN      = 15           # calibration clamp — quietest usable room
 MIC_GATE_MAX      = 3000         # calibration clamp — above this, use a headset
+GATE_NOISE_KEEP   = 0.8          # calibration ignores the loudest 20% of blocks (a few loud blocks aren't "ambient noise")
+GATE_OUTLIER_RATIO = 3.0         # startup calibration: a gate > this x the last good one is suspect (see _vet_startup_gate)
+GATE_STATE_FILE   = os.path.expanduser("~/.openclaw/workspace/rtt_gate_state.json")
 
 # Output volume control — macOS uses system-wide volume via osascript.
 # Per-device volume isn't scriptable on macOS, so software attenuation is the
@@ -2057,15 +2060,36 @@ def _log_entry(role: str, text: str, speaker: str | None = None):
 # one Muse session — SPEAKER_NAMES maps them to user-supplied names.
 MEETING_LOG:    list[dict] = []   # {"epoch","ts","speaker" (label or None),"text"}
 SPEAKER_NAMES:  dict       = {}   # label -> display name
+SPEAKER_AUTO:   set        = set()  # labels whose current name was heard, not typed
 _meeting_lock = _threading.Lock()
 UNKNOWN_SPEAKER = "?"             # engine gave no speaker label (non-diarizing STT)
 
-MEETING_LIVE = {"text": "", "t": 0.0}   # in-progress (partial) text of the open turn
+MEETING_LIVE = {"text": "", "t": 0.0, "speaker": None, "closed": 0.0, "new": False}
 MEETING_LIVE_STALE_SECS = 4.0           # hide a partial this long without an update
+MEETING_LIVE_HOLD_SECS  = 2.0           # keep a closed turn on screen this long
+
+def _meeting_live_begin():
+    """A new turn opened. Muse opens the next turn in the same instant the
+    previous one closes (speaker change), so don't wipe the previous turn yet
+    — keep showing it (with its speaker) until the new turn's first words
+    arrive, or until its hold time runs out."""
+    MEETING_LIVE["new"] = True
 
 def _meeting_live_set(text: str):
+    if MEETING_LIVE["new"]:
+        MEETING_LIVE.update(speaker=None, closed=0.0, new=False)
     MEETING_LIVE["text"] = text.strip()
     MEETING_LIVE["t"] = time.monotonic()
+
+def _meeting_live_speaker(label: str):
+    if MEETING_LIVE["new"]:
+        return      # belongs to the turn already on screen, which has its label
+    MEETING_LIVE["speaker"] = label
+    MEETING_LIVE["t"] = time.monotonic()
+
+def _meeting_live_close():
+    """Turn ended: leave its text (now with its speaker) up for a moment."""
+    MEETING_LIVE["closed"] = time.monotonic()
 
 def _meeting_feed(since: int) -> dict:
     """Incremental feed for the dashboard's fast poll: entries after `since`,
@@ -2075,32 +2099,78 @@ def _meeting_feed(since: int) -> dict:
         entries = [dict(e) for e in MEETING_LOG[since:]]
         names = dict(SPEAKER_NAMES)
         total = len(MEETING_LOG)
-    live = ""
-    if time.monotonic() - MEETING_LIVE["t"] < MEETING_LIVE_STALE_SECS:
-        live = MEETING_LIVE["text"]
-    return {"entries": entries, "names": names, "total": total, "live": live}
+    now = time.monotonic()
+    closed = MEETING_LIVE["closed"]
+    fresh = (now - closed < MEETING_LIVE_HOLD_SECS) if closed \
+            else (now - MEETING_LIVE["t"] < MEETING_LIVE_STALE_SECS)
+    live = MEETING_LIVE["text"] if fresh else ""
+    return {"entries": entries, "names": names, "total": total, "live": live,
+            "live_speaker": (MEETING_LIVE["speaker"] or "") if live else ""}
 
 def _meeting_add(text: str, speaker: str | None):
     now = datetime.datetime.now()
-    MEETING_LIVE["text"] = ""    # the turn's final text replaces its partial
     with _meeting_lock:
         MEETING_LOG.append({"epoch": now.timestamp(),
                             "ts": now.strftime("%H:%M:%S"),
                             "speaker": speaker or UNKNOWN_SPEAKER,
                             "text": text})
+    _meeting_autoname(speaker, text)
 
 def _meeting_set_name(label: str, name: str):
+    """Manual (typed) name. Always wins over a name the daemon heard."""
     name = " ".join(name.split())[:40]
     with _meeting_lock:
+        SPEAKER_AUTO.discard(label)
         if name:
             SPEAKER_NAMES[label] = name
         else:
             SPEAKER_NAMES.pop(label, None)
 
+# Self-introduction detection. Deliberately conservative: only explicit
+# "my name is X" / "call me X" style phrases — a bare "I'm X" or "我是X" fires
+# on "I'm good" / "我是说" far too often to be worth it.
+_NAME_EN = re.compile(
+    r"\b(?i:my name(?: is|['’]s|s)|name['’]s|call me|they call me|i am called|i['’]m called)\s+"
+    r"((?:(?:Dr|Mr|Mrs|Ms|Prof)\.?\s+)?[A-Z][A-Za-z'’\-]{1,19}(?:\s+[A-Z][A-Za-z'’\-]{1,19}){0,2})")
+_NAME_ZH = re.compile(
+    r"(?:我的名字是|我的名字叫|我名字是|我名字叫|我叫(?!做)|叫我|大家好[,，]?我是)\s*"
+    r"([A-Za-z][A-Za-z'\-]{1,19}|[\u4e00-\u9fff]{2,3})")
+_NAME_DENY = {"Sorry", "Back", "Later", "Again", "Please", "Maybe", "Tomorrow",
+              "Today", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+              "Saturday", "Sunday", "Anything", "Whatever"}
+
+def _detect_name(text: str) -> str | None:
+    m = _NAME_EN.search(text) or _NAME_ZH.search(text)
+    if not m:
+        return None
+    name = m.group(1).strip()
+    first = name.split()[0]
+    if first in _NAME_DENY:
+        return None
+    return name
+
+def _meeting_autoname(label: str | None, text: str):
+    """If `text` is a self-introduction, name that speaker label — unless the
+    user already typed a name for it. A later introduction replaces an
+    earlier *heard* name (the speaker corrected themselves, or the first
+    detection was wrong)."""
+    if not label or label == UNKNOWN_SPEAKER:
+        return
+    name = _detect_name(text)
+    if not name:
+        return
+    with _meeting_lock:
+        if label in SPEAKER_NAMES and label not in SPEAKER_AUTO:
+            return                      # typed by the user — keep
+        SPEAKER_NAMES[label] = name
+        SPEAKER_AUTO.add(label)
+    log.info("Meeting speaker %s introduced themselves as %r", label, name)
+
 def _meeting_clear():
     with _meeting_lock:
         MEETING_LOG.clear()
         SPEAKER_NAMES.clear()
+        SPEAKER_AUTO.clear()
 
 def _speaker_display(label: str | None) -> str:
     if not label or label == UNKNOWN_SPEAKER:
@@ -2113,7 +2183,8 @@ def _meeting_speakers() -> list[dict]:
         seen: dict = {}
         for e in MEETING_LOG:
             seen[e["speaker"]] = seen.get(e["speaker"], 0) + 1
-        return [{"label": k, "name": SPEAKER_NAMES.get(k, ""), "count": v}
+        return [{"label": k, "name": SPEAKER_NAMES.get(k, ""), "count": v,
+                 "auto": k in SPEAKER_AUTO}
                 for k, v in seen.items()]
 
 def _meeting_export(fmt: str = "txt") -> str:
@@ -4845,9 +4916,9 @@ class BaseVoiceSession:
                 None, speak, "Calibration failed. No mic data.", self.alsa_output
             )
             return
-        noise_peak = max(peaks)
-        new_gate = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.5)))
+        noise_peak, new_gate = _gate_from_peaks(peaks)
         MIC_GATE_PEAK = new_gate
+        _save_trusted_gate(new_gate)
         log.info("Calibration: noise_peak=%d → MIC_GATE_PEAK=%d", noise_peak, new_gate)
         # Persist to service file so it survives restarts
         _update_service_gate(new_gate)
@@ -5109,7 +5180,9 @@ class BaseVoiceSession:
         active. Silence is the fail-safe: missing or too-short segments are
         rejected in owner-only mode."""
         segment = self._pop_segment()
-        if not _owner_only[0]:
+        if not _owner_only[0] or self._monitoring:
+            # Monitoring is a meeting note-taker: it records everyone, so no
+            # voice check runs (and no "rejected non-owner" entries).
             return True
         device_key = _current_input_device_name()
         if not _verification_available(device_key):
@@ -5201,6 +5274,24 @@ class BaseVoiceSession:
         # that FIFO against the next real transcript.
         _speaker_verified = await self._verify_speaker(transcript)
 
+        # Monitoring = notes only. Record the utterance and stop HERE — before
+        # the wake / sleep / monitor-toggle / owner-only phrase checks and
+        # before any routing to the agent — so nothing said in a meeting can
+        # act as a command. (Stop Monitoring from the dashboard or DTMF 654.)
+        if self._monitoring:
+            t = transcript.strip()
+            if t:
+                log.info("Monitor: %s%s", f"[{speaker}] " if speaker else "", t)
+                _log_entry("monitor", t, speaker)
+                _meeting_add(t, speaker)
+                if speaker:
+                    # Diarized meeting capture: live conversation is not "idle".
+                    # Without this, AUTO_SLEEP_SECS ends a meeting 10 min in even
+                    # while people are talking. Plain (undiarized) monitoring
+                    # stays passive and still auto-sleeps.
+                    _last_interaction[0] = __import__("time").time()
+            return
+
         import time as _ti
         import functools as _ft
 
@@ -5280,14 +5371,6 @@ class BaseVoiceSession:
         # comment). Dashboard HTTP buttons remain ungated fallbacks by
         # design (they never reach this method).
         if not _speaker_verified:
-            # Meeting notes capture everyone, not just the enrolled owner —
-            # but only as notes: an unverified voice still must not reach the
-            # control-phrase checks below, so record and stop here.
-            if self._monitoring:
-                _t = transcript.strip()
-                if _t:
-                    _log_entry("monitor", _t, speaker)
-                    _meeting_add(_t, speaker)
             return
 
         # Wake phrase — always checked regardless of active/monitoring state.
@@ -5477,25 +5560,6 @@ class BaseVoiceSession:
                 await asyncio.get_running_loop().run_in_executor(
                     None, speak, "Everyone mode. Listening to all voices.",
                     self.alsa_output)
-            return
-
-        # Monitoring-only mode: passively log captured segments (no Zeebot/TTS).
-        # NOTE: this block is intentionally AFTER all control phrase checks so
-        # that wake/sleep/monitoring-toggle phrases work even while monitoring.
-        # Intentionally does NOT update _last_interaction — monitoring is passive
-        # and must not prevent auto-sleep from firing.
-        if self._monitoring:
-            t = transcript.strip()
-            if t:
-                log.info("Monitor: %s%s", f"[{speaker}] " if speaker else "", t)
-                _log_entry("monitor", t, speaker)
-                _meeting_add(t, speaker)
-                if speaker:
-                    # Diarized meeting capture: live conversation is not "idle".
-                    # Without this, AUTO_SLEEP_SECS ends a meeting 10 min in even
-                    # while people are talking. Plain (undiarized) monitoring
-                    # stays passive and still auto-sleeps.
-                    _last_interaction[0] = __import__("time").time()
             return
 
         # Language gate: drop non-EN/ZH (or off-whitelist) before routing to Zeebot.
@@ -6126,6 +6190,7 @@ class MuseTranscribeSession(BaseVoiceSession):
         self._conn_mode = MUSE_MODE      # mode of the live connection (fixed per session)
         self._open_turn = None           # turnId of the most recent speechStart
         self._pending_speaker = None     # latest `speaker` label, bound at speechEnd
+        self._turn_labels: list = []     # every speaker event this turn (diagnostics)
         self._turn_speaker: dict = {}    # turnId -> diarization label
 
     def engine_name(self) -> str:
@@ -6164,6 +6229,7 @@ class MuseTranscribeSession(BaseVoiceSession):
             self._conn_mode = self._wanted_mode()
             self._open_turn = None
             self._pending_speaker = None
+            self._turn_labels = []
             self._turn_speaker.clear()
             log.info("Muse session %d connecting (model=%s, mode=%s, reset every %d min)",
                      self._session_no, MUSE_MODEL, self._conn_mode,
@@ -6283,6 +6349,8 @@ class MuseTranscribeSession(BaseVoiceSession):
         t = msg.get("type", "")
         if t == "speechStart":
             self._open_turn = msg.get("turnId")
+            if self._monitoring:
+                _meeting_live_begin()
             self._on_speech_started()
         elif t == "transcript":
             # Partial (cumulative) text of the open turn. Normal operation
@@ -6292,6 +6360,11 @@ class MuseTranscribeSession(BaseVoiceSession):
             if self._monitoring and msg.get("transcript"):
                 _meeting_live_set(_to_simplified(msg["transcript"]))
         elif t == "speechEnd":
+            if self._monitoring:
+                _meeting_live_close()    # held ~2 s with its speaker, then hidden
+                log.info("Muse turn %s closed — speaker events this turn: %s",
+                         msg.get("turnId"), self._turn_labels or "none")
+            self._turn_labels = []
             # The turn's `speaker` event is emitted just BEFORE its speechEnd
             # (measured live: speaker -> speechEnd -> speechComplete, same
             # instant). Bind it here by turnId rather than to "the latest
@@ -6304,6 +6377,9 @@ class MuseTranscribeSession(BaseVoiceSession):
         elif t == "speaker":
             if msg.get("label"):
                 self._pending_speaker = str(msg["label"])
+                if self._monitoring:
+                    _meeting_live_speaker(self._pending_speaker)
+                self._turn_labels.append(f'{msg["label"]}@{msg.get("audioProcessedMs")}ms')
         elif t == "speechComplete":
             text = (msg.get("transcript") or "").strip()
             speaker = self._turn_speaker.pop(msg.get("turnId"), None)
@@ -7905,8 +7981,8 @@ function setCalMode(mode){{
                     with _mic_level_lock:
                         peaks.append(_mic_level_current[0])
                 peaks = peaks[2:]
-                noise_peak = max(peaks) if peaks else 0
-                new_gate = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.5)))
+                noise_peak, new_gate = _gate_from_peaks(peaks)
+                _save_trusted_gate(new_gate)
                 _mic_gate_ref[0] = new_gate
                 MIC_GATE_PEAK = new_gate
                 log.info("HTTP calibration: noise_peak=%d → gate=%d", noise_peak, new_gate)
@@ -8831,12 +8907,10 @@ a.cnl:hover{{background:var(--mu);color:#000;}}
 #meeting .cnt{{font-size:12px;color:var(--mu);}}
 #meeting .macts{{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;}}
 .mon .spk{{color:var(--mon);}}
-#mtx{{flex-shrink:0;margin:6px 14px 0;max-height:34vh;overflow-y:auto;padding:8px 12px;background:var(--sf);border:1px solid var(--bd);border-radius:var(--r);font-size:15px;line-height:1.5;}}
+#mtx{{flex-shrink:0;margin:6px 14px 0;max-height:26vh;overflow-y:auto;padding:8px 12px;background:var(--gnb);border:1px solid var(--gn);border-radius:var(--r);font-size:16px;line-height:1.5;color:var(--gn);}}
 #mtx[hidden]{{display:none;}}
-#mtx .ml{{margin:2px 0;}}
-#mtx .ml .t{{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--mu);margin-right:6px;}}
-#mtx .ml .w{{font-weight:600;color:var(--mon);margin-right:4px;}}
-#mtx .live{{color:var(--mu);font-style:italic;}}
+#mtx .who{{color:#fff;font-weight:600;}}
+#mtx .idle{{opacity:.45;font-style:italic;}}
 #nowreading{{flex-shrink:0;margin:6px 14px 0;padding:8px 12px;background:var(--sf2);border:1px solid var(--di);border-radius:var(--r);font-size:14px;line-height:1.55;}}
 #nowreading[hidden]{{display:none;}}
 #nowreading .nrw{{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:4px;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:.08em;}}
@@ -8945,6 +9019,7 @@ setInterval(function(){{
       inp.addEventListener('keydown',function(e){{if(e.key==='Enter'){{send();inp.blur();}}}});
       row.appendChild(inp);
       row.appendChild(mk('span','cnt',s.count+' utterance'+(s.count===1?'':'s')));
+      if(s.auto) row.appendChild(mk('span','cnt','\u2014 name heard in conversation; edit to correct'));
       el.appendChild(row);
     }});
     var acts=mk('div','macts');
@@ -8956,10 +9031,13 @@ setInterval(function(){{
     acts.appendChild(nm);
     el.appendChild(acts);
   }}
+  var liveOn=false;
   window._meetingUpdate=function(m){{
+    liveOn=!!(m&&m.monitoring);
+    if(!liveOn)mtx.hidden=true;
     if(!m||!m.show){{el.hidden=true;return;}}
     el.hidden=false;
-    var s=[m.monitoring,m.diarized,m.speakers.map(function(x){{return x.label;}}).join(',')].join('|');
+    var s=[m.monitoring,m.diarized,m.speakers.map(function(x){{return x.label+'='+x.name;}}).join(',')].join('|');
     var typing=el.contains(document.activeElement)&&document.activeElement.tagName==='INPUT';
     if(s!==sig&&!typing){{sig=s;build(m);}}
     else{{ // refresh counts only
@@ -8974,30 +9052,23 @@ setInterval(function(){{
   // panel is visible this polls /meeting/live every 300 ms: new finalized
   // lines (cursor-based), the open turn's partial text, and the speaker-name
   // map (so a rename shows up immediately in already-rendered lines).
-  var mtx=document.getElementById('mtx'), cursor=0, names={{}}, liveEl=null;
-  function nm(l){{return l==='?'?'Speaker':(names[l]||('Speaker '+l));}}
-  function addLine(e){{
-    var d=mk('div','ml'); d.dataset.label=e.speaker;
-    d.appendChild(mk('span','t',e.ts));
-    d.appendChild(mk('span','w',nm(e.speaker)+':'));
-    d.appendChild(document.createTextNode(e.text));
-    mtx.insertBefore(d,liveEl);
-  }}
+  var mtx=document.getElementById('mtx'), cursor=0;
   function poll(){{
-    if(el.hidden){{mtx.hidden=true;setTimeout(poll,1500);return;}}
+    if(el.hidden||!liveOn){{mtx.hidden=true;setTimeout(poll,1500);return;}}
+    // since=cursor keeps the finalized-entry list empty; only the live
+    // partial and the running total (to notice a cleared meeting) are used.
     fetch('/meeting/live?since='+cursor).then(function(r){{return r.json();}}).then(function(d){{
       mtx.hidden=false;
-      if(d.total<cursor){{cursor=0;mtx.textContent='';liveEl=null;}}
-      if(!liveEl){{liveEl=mk('div','ml live');mtx.appendChild(liveEl);}}
-      var stick=mtx.scrollHeight-mtx.scrollTop-mtx.clientHeight<40;
-      names=d.names||{{}};
-      d.entries.forEach(addLine);
       cursor=d.total;
-      mtx.querySelectorAll('.ml[data-label] .w').forEach(function(w){{
-        w.textContent=nm(w.parentNode.dataset.label)+':';
-      }});
-      liveEl.textContent=d.live?('\u2026 '+d.live):'';
-      if(stick) mtx.scrollTop=mtx.scrollHeight;
+      mtx.textContent='';
+      if(d.live){{
+        var ls=d.live_speaker, names=d.names||{{}};
+        var who=ls?(names[ls]||('Speaker '+ls)):'Speaker \u2026';
+        mtx.appendChild(mk('b','who',who+': '));
+        mtx.appendChild(document.createTextNode(d.live));
+      }}else{{
+        mtx.appendChild(mk('span','idle','listening\u2026'));
+      }}
     }}).catch(function(){{}}).then(function(){{setTimeout(poll,300);}});
   }}
   poll();
@@ -9446,6 +9517,58 @@ async def main(http_port: int, input_device=None, output_device=None,
     log.info("Daemon stopped.")
 
 
+def _gate_from_peaks(peaks: list) -> tuple:
+    """(noise_peak, gate) from per-block peak levels. The old rule took the
+    single loudest block (max) x1.5, so one transient — speech, phone audio,
+    a click during the 2 s startup window — set the gate 5-10x too high (seen:
+    1254/984/841/598 against a normal ~130), zeroing quiet speech until the
+    next restart. Now the loudest 20% of blocks are ignored first."""
+    if not peaks:
+        return 0, MIC_GATE_MIN
+    ordered = sorted(peaks)
+    kept = ordered[:max(1, int(len(ordered) * GATE_NOISE_KEEP))]
+    noise_peak = kept[-1]
+    return noise_peak, max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.5)))
+
+def _load_gate_state() -> dict:
+    try:
+        with open(GATE_STATE_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def _save_gate_state(gate: int) -> None:
+    try:
+        with open(GATE_STATE_FILE, "w") as f:
+            json.dump({"gate": int(gate), "t": time.time()}, f)
+    except Exception as e:
+        log.warning("Could not save gate state: %s", e)
+
+def _save_trusted_gate(gate: int) -> None:
+    """A gate the user calibrated on purpose (dashboard / voice command, told to
+    stay quiet) becomes the new known-good reference."""
+    _save_gate_state(gate)
+
+def _vet_startup_gate(measured: int) -> int:
+    """Outlier guard for the automatic startup measurement. If `measured` is
+    more than GATE_OUTLIER_RATIO x the last known-good gate, keep the last good
+    one — the 2 s window most likely caught speech/noise rather than the room.
+    Never auto-accepted, not even if it repeats: back-to-back restarts while
+    testing (audio playing each time) would otherwise confirm each other. To
+    raise the gate for a genuinely noisier room, recalibrate from the
+    dashboard (that result is trusted and becomes the new reference). With no
+    saved reference yet, the first measurement is taken as-is."""
+    good = int(_load_gate_state().get("gate") or 0)
+    if not good or measured <= good * GATE_OUTLIER_RATIO:
+        _save_gate_state(measured)
+        return measured
+    log.warning("Startup mic gate measured %d is >%.0fx the last good gate %d — "
+                "probably speech/noise during the 2 s window; keeping %d. "
+                "(Recalibrate from the dashboard in a quiet room to override.)",
+                measured, GATE_OUTLIER_RATIO, good, good)
+    return good
+
 def calibrate_mic(input_device=None, duration: float = 3.0, verbose: bool = True) -> int:
     """Record ambient noise and return a recommended MIC_GATE_PEAK value (1.5x noise peak).
 
@@ -9464,8 +9587,9 @@ def calibrate_mic(input_device=None, duration: float = 3.0, verbose: bool = True
                         device=input_device):
         import time; time.sleep(duration)
     peaks = peaks[2:]  # discard first two frames (hardware warmup)
-    noise_peak = max(peaks) if peaks else 0
-    recommended = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.5)))
+    noise_peak, recommended = _gate_from_peaks(peaks)
+    log.info("Mic calibration blocks: max=%d kept-peak=%d → gate=%d (peaks=%s)",
+             max(peaks) if peaks else 0, noise_peak, recommended, sorted(peaks))
     if verbose:
         print(f"Noise floor peak: {noise_peak}  →  recommended MIC_GATE_PEAK: {recommended} (clamped {MIC_GATE_MIN}–{MIC_GATE_MAX})")
     return recommended
@@ -9671,6 +9795,7 @@ if __name__ == "__main__":
         try:
             _measured_gate = calibrate_mic(input_device=_selected_input_device[0],
                                             duration=2.0, verbose=False)
+            _measured_gate = _vet_startup_gate(_measured_gate)
             MIC_GATE_PEAK = _measured_gate
             log.info("Auto-calibrated mic gate for this boot: %d "
                      "(override with --mic-gate, or pass --no-auto-calibrate to stop "

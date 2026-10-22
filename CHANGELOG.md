@@ -1,5 +1,27 @@
 # Changelog
 
+## [3.29.2] — 2026-10-22
+
+### Added
+
+- **Auto-naming speakers.** Self-introductions ("my name is Victor",
+  "我的名字是Victor", "call me …", "我叫…") rename the speaker label to the
+  heard name; a manual rename always wins.
+- Live box (`#mtx`) shows only the current turn, prefixed with the speaker
+  (`Speaker …` until Muse sends the label at turn end).
+
+### Changed
+
+- **Monitoring never gates or routes.** The owner-voice check is skipped and
+  nothing is passed to the agent while Monitoring; any voice is transcribed.
+- Live box hides when Monitoring is off.
+- Mic-gate calibration is robust: the loudest 20% of blocks are dropped
+  before taking 1.5x the max, and a startup gate more than 3x the last good
+  one is rejected (last good kept in `rtt_gate_state.json`). Fixes a
+  speech-inflated gate (1254) that blanked transcription.
+- Logs `Muse turn N closed — speaker events this turn` and the Muse mode on
+  connect.
+
 ## [3.29.1] — 2026-10-22
 
 ### Fixed
