@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.29.5"
+__version__ = "3.29.6"
 
 import argparse
 import asyncio
@@ -2420,7 +2420,7 @@ def _meeting_turn_finish(turn, text: str, speaker):
     full = _join_text(prefix, text) if prefix else text
     if text:
         _meeting_autoname(speaker, full)
-        if speaker and _ID_HINT.search(full):
+        if speaker and speaker not in SPEAKER_NAMES and _ID_HINT.search(full):
             _meeting_identify_schedule()
     if speaker:
         _last_interaction[0] = time.time()
@@ -2526,7 +2526,7 @@ def _meeting_add(text: str, speaker: str | None, mid=None, t0=None, t1=None):
                             "t0": t0 or MEETING_LIVE.get("turn_t0") or t1,   # speech start
                             "t1": t1})                                       # speech end
     _meeting_autoname(speaker, text)
-    if speaker and _ID_HINT.search(text):
+    if speaker and speaker not in SPEAKER_NAMES and _ID_HINT.search(text):
         _meeting_identify_schedule()
 
 def _meeting_set_name(label: str, name: str):
@@ -2590,7 +2590,7 @@ MEETING_ID_SESSION = "agent:main:rtt-meeting-names"
 _gateway_ref: list = [None]          # set in main(); the shared GatewayClient
 _ID_HINT = re.compile(r"\b(?:this is|i am|i['’]m|it['’]s|here|speaking|name)\b|我是|这是|我这边|本人|我叫|叫我", re.I)
 _id_state = {"busy": False, "pending": False, "last": 0.0}
-MEETING_ID_MIN_GAP_SECS = 8.0
+MEETING_ID_MIN_GAP_SECS = 30.0
 MEETING_ID_CONTEXT = 30              # recent utterances sent to the agent
 
 def _meeting_identify_schedule(force: bool = False):
@@ -2598,8 +2598,8 @@ def _meeting_identify_schedule(force: bool = False):
     loop = _event_loop[0]
     if not loop or not _gateway_ref[0]:
         return
-    if _id_state["busy"]:
-        _id_state["pending"] = True
+    if _id_state["busy"] or (_opt_state["busy"] and not force):
+        _id_state["pending"] = True      # the agent is busy with Optimize — retry later
         return
     if not force and time.monotonic() - _id_state["last"] < MEETING_ID_MIN_GAP_SECS:
         _id_state["pending"] = True
@@ -2680,12 +2680,16 @@ async def _meeting_identify():
 # font) and in the download. Original wording is kept in entry["orig"].
 MEETING_OPT_SESSION = "agent:main:rtt-meeting-notes"
 MEETING_PAUSE_SECS  = 10.0
-MEETING_OPT_BATCH_CHARS = 6000
+MEETING_OPT_BATCH_CHARS = 3500
+MEETING_OPT_TIMEOUT_S   = 240        # per agent request (the voice default of 90 s is too short for a big edit)
 MEETING_SUMMARIES: dict = {}         # first entry id of segment -> {"after","speaker","text"}
 _OPT_DONE: set = set()               # segments (tuple of entry ids) already optimized
 _opt_state = {"busy": False, "msg": "", "en": False, "zh": False,   # summary languages; neither = as spoken
               "step": "", "i": 0, "n": 0, "fixes": 0, "sums": 0, "segs": 0, "lines": 0,
-              "overall": False, "examples": [], "finished": 0.0, "ok": True}
+              "overall": False, "examples": [], "finished": 0.0, "ok": True, "skipped": 0,
+              "paused": False, "paused_at": 0.0, "resume": False, "cancel": False}
+MEETING_IDLE_SECS = 30.0             # "meeting not in process": Monitoring off, or no speech for this long
+MEETING_POSTPONE_MIN_SECS = 10.0     # a postponed run waits at least this long before auto-resuming
 OPT_RESULT_SHOW_SECS = 25.0          # how long the finished result stays in the live box
 
 def _opt_view():
@@ -2698,7 +2702,7 @@ def _opt_view():
     return {"busy": st["busy"], "step": st["step"], "i": st["i"], "n": st["n"],
             "fixes": st["fixes"], "sums": st["sums"], "segs": st["segs"], "lines": st["lines"],
             "overall": st["overall"], "examples": list(st["examples"]), "ok": st["ok"],
-            "msg": st["msg"], "langs": langs}
+            "msg": st["msg"], "langs": langs, "paused": st["paused"]}
 
 # ── Whole-meeting summary (top of the .md download) ──────────────────────────
 # Written by OpenClaw at the end of an Optimize run: overview, key concepts,
@@ -2763,17 +2767,15 @@ async def _opt_overall(entries: list) -> None:
     out = {}
     for lang in langs:
         if len(chunks) == 1:
-            d = _json_obj(await gw.ask(_overall_prompt(chunks[0], lang), session_key=MEETING_OPT_SESSION))
+            d = _json_obj(await _opt_ask(_overall_prompt(chunks[0], lang)))
         else:
             parts = []
             for i, ch in enumerate(chunks, 1):
                 _opt_state["msg"] = f"Summarizing meeting {i}/{len(chunks)}…"
-                pd = _json_obj(await gw.ask(_overall_prompt(ch, lang, part=(i, len(chunks))),
-                                            session_key=MEETING_OPT_SESSION))
+                pd = _json_obj(await _opt_ask(_overall_prompt(ch, lang, part=(i, len(chunks)))))
                 if pd:
                     parts.append(json.dumps(pd, ensure_ascii=False))
-            d = _json_obj(await gw.ask(_overall_prompt("\n\n".join(parts), lang, merge=True),
-                                       session_key=MEETING_OPT_SESSION)) if parts else None
+            d = _json_obj(await _opt_ask(_overall_prompt("\n\n".join(parts), lang, merge=True))) if parts else None
         if d:
             out[lang or "spoken"] = d
     if out:
@@ -2903,34 +2905,118 @@ def _opt_apply(reply: str, batch: list) -> tuple:
         nsum += 1
     return nfix, nsum
 
+def _summary_block_html() -> str:
+    """The speakers' one-sentence main points as one block at the top of the
+    log. Newest-first like the log itself: the last speaker to appear is at the
+    top of the block, the first at its bottom."""
+    if not MEETING_SUMMARIES:
+        return ""
+    import html as _h
+    items = sorted(MEETING_SUMMARIES.items())            # by first entry id = order of appearance
+    out = '<div class="sumblock"><div class="sumh">&#10024; Main points &mdash; by speaker, first to speak at the bottom</div>'
+    for _fid, v in reversed(items):
+        ts = f'<span class="ts">{v["ts"]}</span> ' if v.get("ts") else ""
+        out += (f'<div class="sum">{ts}<b>{_h.escape(_speaker_display(v["speaker"]))}</b> &mdash; '
+                f'{_h.escape(v["text"]).replace(chr(10), "<br>")}</div>')
+    return out + "</div>"
+
 def _opt_set_summary(seg: list, text: str):
     first, last = seg[0], seg[-1]
-    MEETING_SUMMARIES[first["id"]] = {"after": last["id"], "speaker": first["speaker"], "text": text}
-    for i in range(len(CONVERSATION_LOG) - 1, -1, -1):
-        if CONVERSATION_LOG[i].get("sid") == first["id"]:
-            del CONVERSATION_LOG[i]
-    for i, c in enumerate(CONVERSATION_LOG):
-        if c.get("mid") == last["id"]:
-            ts = datetime.datetime.now().strftime("%H:%M:%S")
-            CONVERSATION_LOG.insert(i + 1, {"role": "summary", "text": text, "ts": ts,
-                                            "epoch": time.time(), "speaker": first["speaker"],
-                                            "sid": first["id"]})
-            break
+    # Shown as one grouped block at the top of the dashboard log (see
+    # _summary_block_html), in order of appearance; also used by the .md export.
+    MEETING_SUMMARIES[first["id"]] = {"after": last["id"], "speaker": first["speaker"], "text": text,
+                                      "ts": first.get("ts", "")}
 
 def _meeting_optimize_schedule():
     loop = _event_loop[0]
     if _opt_state["busy"] or not loop or not _gateway_ref[0]:
         return
     _opt_state.update(busy=True, msg="Starting…", step="Starting", i=0, n=0, fixes=0, sums=0,
-                      examples=[], finished=0.0, ok=True)
+                      examples=[], finished=0.0, ok=True, paused=False, resume=False, cancel=False)
     loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_meeting_optimize()))
+
+class _OptCancelled(Exception):
+    pass
+
+def _meeting_idle() -> bool:
+    """True when the meeting isn't in progress and the agent is free for background work."""
+    if not _persist_monitoring[0]:
+        return True
+    last = max(MEETING_LIVE["t"], MEETING_LIVE["closed"] or 0.0)
+    return time.monotonic() - last > MEETING_IDLE_SECS
+
+async def _opt_checkpoint():
+    """Between agent requests: stop if cancelled; if postponed ("Later"), wait
+    until the user resumes it or the meeting goes idle, then carry on."""
+    st = _opt_state
+    if st["cancel"]:
+        raise _OptCancelled()
+    if not st["paused"]:
+        return
+    while st["paused"]:
+        if st["cancel"]:
+            raise _OptCancelled()
+        waited = time.monotonic() - st["paused_at"]
+        if st["resume"] or (waited > MEETING_POSTPONE_MIN_SECS and _meeting_idle()):
+            st.update(paused=False, resume=False, msg="Resuming…")
+            return
+        st["msg"] = "Postponed — resumes when the meeting is idle"
+        await asyncio.sleep(1.0)
+
+async def _opt_ask(prompt: str) -> str:
+    """gw.ask() that Stop can interrupt immediately (the agent may still finish
+    the run on its side; we just stop waiting and discard the answer)."""
+    await _opt_checkpoint()
+    t = asyncio.ensure_future(_gateway_ref[0].ask(prompt, session_key=MEETING_OPT_SESSION,
+                                                  timeout=MEETING_OPT_TIMEOUT_S))
+    try:
+        while not t.done():
+            if _opt_state["cancel"]:
+                t.cancel()
+                raise _OptCancelled()
+            await asyncio.wait({t}, timeout=0.3)
+        return t.result()
+    finally:
+        if not t.done():
+            t.cancel()
+
+def _meeting_opt_control(action: str) -> None:
+    st = _opt_state
+    if not st["busy"]:
+        return
+    if action == "stop":
+        st["cancel"] = True
+    elif action == "later" and not st["paused"]:
+        st.update(paused=True, paused_at=time.monotonic(), resume=False, msg="Postponed — resumes when the meeting is idle")
+    elif action == "resume" and st["paused"]:
+        st["resume"] = True
+
+async def _opt_run_batch(batch: list, tag: str) -> tuple:
+    """One agent request for `batch`; on a timeout/error, split it in half and
+    retry each half once, then give up on that piece (counted in skipped)."""
+    try:
+        reply = await _opt_ask(_opt_prompt(batch))
+        nf, ns = _opt_apply(reply, batch)
+        log.info("Notes optimizer batch %s: %d fixes, %d summaries", tag, nf, ns)
+        return nf, ns
+    except _OptCancelled:
+        raise
+    except Exception as e:
+        log.warning("Notes optimizer batch %s failed: %r", tag, e)
+        if len(batch) < 2:
+            _opt_state["skipped"] += 1
+            return 0, 0
+        mid = len(batch) // 2
+        a = await _opt_run_batch(batch[:mid], tag + "a")
+        b = await _opt_run_batch(batch[mid:], tag + "b")
+        return a[0] + b[0], a[1] + b[1]
 
 async def _meeting_optimize():
     st = _opt_state
     try:
         with _meeting_lock:
             entries = [e for e in MEETING_LOG if "id" in e]
-        st.update(step="Reading the notes", i=0, n=0, fixes=0, sums=0, segs=0, lines=len(entries),
+        st.update(step="Reading the notes", i=0, n=0, fixes=0, sums=0, segs=0, lines=len(entries), skipped=0,
                   overall=False, examples=[], finished=0.0, ok=True)
         # Pressing the button always redoes everything with the CURRENT settings
         # (summary languages, new lines, or just another try for different
@@ -2951,9 +3037,7 @@ async def _meeting_optimize():
         st["n"] = len(batches)
         for i, batch in enumerate(batches, 1):
             st.update(i=i - 1, step="Correcting the text and writing speaker points", msg=f"Optimizing {i}/{len(batches)}…")
-            reply = await _gateway_ref[0].ask(_opt_prompt(batch), session_key=MEETING_OPT_SESSION)
-            nf, ns = _opt_apply(reply, batch)
-            log.info("Notes optimizer batch %d/%d: %d fixes, %d summaries", i, len(batches), nf, ns)
+            nf, ns = await _opt_run_batch(batch, f"{i}/{len(batches)}")
             if ns or nf:
                 for sg in batch:
                     _OPT_DONE.add((tuple(e["id"] for e in sg), _opt_langkey()))
@@ -2963,25 +3047,44 @@ async def _meeting_optimize():
         st.update(step="Writing the whole-meeting summary", msg="Summarizing meeting…")
         with _meeting_lock:
             entries = [e for e in MEETING_LOG if "id" in e]
-        await _opt_overall(entries)
+        try:
+            await _opt_overall(entries)
+        except _OptCancelled:
+            raise
+        except Exception as e:
+            log.warning("Whole-meeting summary failed: %r", e)
+            st["skipped"] += 1
         st["overall"] = bool(MEETING_OVERALL)
         st["step"] = "Done"
-        st["msg"] = f"Done: {st['fixes']} corrections, {st['sums']} segment summaries, meeting summary"
+        extra = ""
+        if st["skipped"]:
+            extra = f" — {st['skipped']} part(s) timed out, press Optimize again"
+        st["msg"] = (f"Done: {st['fixes']} corrections, {st['sums']} segment summaries"
+                     + (", meeting summary" if st["overall"] else ", no meeting summary") + extra)
+    except _OptCancelled:
+        log.info("Notes optimizer stopped by user (%d corrections, %d speaker points kept)", st["fixes"], st["sums"])
+        st.update(msg=f"Stopped — kept {st['fixes']} corrections and {st['sums']} speaker points", ok=True, step="Stopped")
     except Exception as e:
-        log.warning("Notes optimizer failed: %s", e)
-        st.update(msg="Failed — see log", ok=False, step="Failed")
+        log.warning("Notes optimizer failed: %r", e)
+        st.update(msg=f"Failed — {type(e).__name__}: {e}"[:120], ok=False, step="Failed")
     finally:
         st["busy"] = False
+        st.update(paused=False, resume=False, cancel=False)
         st["finished"] = time.time()
 
 def _meeting_clear():
+    """"New meeting": forget the notes AND the meeting lines in the dashboard log
+    (system messages and other log rows are left alone)."""
+    if _opt_state["busy"]:
+        _opt_state["cancel"] = True          # don't keep optimizing notes that are being thrown away
+    CONVERSATION_LOG[:] = [e for e in CONVERSATION_LOG if e.get("role") != "monitor"]
     _LIVE_CHUNKS.clear()
     MEETING_SUMMARIES.clear()
     MEETING_OVERALL.clear()
     _OPT_DONE.clear()
     _opt_state.update(msg="", finished=0.0)
     _CARRY.update(text="", speaker=None, t=0.0)
-    MEETING_LIVE.update(text="", pushed="", prefix="")
+    MEETING_LIVE.update(text="", pushed="", prefix="", closed=0.0, new=False, speaker=None)
     with _meeting_lock:
         MEETING_LOG.clear()
         SPEAKER_NAMES.clear()
@@ -5510,8 +5613,11 @@ class GatewayClient:
                     log.warning("Gateway reconnect failed (%s) — retrying in 5s", e)
                     await asyncio.sleep(5)
 
-    async def ask(self, message: str, session_key: str = OPENCLAW_SESSION) -> str:
-        """Send a message to the agent and return its complete reply text."""
+    async def ask(self, message: str, session_key: str = OPENCLAW_SESSION,
+                  timeout: float = None) -> str:
+        """Send a message to the agent and return its complete reply text.
+        `timeout` (seconds) overrides AGENT_TIMEOUT_S for long, non-voice jobs."""
+        _tmo = timeout or AGENT_TIMEOUT_S
         await asyncio.wait_for(self._ready.wait(), timeout=20)
         loop = asyncio.get_running_loop()
         idem = str(uuid.uuid4())
@@ -5543,10 +5649,10 @@ class GatewayClient:
         # Register with agent.wait so the gateway tracks this run
         await self._ws.send(json.dumps({
             "type": "req", "id": f"wait:{run_id}", "method": "agent.wait",
-            "params": {"runId": run_id, "timeoutMs": AGENT_TIMEOUT_S * 1000},
+            "params": {"runId": run_id, "timeoutMs": int(_tmo * 1000)},
         }))
 
-        text = await asyncio.wait_for(reply_fut, timeout=AGENT_TIMEOUT_S + 5)
+        text = await asyncio.wait_for(reply_fut, timeout=_tmo + 5)
         return await self._resolve_reply_text(text, session_key)
 
     async def _resolve_reply_text(self, text: str, session_key: str) -> str:
@@ -7516,7 +7622,7 @@ def _dashboard_dynamic(sess) -> dict:
             else:
                 thinking_dur[_ep] = None  # still waiting
 
-    rows = ""
+    rows = _summary_block_html()
     for e in reversed(CONVERSATION_LOG):
         ts = e.get("ts", "")
         ts_span = f'<span class="ts">{ts}</span> ' if ts else ""
@@ -7529,10 +7635,6 @@ def _dashboard_dynamic(sess) -> dict:
             _who = (f'<b class="spk">{__import__("html").escape(_speaker_display(_sp))}:</b> '
                     if _sp else ('<b class="spk">Speaker &hellip;:</b> ' if e.get("pending") else ""))
             rows += f'<div class="mon">{ts_span}{_who}{e["text"]}</div>'
-        elif e["role"] == "summary":
-            _sw = __import__("html").escape(_speaker_display(e.get("speaker")))
-            rows += (f'<div class="sum">{ts_span}&#9656; <b>{_sw}</b> &mdash; '
-                     f'{__import__("html").escape(e["text"]).replace(chr(10), "<br>")}</div>')
         elif e["role"] == "thinking":
             ep  = e.get("epoch", 0.0)
             dur = thinking_dur.get(ep)
@@ -7644,6 +7746,7 @@ def _dashboard_dynamic(sess) -> dict:
             "speakers":   _meeting_speakers(),
             "optimizing": _opt_state["busy"],
             "opt_msg":    _opt_state["msg"],
+            "opt_paused": _opt_state["paused"],
             "opt_en":     _opt_state["en"],
             "opt_zh":     _opt_state["zh"],
         },
@@ -7885,6 +7988,10 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                     _opt_state["zh"] = _qs.get("zh", ["0"])[0] == "1"
                     if not _opt_state["busy"]:
                         _opt_state["msg"] = "settings changed — press to regenerate"
+                    self.send_response(204)
+                    self.end_headers()
+                elif _u.path in ("/meeting/optstop", "/meeting/optlater", "/meeting/optresume"):
+                    _meeting_opt_control(_u.path[len("/meeting/opt"):])
                     self.send_response(204)
                     self.end_headers()
                 elif _u.path == "/meeting/optimize":
@@ -9913,6 +10020,8 @@ a.cnl:hover{{background:var(--mu);color:#000;}}
 .mon .spk{{color:var(--mon);}}
 .sum{{margin:3px 0;padding:6px 10px;border-left:3px solid #e9c46a;border-radius:var(--r);color:#e9c46a;font-family:Georgia,'Iowan Old Style','Songti SC',serif;font-style:italic;font-size:15px;}}
 .sum b{{font-style:normal;}}
+.sumblock{{margin:4px 0 8px;padding:4px 0;border-bottom:1px dashed #e9c46a55;}}
+.sumh{{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#e9c46a;opacity:.8;margin:2px 0 4px 3px;}}
 #meeting .lang{{display:inline-flex;gap:0;}}
 #meeting .lgb{{opacity:.6;}}
 #meeting .lgb.on{{opacity:1;border-color:var(--mon);color:var(--mon);}}
@@ -10033,6 +10142,14 @@ setInterval(function(){{
     ob.title='Ask OpenClaw to correct recognition errors from context and add a one-sentence main point after each speaker segment';
     ob.addEventListener('click',function(e){{e.preventDefault();if(!ob.classList.contains('busy')){{fetch('/meeting/optimize');ob.textContent='✨ …';}}}});
     acts.appendChild(ob); optBtn=ob;
+    // While Optimize runs: postpone it (it resumes by itself once the meeting is idle) or stop it.
+    var lb=mk('a','btn','⏸ Later'); lb.href='#'; lb.style.display='none';
+    lb.title='Postpone Optimize for more urgent work — it resumes by itself when the meeting is idle. Press again to resume now.';
+    lb.addEventListener('click',function(e){{e.preventDefault();fetch(optPaused?'/meeting/optresume':'/meeting/optlater');}});
+    var sb=mk('a','btn danger','⏹ Stop'); sb.href='#'; sb.style.display='none';
+    sb.title='Stop Optimize now (corrections and points already made are kept)';
+    sb.addEventListener('click',function(e){{e.preventDefault();fetch('/meeting/optstop');}});
+    acts.appendChild(lb); acts.appendChild(sb); optLater=lb; optStop=sb;
     // Summary language(s): each toggle is on/off. Both on = summary in both
     // languages; both off = in the language the speaker used.
     var lg=mk('span','lang'); lg.title='Summary language: English and/or Chinese. Both off = as spoken.';
@@ -10071,7 +10188,12 @@ setInterval(function(){{
     acts.appendChild(nm);
     el.appendChild(acts);
   }}
-  var liveOn=false, optBtn=null, langBox=null, curEn=false, curZh=false;
+  var liveOn=false, optBtn=null, langBox=null, curEn=false, curZh=false, optLater=null, optStop=null, optPaused=false;
+  function setOptCtl(busy,paused){{
+    optPaused=!!paused;
+    if(optLater){{optLater.style.display=busy?'':'none'; optLater.textContent=paused?'▶ Resume':'⏸ Later';}}
+    if(optStop) optStop.style.display=busy?'':'none';
+  }}
   function setLang(en,zh,send){{
     curEn=!!en; curZh=!!zh;
     if(langBox) langBox.querySelectorAll('.lgb').forEach(function(b){{b.classList.toggle('on',b.dataset.l==='en'?curEn:curZh);}});
@@ -10083,6 +10205,7 @@ setInterval(function(){{
   window._meetingUpdate=function(m){{
     liveOn=!!(m&&m.monitoring);
     if(m&&m.opt_en!==undefined) setLang(m.opt_en,m.opt_zh,false);
+    if(m) setOptCtl(!!m.optimizing,!!m.opt_paused);
     if(optBtn&&m){{
       optBtn.classList.toggle('busy',!!m.optimizing);
       var om=m.opt_msg||'';
@@ -10113,8 +10236,9 @@ setInterval(function(){{
   // for a while after it finishes (counts, language, a few example corrections).
   function renderOpt(o){{
     mtx.hidden=false; mtx.textContent='';
+    setOptCtl(o.busy,o.paused);
     var t=mk('div',null,null);
-    t.appendChild(mk('b','who',o.busy?('✨ Optimizing notes — '+(o.step||'working')+(o.n?(' (batch '+Math.min(o.i+1,o.n)+'/'+o.n+')'):'')+'…')
+    t.appendChild(mk('b','who',o.paused?('⏸ Optimization postponed — resumes when the meeting is idle ('+o.fixes+' corrections so far)'):o.step==='Stopped'?('⏹ '+o.msg):o.busy?('✨ Optimizing notes — '+(o.step||'working')+(o.n?(' (batch '+Math.min(o.i+1,o.n)+'/'+o.n+')'):'')+'…')
       :(o.ok?'✨ Optimized — ':'✨ Optimize failed — ')+(o.ok?(o.msg||'done'):(o.msg||''))));
     mtx.appendChild(t);
     var pct=o.busy?(o.n?Math.round((o.i/(o.n+1))*100):5):100;

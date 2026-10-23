@@ -1,5 +1,30 @@
 # Changelog
 
+## [3.29.6] — 2026-10-22
+
+### Added
+
+- **Optimize can be postponed or stopped.** While it runs, `⏸ Later` pauses it
+  after the request in flight (it resumes by itself once the meeting is idle —
+  Monitoring off or 30 s without speech — or on `▶ Resume`), and `⏹ Stop`
+  abandons it at once, keeping the corrections and speaker points already made.
+- **Speaker main points are grouped at the top of the log**: one block,
+  "✨ Main points", in order of appearance (first speaker at the bottom,
+  newest-first like the log), instead of rows between the speaker lines.
+
+### Fixed
+
+- **Optimize no longer dies on a long meeting.** A big edit request outlived the
+  90 s voice-chat limit and the whole run failed with an empty `TimeoutError`.
+  Requests now get 240 s and are smaller (~3,500 chars); a timed-out batch is
+  split in half and retried once, a failed whole-meeting summary no longer
+  discards the corrections, and failures name their type.
+- **Speaker-name review fired constantly** (51 times in one session on phrases
+  like "我是"): it now runs only for a speaker with no name yet, at most every
+  30 s, and not while Optimize is working.
+- **New meeting now clears the meeting lines from the dashboard log** (it only
+  cleared the notes), and stops a running Optimize.
+
 ## [3.29.5] — 2026-10-22
 
 ### Added
