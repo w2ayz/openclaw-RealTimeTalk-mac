@@ -3,6 +3,8 @@
 #
 # Steps:
 #   1. Verify Homebrew dependencies (portaudio, ffmpeg, node)
+#   1.5 Offer BlackHole 2ch (optional virtual audio device: lets Monitoring /
+#      meeting notes mix the mic with computer audio — calls, videos — for Muse)
 #   2. Resolve the Edge TTS skill (first TTS fallback) and prepare its node deps
 #   3. Create Python venv and install dependencies
 #   4. STT keys/engine (OpenAI / Gemini / Muse; menu [1]-[6]), TTS keys/engine
@@ -53,6 +55,50 @@ for pkg in portaudio ffmpeg node hidapi; do
         brew install "$pkg"
     fi
 done
+echo
+
+# ── 1.5. BlackHole 2ch (optional) ────────────────────────────────────────────
+# A free virtual audio device. RealTimeTalk's "Call audio" setting (Monitoring →
+# Meeting Notes) mixes it with the microphone, so the transcriber hears BOTH you
+# and whatever the computer plays (Zoom / Meet / Teams, YouTube, …) — digitally,
+# not through the room. Not required: without it RTT just hears a call through
+# the mic like any other sound.
+
+echo "Checking BlackHole (optional — mic + computer-audio capture for meetings)..."
+if brew list --cask blackhole-2ch >/dev/null 2>&1 || \
+   system_profiler SPAudioDataType 2>/dev/null | grep -qi "blackhole"; then
+    green "  ✓ BlackHole 2ch installed"
+    BLACKHOLE_READY=1
+else
+    cat <<'BH_EOF'
+  BlackHole 2ch is a free virtual audio device. With it, RealTimeTalk can MIX
+  your microphone with online audio (Zoom/Meet/Teams calls, YouTube, …) and send
+  both to the speech engine for live transcription and meeting notes.
+  Without it everything still works — RTT just hears a call only through the
+  microphone. Installing needs your admin password; macOS may ask you to restart.
+BH_EOF
+    BLACKHOLE_READY=0
+    if [ -t 0 ]; then
+        read -r -p "  Install BlackHole 2ch now? [y/N] " _bh_ans
+    else
+        _bh_ans="n"
+    fi
+    case "$_bh_ans" in
+        [yY]*)
+            if brew install --cask blackhole-2ch; then
+                green "  ✓ BlackHole 2ch installed (restart macOS if it doesn't show up in Audio MIDI Setup)"
+                BLACKHOLE_READY=1
+            else
+                yellow "  → BlackHole install failed — continuing without it. Retry later: brew install --cask blackhole-2ch"
+            fi ;;
+        *)  yellow "  → Skipped. Install later with: brew install --cask blackhole-2ch" ;;
+    esac
+fi
+if [ "${BLACKHOLE_READY:-0}" = "1" ]; then
+    yellow "  One manual step remains (macOS can't be scripted for this): open Audio MIDI Setup,"
+    yellow "  click + → Create Multi-Output Device, tick your speakers/headphones AND BlackHole 2ch,"
+    yellow "  then set it as the sound output (or Zoom's speaker). Details: DEPLOYMENT.md §7.5"
+fi
 echo
 
 # ── 2. Edge TTS skill (first TTS fallback after ElevenLabs) ──────────────────

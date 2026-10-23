@@ -1,5 +1,39 @@
 # Changelog
 
+## [3.29.5] — 2026-10-22
+
+### Added
+
+- **Call audio (BlackHole): mix the mic with computer audio for Muse.** While
+  Monitoring, a loopback input (`Call audio` selector in Meeting Notes) is
+  mixed with the microphone before the gate/NS chain, so Zoom/Meet/Teams or
+  YouTube audio and your own voice reach the transcriber digitally instead of
+  through the room. Defaults to **BlackHole 2ch** when installed; "off" is
+  remembered (`device_prefs.json` → `call_audio_device_name`). Installer step
+  1.5 offers `brew install --cask blackhole-2ch`; README and DEPLOYMENT §7.5
+  document the Multi-Output Device setup, verification and troubleshooting.
+- **Optimize progress in the live box**: step, batch, progress bar, counts
+  (lines, segments, corrections, speaker points, meeting summary, summary
+  language) and example corrections, kept ~25 s after it finishes.
+- **Unpunctuated speech is punctuated.** The live box pushes to the log at
+  ~3 lines even with no full stops (clause break, else a word boundary), and
+  OpenClaw then adds punctuation and sentence breaks to those lines without
+  changing any word (words-only check; raw text kept).
+- **Sentence re-flow**: an opening fragment that continues the previous line is
+  moved onto its end and lower-cased, so lines start at sentence starts.
+- Proper English capitalization on every line (sentence starts, "I").
+
+### Changed
+
+- Meeting Notes panel: one-line button row (✨ Optimize · EN · 中文 · 🔎 Names ·
+  ⬇ .md · Call audio · New meeting), a short parenthetical beside the title
+  instead of the intro paragraph.
+- Optimize notes can be pressed again at any time (v3.29.4 behaviour kept).
+
+### Fixed
+
+- `/call-audio` routes were unreachable (registered under `/meeting/`).
+
 ## [3.29.4] — 2026-10-22
 
 ### Changed
