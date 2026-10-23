@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.29.7] — 2026-10-23
+
+### Fixed
+
+- **A false "Hey Jarvis" no longer ends Monitoring.** When a mis-heard wake
+  phrase started the confirmation countdown and it ran out, the daemon went to
+  sleep and switched Monitoring off mid-meeting. If Monitoring is on and
+  someone has spoken in the last 30 s, the false wake is now dropped
+  ("False wake ignored — Monitoring continues") and notes carry on. With no
+  speech for 30 s the old behaviour (sleep) still applies.
+
 ## [3.29.6] — 2026-10-22
 
 ### Added

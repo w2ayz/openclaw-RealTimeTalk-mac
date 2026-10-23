@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.29.6"
+__version__ = "3.29.7"
 
 import argparse
 import asyncio
@@ -6053,6 +6053,16 @@ class BaseVoiceSession:
             if not deadline or self._active:
                 continue
             if _nw.time() < deadline:
+                continue
+            if self._monitoring and not _meeting_idle():
+                # A false "Hey Jarvis" during a live meeting: people are still
+                # talking, so drop the pending wake and keep taking notes
+                # rather than sleeping and killing Monitoring. With no speech
+                # for MEETING_IDLE_SECS the normal sleep path below applies.
+                log.info("Name-wake window elapsed during active Monitoring — false wake, staying in Monitoring")
+                _log_entry("system", "False wake ignored — Monitoring continues")
+                _name_wake_deadline[0] = 0.0
+                self._pending_wake_confirm = False
                 continue
             log.info("Name-wake window elapsed with no match — back to Sleeping Mode")
             _log_entry("system", f"No \"{AGENT_NAME}\" within {int(NAME_WAKE_TIMEOUT)}s — back to sleep")
