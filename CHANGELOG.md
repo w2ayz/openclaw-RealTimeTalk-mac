@@ -1,5 +1,40 @@
 # Changelog
 
+## [3.29.9] — 2026-11-13
+
+### Changed
+
+- **"Call audio" is now "Mixed Input".** The Meeting Notes dropdown, its tooltip,
+  log lines and the docs say what it does — mixes a second input with the mic
+  input. The saved preference key (`call_audio_device_name`) and the
+  `/call-audio` endpoints are unchanged.
+
+### Fixed
+
+- **Mixed Input can no longer double the mic input.** If the Mixed Input device is
+  also the mic input (e.g. BlackHole 2ch chosen as the microphone for a pure
+  loopback), it is **greyed out** in the dropdown (`… (is the mic input)`), the
+  daemon refuses to open it a second time (`not mixed (would double)`), and the
+  mix is re-evaluated whenever the mic input changes (closes if they now match,
+  reopens when you switch back to a real mic). `/call-audio` also reports `input`.
+- **An optional Mixed Input can no longer hang session start.** It opens in a
+  background thread with a 10 s limit (`MIXED_INPUT_OPEN_TIMEOUT_S`); on timeout
+  the session carries on mic-only (`Mixed Input open timed out`). A thread stuck
+  in CoreAudio can't be cancelled and keeps `_audio_open_lock` until it returns —
+  Restart clears it. (Seen live: transcription stalled at "listening…" with the
+  Mixed Input set to a headset whose output side was in the Multi-Output Device.)
+
+### Documentation
+
+- DEPLOYMENT.md §7.5 / README: the Multi-Output Device **must include BlackHole**
+  to create the loopback; BlackHole is both an input and an output but cannot mix
+  (RTT mixes in software); the two setups — **A. Mixed** (real mic + Mixed Input
+  = BlackHole) and **B. Pure loopback** (microphone = BlackHole, Mixed Input
+  greyed out, Owner-only/Enroll not applicable); the Primary Device /
+  Drift Correction note; the ⬇ Newest first / ⬆ Newest last log button;
+  troubleshooting rows for the stall and for doubling.
+- Pi fork v3.29.9 carries only the rename (its Mixed Input is untested).
+
 ## [3.29.8] — 2026-11-13
 
 ### Added

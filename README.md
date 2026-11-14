@@ -62,7 +62,7 @@ verbatim from the Pi version.
 | STT provider key(s) in `~/.openclaw/openclaw.json` (optional) | OpenAI (`talk.providers.openai.apiKey`, regular `sk-...` key, **not** the openai-codex OAuth profile) and/or Gemini (`talk.providers.gemini.apiKey`, `AQ....` or legacy `AIza...` from AI Studio) and/or Muse (`talk.providers.muse.apiKey`, a Meta Model API key) — any one works on its own; with none, RealTimeTalk runs TTS-only (no mic/wake-word listening — see "STT engine selection" below) |
 | [Edge TTS skill](https://github.com/w2ayz/openclaw-edge-tts) (first TTS fallback — optional) | install at the official path `~/.openclaw/workspace/skills/edge-tts/` (`npm install` in `scripts/`); the installer resolves it and prepares its deps |
 | Homebrew + portaudio + ffmpeg + node | `brew install portaudio ffmpeg node`     |
-| BlackHole 2ch (optional — mix computer audio with the mic for meeting notes) | `brew install --cask blackhole-2ch` — see "Meeting notes & call audio" below |
+| BlackHole 2ch (optional — mix computer audio with the mic for meeting notes) | `brew install --cask blackhole-2ch` — see "Meeting notes & Mixed Input" below |
 | `hidapi` (only for Radio Mode's AIOC hardware-revision detection — cosmetic, everything else works without it) | `brew install hidapi` |
 | Python 3.9+                 | system Python or `brew install python`     |
 | A microphone                | USB mic, Bluetooth headset, or iPhone via Continuity Camera |
@@ -213,7 +213,7 @@ different location works too, but this is what the rest of the OpenClaw
 setup expects.)
 
 The installer:
-1. `brew install`s portaudio, ffmpeg, node (skipped if already present), and offers **BlackHole 2ch** (optional — see "Meeting notes & call audio")
+1. `brew install`s portaudio, ffmpeg, node (skipped if already present), and offers **BlackHole 2ch** (optional — see "Meeting notes & Mixed Input")
 2. Creates a Python venv at `./venv` and installs `sounddevice`, `websockets`, `numpy`, `zhconv`
 3. STT keys/engine, TTS keys/engine order, and STT vocabulary — a choice
    menu (OpenAI / Gemini / Muse / **choose the default engine** / keep existing / **skip for TTS-only**),
@@ -437,7 +437,7 @@ launchctl bootstrap "gui/$UID_VAL" ~/Library/LaunchAgents/ai.openclaw.realtimeta
 
 ---
 
-## Meeting notes & call audio (Monitoring + BlackHole)
+## Meeting notes & Mixed Input (Monitoring + BlackHole)
 
 **Monitor** turns RealTimeTalk into a meeting note-taker: everything said is
 transcribed live, with Muse's diarization each speaker is labelled (and named
@@ -448,22 +448,33 @@ speaker, in English and/or 中文) and a **⬇ .md** download that opens with a
 whole-meeting summary (date, time, participants, key concepts, key facts,
 decisions, action items).
 
-**BlackHole 2ch** (free virtual audio device) lets it capture more than the
-microphone. With it installed, the **Call audio** setting — which defaults to
-BlackHole 2ch — **mixes the microphone with whatever the computer plays**
-(Zoom / Meet / Teams, YouTube, …) and sends both to Muse, digitally rather than
-through the room. Without it, Monitoring is mic-only.
+**BlackHole 2ch** (free virtual audio device, both an input and an output) lets
+it capture more than the microphone. BlackHole can't mix by itself — RealTimeTalk's
+**Mixed Input** setting (defaults to BlackHole 2ch once installed) **mixes the
+microphone with whatever the computer plays** (Zoom / Meet / Teams, YouTube, …)
+and sends both to Muse, digitally rather than through the room. Without it,
+Monitoring hears the mic input only.
 
 ```bash
 brew install --cask blackhole-2ch      # or accept the installer's offer
 ```
 
 Then, once: *Audio MIDI Setup* → **+** → *Create Multi-Output Device* → tick your
-speakers/headphones **and** BlackHole 2ch (speakers primary), and select it as the
-sound output (or as Zoom's speaker). Use headphones to avoid echo. Full steps,
-a verification check, and troubleshooting are in
+speakers/headphones **and** BlackHole 2ch (**the Multi-Output Device must include
+BlackHole — that creates the loopback**; speakers primary), and select it as the
+sound output (or as Zoom's speaker). Use headphones to avoid echo. Then pick one:
+
+- **Mixed (your voice + the computer's audio):** microphone = your real mic,
+  Meeting Notes → **Mixed Input** = BlackHole 2ch.
+- **Pure loopback (computer audio only):** microphone = BlackHole 2ch. **Mixed
+  Input** then shows BlackHole greyed out (*is the mic input*) — it is already the
+  input and mixing it again would double it. Owner-only / Enroll don't apply in
+  Monitoring.
+
+Full steps, a verification check, and troubleshooting are in
 [DEPLOYMENT.md §7.5](DEPLOYMENT.md). Mac only; transcribing a call may need the
-other participants' consent.
+other participants' consent. The dashboard's **⬇ Newest first / ⬆ Newest last**
+button flips the log between newest-on-top and a normal-document order.
 
 ---
 

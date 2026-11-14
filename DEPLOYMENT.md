@@ -393,7 +393,7 @@ Voice ID is optional; omitting it leaves speaker verification disabled
    ```
 4. Confirm mic/speaker on the Calibrate page (`/calibration`) show real
    device names, not `device #N` or a device you've since disconnected
-5. (Optional — meeting notes with call audio, §7.5) With BlackHole installed, `curl -s localhost:19000/call-audio` lists it under `devices` and shows `"active": true`
+5. (Optional — meeting notes with a Mixed Input, §7.5) With BlackHole installed, `curl -s localhost:19000/call-audio` lists it under `devices` and shows `"active": true`
 6. If you built the wrapper: `ps -o ppid= -p $(pgrep -f RealTimeTalk-daemon.py)` should show `RealTimeTalk`'s PID as the parent, not `1` (launchd) directly
 
 ---
@@ -422,26 +422,28 @@ docstring for what's and isn't supported (notably: no Digirig Mobile).
 
 ---
 
-## 7.5. Meeting notes with call audio (optional — BlackHole)
+## 7.5. Meeting notes with a Mixed Input (optional — BlackHole)
 
 **What it's for.** Monitoring mode is a meeting note-taker: everything said is
 transcribed (with Muse's speaker diarization, each speaker is labelled and can
 be named), nothing is routed to your agent, and the notes download as Markdown.
-By default RealTimeTalk only hears what the **microphone** hears, so a Zoom call
-or a YouTube video is picked up second-hand through the room — faint, echoey,
-and only if your speakers are on. **BlackHole 2ch** fixes that: it's a virtual
-audio cable. RealTimeTalk's **Call audio** setting mixes it with the mic, so
-Muse receives *your voice and the online audio together*, digitally.
+By default RealTimeTalk only hears what its **microphone input** hears, so a Zoom
+call or a YouTube video is picked up second-hand through the room — faint,
+echoey, and only if your speakers are on. **BlackHole 2ch** fixes that: it's a
+virtual audio cable (both an input and an output device — whatever is played to
+it comes back out of its input side). BlackHole itself cannot mix; RealTimeTalk's
+**Mixed Input** setting does the mixing in software, adding a second input to the
+mic so Muse receives *your voice and the computer's audio together*, digitally.
 
 ```
  Zoom / browser / any app ──► Multi-Output Device ──┬─► speakers / headphones (you still hear it)
-                                                    └─► BlackHole 2ch ─► RTT "Call audio" ─┐
- Your microphone ──────────────────────────────────────────────────────────────────────────┴─► mix ─► Muse
+                                                    └─► BlackHole 2ch ─► RTT "Mixed Input" ─┐
+ Your microphone ───────────────────────────────────────────────────────────────────────────┴─► mix ─► Muse
 ```
 
 The mix happens **only while Monitoring is on**, and only the mixed stream goes
 to the transcriber — nothing from a call is ever sent to your agent. Without
-BlackHole, Monitoring still works exactly as before (mic only).
+BlackHole, Monitoring still works exactly as before (mic input only).
 
 **One-time setup**
 
@@ -451,24 +453,46 @@ BlackHole, Monitoring still works exactly as before (mic only).
 2. **Create a Multi-Output Device** (macOS can't script this). Open
    *Audio MIDI Setup* (Spotlight, or Applications → Utilities) → click **+**
    (bottom left) → **Create Multi-Output Device**. Tick **Use** for your real
-   speakers/headphones **and** for **BlackHole 2ch**; make the speakers/headphones
-   the *Primary Device*, and tick *Drift Correction* on the BlackHole row only.
+   speakers/headphones **and** for **BlackHole 2ch**. **The Multi-Output Device
+   must include BlackHole 2ch — that is what creates the audio loopback.** Make
+   the speakers/headphones the *Primary Device* (the clock source), and tick
+   *Drift Correction* on the BlackHole row only. (If BlackHole is the Primary
+   Device instead, the real speakers/headphones then need Drift Correction, and
+   macOS may grey that box out — long meetings can crackle or drift.)
 3. **Send the computer's sound to it**: System Settings → Sound → Output →
    *Multi-Output Device*, or pick it as the speaker inside Zoom/Meet/Teams. Keep
    Zoom's **microphone** set to your real mic. (macOS disables the volume keys
    for a Multi-Output Device — set volume in the app or on the headset.)
 4. **Use headphones** if you can. With open speakers, the call also leaks into
    the mic and reaches Muse twice, a fraction of a second apart.
-5. **In RealTimeTalk**: open the dashboard → turn on **Monitor** → the Meeting
-   Notes panel's **Call audio** dropdown. It **defaults to BlackHole 2ch** as soon
-   as BlackHole is installed (restart the daemon once after installing it); choose
-   *Call audio: off* to go back to mic-only. The choice is saved in
-   `~/.openclaw/workspace/device_prefs.json` (`call_audio_device_name`).
+5. **In RealTimeTalk, choose how it listens to BlackHole** — one of two setups:
+
+   | Setup | Microphone (Calibrate page / Audio Devices) | Meeting Notes → **Mixed Input** | Hears |
+   |---|---|---|---|
+   | **A. Mixed** | your real mic | **BlackHole 2ch** | your voice **and** the computer's audio |
+   | **B. Pure loopback** | **BlackHole 2ch** | greyed out — `Mixed Input: BlackHole 2ch (is the mic input)`; shows *off* | the computer's audio only |
+
+   In **Setup A**, open the dashboard → turn on **Monitor** → in the Meeting Notes
+   panel's **Mixed Input** dropdown choose **BlackHole 2ch**. It **defaults to
+   BlackHole 2ch** as soon as BlackHole is installed (restart the daemon once
+   after installing it); choose *Mixed Input: off* to go back to the mic input
+   alone. The choice is saved in `~/.openclaw/workspace/device_prefs.json`
+   (`call_audio_device_name`).
+
+   In **Setup B** (BlackHole already chosen as the microphone), BlackHole is
+   **greyed out in the Mixed Input dropdown** because it is already the input:
+   mixing it in again would add the same audio to itself (doubled, slightly
+   offset, clipping). Nothing to choose; RTT skips the mix automatically and logs
+   `Mixed Input 'BlackHole 2ch' is already the mic input — not mixed`. Switch the
+   microphone back to a real mic and the saved Mixed Input is restored on its own.
+   In Setup B, **Owner-only / voice enrollment does not apply**: Monitoring
+   records every speaker, and a loopback carries speaker audio rather than a
+   person, so there is nothing to enroll.
 
 **Check it works.** Play any audio, then:
 `curl -s --max-time 3 http://localhost:19000/levels` — the first number in each
 `data:` line should jump when the audio plays (and `curl -s localhost:19000/call-audio`
-should show `"active": true`). Log line: `Call audio on: BlackHole 2ch (2 ch) — mixed into the mic while Monitoring`.
+should show `"active": true` (Setup A; in Setup B it stays `false` by design, because the mic input already is BlackHole)). Log line: `Mixed Input on: BlackHole 2ch (2 ch) — mixed into the mic while Monitoring`.
 
 **Good to know**
 
@@ -580,10 +604,11 @@ workspace fresh every session, so this takes effect on the next one.
 | Daemon exits with signal 11 (segfault), auto-restarts via launchd | Known failure class from concurrent PortAudio stream operations — should be fixed as of v3.9.1 (see CHANGELOG), but if you hit a new one, check `/tmp/openclaw/realtimetalk.log` around the crash for what else was happening (Monitor/EchoTest toggling, device hot-plug) and report it. |
 | `import hid` fails / AIOC shows generic name instead of "AIOC v1.2+" | `DYLD_LIBRARY_PATH` isn't reaching the process. Confirm `brew install hidapi` succeeded, confirm the plist's `EnvironmentVariables` includes `DYLD_LIBRARY_PATH`, and confirm you reloaded via bootout+bootstrap, not kickstart. Cosmetic only — nothing else depends on `hid`. |
 | Speaker/mic panel shows a device you disconnected | Should self-correct within ~2 seconds (the Calibrate page polls and re-resolves by name against a fresh device list as of v3.9.1). If it doesn't, restart the daemon. |
-| **Call audio** dropdown has no BlackHole 2ch | BlackHole isn't installed, or macOS needs a restart after installing it (§7.5). Check with Audio MIDI Setup. After it appears, restart the daemon so RTT re-reads the device list. |
-| Call audio is on but a video/call isn't transcribed | Nothing is reaching BlackHole: confirm the app is *playing*, that macOS (or the app's speaker setting) is set to the **Multi-Output Device**, and that **BlackHole 2ch is ticked** in it (§7.5 step 2–3). Watch `curl -s --max-time 3 localhost:19000/levels` while it plays. |
+| **Mixed Input** dropdown has no BlackHole 2ch | BlackHole isn't installed, or macOS needs a restart after installing it (§7.5). Check with Audio MIDI Setup. After it appears, restart the daemon so RTT re-reads the device list. |
+| Mixed Input is on but a video/call isn't transcribed | Nothing is reaching BlackHole: confirm the app is *playing*, that macOS (or the app's speaker setting) is set to the **Multi-Output Device**, and that **BlackHole 2ch is ticked** in it (§7.5 step 2–3). Watch `curl -s --max-time 3 localhost:19000/levels` while it plays. |
 | Can't hear the call after switching to the Multi-Output Device | Your speakers/headphones aren't ticked in it, or aren't its Primary Device. Fix in Audio MIDI Setup (§7.5 step 2). Volume keys don't work on a Multi-Output Device — use the app's or headset's volume. |
-| Call audio appears twice / echoey in the notes | Open speakers are leaking into the mic *and* BlackHole is mixed in. Use headphones, or set Call audio to *off*. |
+| Mixed Input appears twice / echoey in the notes | Open speakers are leaking into the mic *and* BlackHole is mixed in. Use headphones, or set Mixed Input to *off*. (BlackHole as both the microphone *and* the Mixed Input can't happen as of v3.29.9 — it's greyed out.) |
+| Transcription hangs at "listening…" right after pressing Monitor with a Mixed Input set | Opening the optional Mixed Input can hang in CoreAudio (seen when the device's output side is already in the Multi-Output Device). As of v3.29.9 RTT gives up after 10 s and carries on mic-only (log: `Mixed Input open timed out`). If it ever stays stuck, press **Restart**. |
 | Mic never picks up audio | Check mic permission was actually granted (§5) — `tccutil reset Microphone ai.openclaw.realtimetalk` and re-launch if you're unsure, then check System Settings → Privacy & Security → Microphone. |
 | `sd.rec()`/enrollment records from the wrong device | Fixed as of v3.9.1 — update if you're on an older commit. |
 

@@ -58,7 +58,7 @@ done
 echo
 
 # ── 1.5. BlackHole 2ch (optional) ────────────────────────────────────────────
-# A free virtual audio device. RealTimeTalk's "Call audio" setting (Monitoring →
+# A free virtual audio device. RealTimeTalk's "Mixed Input" setting (Monitoring →
 # Meeting Notes) mixes it with the microphone, so the transcriber hears BOTH you
 # and whatever the computer plays (Zoom / Meet / Teams, YouTube, …) — digitally,
 # not through the room. Not required: without it RTT just hears a call through

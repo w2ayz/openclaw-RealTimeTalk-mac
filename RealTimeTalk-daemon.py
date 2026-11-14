@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.29.8"
+__version__ = "3.29.9"
 
 import argparse
 import asyncio
@@ -3685,6 +3685,7 @@ def _save_device_prefs(output_name: str = None, input_name: str = None, call_aud
 # chain, so remote voices get speaker labels like anyone else.
 _call_audio: dict = {"name": "", "stream": None, "buf": bytearray(),
                      "lock": _threading.Lock()}
+MIXED_INPUT_OPEN_TIMEOUT_S = 10              # give up opening the optional Mixed Input after this
 CALL_AUDIO_MAX_BUF = SAMPLE_RATE * 2          # keep ≤ 1 s of int16 mono (clock drift guard)
 
 def _call_audio_cb(indata, frames, time_info, status):
@@ -3724,7 +3725,12 @@ def _call_audio_open(name: str) -> tuple:
     """Open the loopback input `name`. Returns (ok, message)."""
     _call_audio_close()
     if not name:
-        return True, "Call audio off — microphone only"
+        return True, "Mixed Input off — microphone only"
+    if name == _current_input_device_name():
+        # The mic input IS this device (e.g. BlackHole used as a pure loopback
+        # input): mixing it in again would add the same audio to itself.
+        log.info("Mixed Input %r is already the mic input — not mixed (would double)", name)
+        return True, f"{name} is already the mic input — not mixed"
     idx = _resolve_device_by_name(name, "input")
     if idx is None:
         return False, f"Input device {name!r} not found"
@@ -3735,10 +3741,10 @@ def _call_audio_open(name: str) -> tuple:
                                 blocksize=DEVICE_BLOCKSIZE, callback=_call_audio_cb, device=idx)
             st.start()
         _call_audio["stream"] = st
-        log.info("Call audio on: %s (%d ch) — mixed into the mic while Monitoring", name, ch)
-        return True, f"Call audio: {name}"
+        log.info("Mixed Input on: %s (%d ch) — mixed into the mic while Monitoring", name, ch)
+        return True, f"Mixed Input: {name}"
     except Exception as e:
-        log.warning("Call audio open failed for %r: %s", name, e)
+        log.warning("Mixed Input open failed for %r: %s", name, e)
         return False, f"Could not open {name!r}: {e}"
 
 def _call_audio_set(name: str) -> tuple:
@@ -3760,7 +3766,7 @@ def _call_audio_load() -> None:
     for d in (_query_devices_fresh() or []):
         if d.get("max_input_channels", 0) > 0 and d["name"].lower().startswith("blackhole"):
             _call_audio["name"] = d["name"]
-            log.info("Call audio defaulting to %s", d["name"])
+            log.info("Mixed Input defaulting to %s", d["name"])
             return
 
 def _call_audio_ensure() -> None:
@@ -6886,10 +6892,21 @@ class BaseVoiceSession:
             in_stream.start()
         self._mic_stream_ref[0] = in_stream
         _last_mic_cb[0] = _rt.time()   # seed so watchdog doesn't fire immediately
+        # Mixed Input is optional: a CoreAudio open that never returns (seen live
+        # on a headset whose output side was in the Multi-Output Device) must not
+        # keep the session from starting. Bound it; on timeout carry on mic-only.
+        # The stuck worker thread cannot be cancelled and keeps _audio_open_lock
+        # until it returns, so later stream changes may wait — a Restart clears it.
         try:
-            _call_audio_ensure()
+            await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(None, _call_audio_ensure),
+                timeout=MIXED_INPUT_OPEN_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            log.warning("Mixed Input open timed out after %ds — continuing with the mic only",
+                        MIXED_INPUT_OPEN_TIMEOUT_S)
+            _log_entry("system", "Mixed Input did not open in time — using the mic only.")
         except Exception as e:
-            log.warning("Call audio unavailable: %s", e)
+            log.warning("Mixed Input unavailable: %s", e)
 
     def _close_mic_stream(self):
         s = self._mic_stream_ref[0]
@@ -7522,6 +7539,13 @@ def _switch_mic_stream(session, new_idx: int) -> None:
             _last_mic_cb[0] = _t.time()
             log.info("Mic stream switched to device %d OK%s", new_idx,
                      " (retry)" if _attempt == 2 else "")
+            try:
+                # The call-audio mix must never duplicate the mic input: re-evaluate
+                # (closes it if the new input is the call device, reopens it if not).
+                _call_audio_close()
+                _call_audio_ensure()
+            except Exception as _e:
+                log.warning("Mixed Input re-evaluation after mic switch failed: %s", _e)
             _log_entry("system", "Mic switched.")
             break
         except Exception as e:
@@ -7994,6 +8018,7 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                     _fresh = _query_devices_fresh() or []
                     _send_json(self, 200, {
                         "current": _call_audio["name"],
+                        "input": _current_input_device_name(),
                         "active": _call_audio["stream"] is not None,
                         "devices": [d["name"] for d in _fresh if d.get("max_input_channels", 0) > 0]})
                 elif _u.path == "/call-audio/set":
@@ -10244,13 +10269,16 @@ setInterval(function(){{
     var dl=mk('a','btn','⬇ .md'); dl.href='/meeting/download?fmt=md'; dl.title='Download the notes as Markdown'; acts.appendChild(dl);
     // Call audio: mix a loopback input (default BlackHole 2ch) with the mic while Monitoring.
     var sel=document.createElement('select'); sel.className='casel';
-    sel.title='Call audio: a loopback input (e.g. BlackHole 2ch) mixed with the mic while Monitoring, to capture a call or video digitally. Off = microphone only.';
+    sel.title='Mixed Input: a second input (e.g. BlackHole 2ch, carrying computer audio such as a call or video) mixed with the mic input while Monitoring. Off = the mic input alone.';
     function fillCa(){{
       fetch('/call-audio').then(function(r){{return r.json();}}).then(function(d){{
         sel.textContent='';
-        var o0=document.createElement('option'); o0.value=''; o0.textContent='Call audio: off'; sel.appendChild(o0);
-        d.devices.forEach(function(n){{var o=document.createElement('option'); o.value=n; o.textContent='Call: '+n; sel.appendChild(o);}});
-        sel.value=d.current||'';
+        var o0=document.createElement('option'); o0.value=''; o0.textContent='Mixed Input: off'; sel.appendChild(o0);
+        d.devices.forEach(function(n){{var o=document.createElement('option'); o.value=n; o.textContent='Mixed Input: '+n;
+          // Greyed out when it is already the mic input (a loopback input needs no mixing; it would double).
+          if(n===d.input){{o.disabled=true;o.textContent+=' (is the mic input)';}}
+          sel.appendChild(o);}});
+        sel.value=(d.current&&d.current!==d.input)?d.current:'';
         sel.classList.toggle('on',!!d.active);
       }}).catch(function(){{}});
     }}
@@ -10258,6 +10286,7 @@ setInterval(function(){{
       fetch('/call-audio/set?name='+encodeURIComponent(sel.value)).then(function(r){{return r.json();}}).then(function(d){{sel.title=d.msg;sel.classList.toggle('on',!!d.ok&&!!sel.value);}}).catch(function(){{}});
     }});
     acts.appendChild(sel); fillCa();
+    setInterval(function(){{if(document.activeElement!==sel) fillCa();}},5000);
     var nm=mk('a','btn danger','New meeting'); nm.href='/meeting/clear'; nm.title='Clear all notes and speaker names';
     nm.addEventListener('click',function(e){{if(!confirm('Clear all meeting notes and speaker names?')) e.preventDefault();}});
     acts.appendChild(nm);
