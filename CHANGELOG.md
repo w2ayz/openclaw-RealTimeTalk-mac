@@ -1,5 +1,30 @@
 # Changelog
 
+## [3.29.8] — 2026-11-13
+
+### Added
+
+- **Log order toggle.** A new header button (`⬇ Newest first` / `⬆ Newest last`)
+  flips the dashboard log between newest-on-top and a normal-document order with
+  the newest at the bottom. The choice is remembered per browser
+  (`localStorage`); in newest-last mode the view follows new lines only while
+  you are already at the bottom. The "Main points" block stays on top with its
+  speakers in first-to-last order. The server still renders newest-first; the
+  page does the flip. The .md export is unchanged.
+
+### Fixed
+
+- **No false "Owner-only… accepting ALL speakers" banner while Monitoring.**
+  Owner-only is a Wake-mode gate; Monitoring records everyone and never routes
+  to the agent, so the banner (and its Enroll link) is suppressed.
+  It is also suppressed for BlackHole (loopback) inputs, which carry speaker
+  audio rather than a person.
+- **Changing the device while RTT is speaking could wedge audio.** `/device-set`
+  now interrupts TTS and waits for `speak()` to unwind before touching any
+  stream (refused with a "press Stop" message if it won't stop), and
+  `_switch_mic_stream` closes the old mic stream under `_audio_open_lock`.
+- Cross-reference: Pi fork v3.29.8 carries the toggle and banner fix (no device-switch change: Pi switches via pactl, no PortAudio streams).
+
 ## [3.29.7] — 2026-10-23
 
 ### Fixed

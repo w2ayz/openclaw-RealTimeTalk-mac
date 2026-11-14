@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.29.7"
+__version__ = "3.29.8"
 
 import argparse
 import asyncio
@@ -7493,8 +7493,9 @@ def _switch_mic_stream(session, new_idx: int) -> None:
     session._mic_stream_ref[0] = None
     try:
         if old:
-            old.stop()
-            old.close()
+            with _audio_open_lock:   # stream lifecycle ops are serialized process-wide
+                old.stop()
+                old.close()
     except Exception:
         pass
 
@@ -7572,7 +7573,12 @@ def _dashboard_dynamic(sess) -> dict:
             f'if(b)b.remove();}},5000);</script>'
         )
         _device_change_msg[0] = ""
-    elif _owner_only[0] and not _verification_available(_current_input_device_name()):
+    elif (_owner_only[0] and not _verification_available(_current_input_device_name())
+          # Owner-only is a Wake-mode gate: Monitoring records everyone (no voice
+          # check, never routed to the agent), and a loopback device such as
+          # BlackHole carries speaker audio, not a person — nothing to enroll.
+          and not (sess and sess._monitoring)
+          and "blackhole" not in _current_input_device_name().lower()):
         device_banner = (
             '<div id="dbanner" style="background:#3a1500;border:1px solid #7a3000;'
             'color:#f59e0b;padding:3px 8px;border-radius:8px;">'
@@ -9741,6 +9747,21 @@ Restart daemon after training to reload profiles.</p>
                 dev_name = _up.unquote(qs.get("name",[""])[0])
                 result   = {"ok": False, "msg": ""}
                 try:
+                    # A device change while TTS is playing used to tear streams
+                    # down under the live speak() loop (mic reads on a closed
+                    # InputStream, sd.stop()/PortAudio reinit against an active
+                    # OutputStream) and could wedge it. Cut the speech first,
+                    # exactly like the Stop button, and wait for speak() to
+                    # unwind before touching any stream.
+                    if _is_speaking[0]:
+                        import time as _tw
+                        _http_interrupt[0] = True
+                        log.info("device-set: TTS playing — interrupting before switching")
+                        _t_end = _tw.time() + 3.0
+                        while _is_speaking[0] and _tw.time() < _t_end:
+                            _tw.sleep(0.05)
+                        if _is_speaking[0]:
+                            raise RuntimeError("Still speaking — press Stop, then change the device again.")
                     # Resolve by NAME, not a raw index — confirmed live: the
                     # Audio Devices table (built from a fresh subprocess
                     # query) showed a speaker at one index, but this
@@ -10052,7 +10073,7 @@ a.cnl:hover{{background:var(--mu);color:#000;}}
 @media(min-width:900px){{body{{font-size:17px;}}#top{{padding:14px 24px 10px;}}a.btn{{font-size:13px;padding:6px 12px;}}#dp{{font-size:13px;}}#log{{padding:14px 24px;}}}}
 </style></head><body>
 <div id="top">
-<div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" id="pill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" style="margin-left:10px;" data-hint="{_hint_calibrate}">&#9999; Calibrate</a></div>
+<div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" id="pill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" style="margin-left:10px;" data-hint="{_hint_calibrate}">&#9999; Calibrate</a><a href="#" class="btn" id="orderbtn" style="margin-left:6px;" data-hint="Flip the log between newest-on-top and newest-at-bottom (like a document)">&#11015; Newest first</a></div>
 <div class="nav" id="navbar">{nav_html}</div>
 {device_panel}{device_banner}<div id="hzone" style="min-height:28px;padding:5px 10px;border-radius:8px;background:var(--sf2);border:1px solid var(--bd);color:var(--mu);font-size:15px;opacity:0;transition:opacity .15s;pointer-events:none;">&nbsp;</div></div>
 <div id="nowreading" hidden></div>
@@ -10094,6 +10115,50 @@ setInterval(function(){{
   // fragment and patching only the changed elements avoids that. Paused
   // while hovering a nav button so the hint tooltip (and the hovered
   // element itself) aren't yanked out from under the cursor mid-display.
+  // Log order toggle: the server always renders newest-first; oldest-first
+  // is produced here by reversing the entries (summary block stays on top
+  // with its own order flipped, the live banner moves to the bottom).
+  // Choice is per-browser (localStorage).
+  var oldestFirst=false;
+  try{{oldestFirst=localStorage.getItem('rttLogOrder')==='oldest';}}catch(e){{}}
+  function _kids(html){{var t=document.createElement('div');t.innerHTML=html;return Array.prototype.slice.call(t.childNodes);}}
+  window._renderLog=function(d,forceScroll){{
+    var log=document.getElementById('log');
+    if(!log||!d) return;
+    var btn=document.getElementById('orderbtn');
+    if(btn) btn.innerHTML=oldestFirst?'&#11014; Newest last':'&#11015; Newest first';
+    if(!oldestFirst){{
+      log.innerHTML=d.speaking_banner+d.rows;
+      if(forceScroll) log.scrollTop=0;
+      return;
+    }}
+    var atBottom=(log.scrollHeight-log.scrollTop-log.clientHeight)<40;
+    var rows=_kids(d.rows),head=[],body=[];
+    rows.forEach(function(n){{
+      if(n.nodeType===1&&n.classList.contains('sumblock')){{
+        var hd=n.querySelector('.sumh'),sums=Array.prototype.slice.call(n.querySelectorAll('.sum')).reverse();
+        while(n.firstChild) n.removeChild(n.firstChild);
+        if(hd) n.appendChild(hd);
+        sums.forEach(function(x){{n.appendChild(x);}});
+        head.push(n);
+      }} else body.push(n);
+    }});
+    body.reverse();
+    log.innerHTML='';
+    head.concat(body,_kids(d.speaking_banner)).forEach(function(n){{log.appendChild(n);}});
+    if(forceScroll||atBottom) log.scrollTop=log.scrollHeight;
+  }};
+  (function(){{
+    var b=document.getElementById('orderbtn');
+    if(!b) return;
+    b.addEventListener('click',function(e){{
+      e.preventDefault();
+      oldestFirst=!oldestFirst;
+      try{{localStorage.setItem('rttLogOrder',oldestFirst?'oldest':'newest');}}catch(x){{}}
+      if(window._lastFrag) window._renderLog(window._lastFrag,true); else _refresh();
+    }});
+    if(oldestFirst) setTimeout(function(){{window._forceScroll=true;_refresh();}},0);
+  }})();
   function _refresh(){{
     if(hovering) return;
     fetch('/dashboard-frag').then(function(r){{return r.json();}}).then(function(d){{
@@ -10105,8 +10170,8 @@ setInterval(function(){{
       if(dp) dp.outerHTML=d.device_panel;
       var db=document.getElementById('dbanner');
       if(db) db.outerHTML=d.device_banner;
-      var log=document.getElementById('log');
-      if(log) log.innerHTML=d.speaking_banner+d.rows;
+      window._lastFrag=d;
+      window._renderLog(d,!!window._forceScroll);window._forceScroll=false;
       if(window._meetingUpdate) window._meetingUpdate(d.meeting);
     }}).catch(function(){{}});
   }}
