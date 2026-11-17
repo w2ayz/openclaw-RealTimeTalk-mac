@@ -1,5 +1,30 @@
 # Changelog
 
+## [3.30.0] — 2026-11-17
+
+### Added
+
+- **Meeting Notes panel shows a live auto-sleep countdown with manual extend
+  buttons.** While Monitoring, the dashboard now displays "⏳ Auto-sleep in
+  MM:SS" (turns amber under 60s) plus "+5 min" / "+10 min" buttons, so you can
+  see a meeting is about to get cut off and extend it before it happens,
+  instead of discovering afterward that it stopped. New `/meeting/extend?secs=N`
+  endpoint adds `N` seconds to the *current* deadline (not a flat reset), so
+  repeated clicks stack.
+
+### Fixed
+
+- **Waking directly into Monitoring from Sleeping Mode (`/monitor/start` or
+  the dashboard's Monitor button while asleep) no longer immediately
+  re-triggers auto-sleep.** The idle clock (`_last_interaction`) wasn't reset
+  when `_pending_monitor_wake` was consumed in `main()`, so after any sleep
+  longer than `AUTO_SLEEP_SECS` (10 min), the very next wake-into-Monitoring
+  disconnected again within seconds — confirmed live: a session asleep since
+  12:43 woke into Monitoring at 13:11:42 and auto-slept again at 13:12:13,
+  logging "idle 39 min" (the gap since the *pre-sleep* last utterance, not
+  since the wake). Now resets to "now" at the point the new session actually
+  starts.
+
 ## [3.29.9] — 2026-11-13
 
 ### Changed

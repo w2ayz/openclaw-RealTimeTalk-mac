@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.29.9"
+__version__ = "3.30.0"
 
 import argparse
 import asyncio
@@ -7789,6 +7789,10 @@ def _dashboard_dynamic(sess) -> dict:
             "opt_paused": _opt_state["paused"],
             "opt_en":     _opt_state["en"],
             "opt_zh":     _opt_state["zh"],
+            # Epoch time the auto-sleep idle_watcher will disconnect Monitoring at —
+            # 0 when not monitoring. Lets the dashboard show a live countdown and
+            # offer a manual extend before the meeting gets cut off.
+            "sleep_deadline": (_last_interaction[0] + AUTO_SLEEP_SECS) if monitoring else 0,
         },
     }
 
@@ -8012,6 +8016,29 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                         _meeting_set_name(_lbl, _qs.get("name", [""])[0])
                         log.info("Meeting speaker %s named %r", _lbl, SPEAKER_NAMES.get(_lbl, ""))
                     self.send_response(204)
+                    self.end_headers()
+                elif _u.path == "/meeting/extend":
+                    # Manual extension of the auto-sleep idle clock for Monitoring —
+                    # additive against the current deadline (not a flat reset), so
+                    # repeated clicks stack instead of each one just re-granting a
+                    # fresh AUTO_SLEEP_SECS from the moment of the click.
+                    import time as _mext
+                    _sess = session_ref[0]
+                    if _sess and _sess._monitoring:
+                        try:
+                            _secs = max(30, min(3600, int(_qs.get("secs", ["300"])[0])))
+                        except ValueError:
+                            _secs = 300
+                        _now = _mext.time()
+                        _cur_deadline = _last_interaction[0] + AUTO_SLEEP_SECS
+                        _new_deadline = max(_cur_deadline, _now) + _secs
+                        _last_interaction[0] = _new_deadline - AUTO_SLEEP_SECS
+                        log.info("HTTP meeting/extend — +%ds (new deadline in %ds)",
+                                 _secs, int(_new_deadline - _now))
+                        _log_entry("system", f"Meeting extended by {_secs // 60} min")
+                        self.send_response(204)
+                    else:
+                        self.send_response(409)
                     self.end_headers()
                 elif _u.path == "/call-audio":
                     _call_audio_load()
@@ -10060,8 +10087,10 @@ a.cnl:hover{{background:var(--mu);color:#000;}}
 #meeting{{flex-shrink:0;margin:6px 14px 0;padding:10px 12px;background:var(--mb);border:1px solid var(--mon);border-radius:var(--r);font-size:14px;line-height:1.5;}}
 #meeting[hidden]{{display:none;}}
 #meeting .mh{{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--mon);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;}}
-#meeting .mp{{color:var(--tx);margin-bottom:6px;}}
+#meeting .mp{{color:var(--tx);margin-bottom:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;}}
 #meeting .mp.warn{{color:var(--bot);}}
+#meeting .mp .mctr{{font-family:'JetBrains Mono',monospace;font-weight:600;}}
+#meeting .mp .btn{{padding:3px 7px;font-size:11px;}}
 #meeting .spkrow{{display:flex;align-items:center;gap:8px;margin:4px 0;flex-wrap:wrap;}}
 #meeting .spkrow label{{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--mon);min-width:78px;}}
 #meeting input{{flex:1;min-width:120px;max-width:260px;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:5px 8px;font:inherit;font-size:14px;}}
@@ -10113,6 +10142,12 @@ setInterval(function(){{
   }});
   document.querySelectorAll('.cctr').forEach(function(el){{
     el.textContent=Math.max(0,Math.ceil(parseFloat(el.dataset.deadline)-now));
+  }});
+  document.querySelectorAll('.mctr').forEach(function(el){{
+    var left=Math.max(0,Math.ceil(parseFloat(el.dataset.deadline)-now));
+    var mm=Math.floor(left/60), ss=left%60;
+    el.textContent=mm+':'+(ss<10?'0':'')+ss;
+    el.parentElement.classList.toggle('warn',left<=60);
   }});
 }},500);
 (function(){{
@@ -10222,6 +10257,22 @@ setInterval(function(){{
       ? (m.monitoring?' (everything said is transcribed; name each speaker)':' (notes kept — download or start a new meeting)')
       : ' (transcribed, but this engine can\u2019t label speakers — use Muse)'));
     el.appendChild(hd);
+    if(m.monitoring&&m.sleep_deadline){{
+      var cr=mk('div','mp');
+      cr.appendChild(mk('span',null,'⏳ Auto-sleep in '));
+      var ct=document.createElement('span'); ct.className='mctr'; ct.dataset.deadline=m.sleep_deadline;
+      cr.appendChild(ct);
+      [[300,'+5 min'],[600,'+10 min']].forEach(function(o){{
+        var eb=mk('a','btn','⏩ '+o[1]); eb.href='#';
+        eb.title='Push the auto-sleep deadline out by '+o[1]+' from now (or from the current deadline, whichever is later)';
+        eb.addEventListener('click',function(e){{
+          e.preventDefault();
+          fetch('/meeting/extend?secs='+o[0]).then(function(){{if(window._lastFrag&&window._lastFrag.meeting) ct.dataset.deadline=window._lastFrag.meeting.sleep_deadline;}});
+        }});
+        cr.appendChild(eb);
+      }});
+      el.appendChild(cr);
+    }}
     if(m.diarized) m.speakers.forEach(function(s){{
       if(s.label==='?') return;
       var row=mk('div','spkrow');
@@ -10329,6 +10380,11 @@ setInterval(function(){{
         var c=cs[i]&&cs[i].querySelector('.cnt'); if(c) c.textContent=x.count+' utterance'+(x.count===1?'':'s');
       }});
     }}
+    // The countdown's deadline moves (idle ticking down, or jumping on
+    // extend/new speech) without the signature above changing, so refresh
+    // it on every poll regardless of whether build() just ran.
+    var mc=el.querySelector('.mctr');
+    if(mc&&m.monitoring&&m.sleep_deadline) mc.dataset.deadline=m.sleep_deadline;
   }};
   // ── Fast live feed ──────────────────────────────────────────────────────
   // The 3 s /dashboard-frag poll is far too slow for live notes, so while the
@@ -10811,6 +10867,11 @@ async def main(http_port: int, input_device=None, output_device=None,
             session._monitoring = True
             _persist_monitoring[0] = True
             _pending_monitor_wake[0] = False
+            # Reset the idle clock here too (not just in the /wake branch above) —
+            # without this, a long sleep leaves _last_interaction stale and the new
+            # session's _idle_watcher sees a huge "idle" value on its very first
+            # 30s tick, auto-sleeping Monitoring within seconds of waking into it.
+            _last_interaction[0] = __import__("time").time()
             log.info("Wake-from-sleep: session started in Monitoring (HTTP monitor)")
         session_ref[0] = session
         try:
