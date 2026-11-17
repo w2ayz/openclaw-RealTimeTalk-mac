@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.30.1"
+__version__ = "3.30.2"
 
 import argparse
 import asyncio
@@ -10280,8 +10280,6 @@ setInterval(function(){{
         eb.addEventListener('click',function(e){{e.preventDefault();applyExtend(o[0]);}});
         cr.appendChild(eb);
       }});
-      el.appendChild(cr);
-      var cu=mk('div','mp');
       var mb=mk('a','btn','−'); mb.href='#'; mb.title='Subtract the entered minutes from the auto-sleep deadline';
       var ninp=document.createElement('input'); ninp.type='number'; ninp.min='1'; ninp.max='120';
       ninp.value='5'; ninp.className='mextin'; ninp.title='Minutes to add or subtract';
@@ -10289,8 +10287,8 @@ setInterval(function(){{
       function customAmount(){{var n=parseInt(ninp.value,10);return(n>0)?n:0;}}
       mb.addEventListener('click',function(e){{e.preventDefault();var n=customAmount();if(n) applyExtend(-n*60);}});
       pb.addEventListener('click',function(e){{e.preventDefault();var n=customAmount();if(n) applyExtend(n*60);}});
-      cu.appendChild(mb); cu.appendChild(ninp); cu.appendChild(mk('span','cnt','min')); cu.appendChild(pb);
-      el.appendChild(cu);
+      cr.appendChild(mb); cr.appendChild(ninp); cr.appendChild(mk('span','cnt','min')); cr.appendChild(pb);
+      el.appendChild(cr);
     }}
     if(m.diarized) m.speakers.forEach(function(s){{
       if(s.label==='?') return;

@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.30.2] — 2026-11-17
+
+### Changed
+
+- **The custom extend/shorten input moved onto the same row as the countdown
+  and presets** (was its own line below) — "⏳ Auto-sleep in MM:SS ⏪ -10 min
+  +5 min +10 min − [n] min +" all in one `.mp` row.
+
 ## [3.30.1] — 2026-11-17
 
 ### Added
