@@ -1,5 +1,17 @@
 # Changelog
 
+## [3.30.1] — 2026-11-17
+
+### Added
+
+- **Meeting Notes auto-sleep countdown can now be revised down, not just
+  extended.** A "-10 min" preset sits alongside "+5 min"/"+10 min", and a
+  custom `[−] [minutes] [+]` control lets you type any number of minutes and
+  push the deadline either direction. `/meeting/extend?secs=N` now accepts
+  negative `N` (clamped to ±3600s) and logs "Meeting shortened by X min" vs
+  "...extended by X min" accordingly — same additive-against-current-deadline
+  math as before, just signed.
+
 ## [3.30.0] — 2026-11-17
 
 ### Added

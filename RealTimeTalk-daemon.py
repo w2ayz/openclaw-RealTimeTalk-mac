@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.30.0"
+__version__ = "3.30.1"
 
 import argparse
 import asyncio
@@ -8018,24 +8018,31 @@ def start_http_server(port: int, on_stop, session_ref: list, loop=None):
                     self.send_response(204)
                     self.end_headers()
                 elif _u.path == "/meeting/extend":
-                    # Manual extension of the auto-sleep idle clock for Monitoring —
-                    # additive against the current deadline (not a flat reset), so
-                    # repeated clicks stack instead of each one just re-granting a
+                    # Manual adjustment of the auto-sleep idle clock for Monitoring —
+                    # additive/subtractive against the CURRENT deadline (not a flat
+                    # reset), so repeated clicks (or a negative secs to revise the
+                    # session down) stack instead of each one just re-granting a
                     # fresh AUTO_SLEEP_SECS from the moment of the click.
                     import time as _mext
                     _sess = session_ref[0]
                     if _sess and _sess._monitoring:
                         try:
-                            _secs = max(30, min(3600, int(_qs.get("secs", ["300"])[0])))
+                            _secs = max(-3600, min(3600, int(_qs.get("secs", ["300"])[0])))
                         except ValueError:
                             _secs = 300
                         _now = _mext.time()
                         _cur_deadline = _last_interaction[0] + AUTO_SLEEP_SECS
                         _new_deadline = max(_cur_deadline, _now) + _secs
                         _last_interaction[0] = _new_deadline - AUTO_SLEEP_SECS
-                        log.info("HTTP meeting/extend — +%ds (new deadline in %ds)",
-                                 _secs, int(_new_deadline - _now))
-                        _log_entry("system", f"Meeting extended by {_secs // 60} min")
+                        _mins = abs(_secs) // 60
+                        if _secs > 0:
+                            log.info("HTTP meeting/extend — +%ds (new deadline in %ds)",
+                                     _secs, int(_new_deadline - _now))
+                            _log_entry("system", f"Meeting extended by {_mins} min")
+                        elif _secs < 0:
+                            log.info("HTTP meeting/extend — -%ds (new deadline in %ds)",
+                                     -_secs, int(_new_deadline - _now))
+                            _log_entry("system", f"Meeting shortened by {_mins} min")
                         self.send_response(204)
                     else:
                         self.send_response(409)
@@ -10091,6 +10098,7 @@ a.cnl:hover{{background:var(--mu);color:#000;}}
 #meeting .mp.warn{{color:var(--bot);}}
 #meeting .mp .mctr{{font-family:'JetBrains Mono',monospace;font-weight:600;}}
 #meeting .mp .btn{{padding:3px 7px;font-size:11px;}}
+#meeting .mp input.mextin{{flex:0 0 auto;width:48px;min-width:0;max-width:48px;text-align:center;padding:3px 4px;}}
 #meeting .spkrow{{display:flex;align-items:center;gap:8px;margin:4px 0;flex-wrap:wrap;}}
 #meeting .spkrow label{{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--mon);min-width:78px;}}
 #meeting input{{flex:1;min-width:120px;max-width:260px;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:5px 8px;font:inherit;font-size:14px;}}
@@ -10262,16 +10270,27 @@ setInterval(function(){{
       cr.appendChild(mk('span',null,'⏳ Auto-sleep in '));
       var ct=document.createElement('span'); ct.className='mctr'; ct.dataset.deadline=m.sleep_deadline;
       cr.appendChild(ct);
-      [[300,'+5 min'],[600,'+10 min']].forEach(function(o){{
-        var eb=mk('a','btn','⏩ '+o[1]); eb.href='#';
-        eb.title='Push the auto-sleep deadline out by '+o[1]+' from now (or from the current deadline, whichever is later)';
-        eb.addEventListener('click',function(e){{
-          e.preventDefault();
-          fetch('/meeting/extend?secs='+o[0]).then(function(){{if(window._lastFrag&&window._lastFrag.meeting) ct.dataset.deadline=window._lastFrag.meeting.sleep_deadline;}});
-        }});
+      function applyExtend(secs){{
+        fetch('/meeting/extend?secs='+secs).then(function(){{if(window._lastFrag&&window._lastFrag.meeting) ct.dataset.deadline=window._lastFrag.meeting.sleep_deadline;}});
+      }}
+      [[-600,'-10 min'],[300,'+5 min'],[600,'+10 min']].forEach(function(o){{
+        var eb=mk('a','btn',(o[0]>=0?'⏩ ':'⏪ ')+o[1]); eb.href='#';
+        eb.title=(o[0]>=0?'Push':'Pull in')+' the auto-sleep deadline by '+o[1].replace('-','')+
+          (o[0]>=0?' from now (or the current deadline, whichever is later)':' from the current deadline');
+        eb.addEventListener('click',function(e){{e.preventDefault();applyExtend(o[0]);}});
         cr.appendChild(eb);
       }});
       el.appendChild(cr);
+      var cu=mk('div','mp');
+      var mb=mk('a','btn','−'); mb.href='#'; mb.title='Subtract the entered minutes from the auto-sleep deadline';
+      var ninp=document.createElement('input'); ninp.type='number'; ninp.min='1'; ninp.max='120';
+      ninp.value='5'; ninp.className='mextin'; ninp.title='Minutes to add or subtract';
+      var pb=mk('a','btn','+'); pb.href='#'; pb.title='Add the entered minutes to the auto-sleep deadline';
+      function customAmount(){{var n=parseInt(ninp.value,10);return(n>0)?n:0;}}
+      mb.addEventListener('click',function(e){{e.preventDefault();var n=customAmount();if(n) applyExtend(-n*60);}});
+      pb.addEventListener('click',function(e){{e.preventDefault();var n=customAmount();if(n) applyExtend(n*60);}});
+      cu.appendChild(mb); cu.appendChild(ninp); cu.appendChild(mk('span','cnt','min')); cu.appendChild(pb);
+      el.appendChild(cu);
     }}
     if(m.diarized) m.speakers.forEach(function(s){{
       if(s.label==='?') return;
