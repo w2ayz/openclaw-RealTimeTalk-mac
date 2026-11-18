@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.30.2"
+__version__ = "3.30.3"
 
 import argparse
 import asyncio
@@ -422,6 +422,12 @@ _mic_gate_ref     = [500]  # mutable wrapper for MIC_GATE_PEAK, readable across 
 # ── Mac audio device helpers (CoreAudio via sounddevice + osascript) ─────────
 
 _headset_cal_loop = [False]
+_headset_cal_gen  = [0]        # bumped on every start/stop so a stale loop thread
+                                # from a previous Play-test click (sharing the same
+                                # _headset_cal_loop flag) never keeps running
+                                # alongside a newer one
+_headset_cal_stream: list = [None]  # current test-loop OutputStream so a new
+                                     # loop-start can stop the previous one immediately
 _radio_monitor_active: list = [False]  # Radio Monitor (RX loopback) run flag — same pattern as _headset_cal_loop
 _radio_monitor_out_dev: list = [None]  # output device index the monitor is currently routed to
 _radio_monitor_out_stream: list = [None]  # dedicated sd.OutputStream for the monitor's target device
@@ -9384,6 +9390,16 @@ setInterval(upd, 2000);
                 self.wfile.write(resp)
 
             elif self.path == "/speaker-cal/loop-start":
+                # Clicking Play test again while a loop is already running must not
+                # stack a second concurrent playback — stop whatever's currently
+                # playing and invalidate the old loop thread (via the generation
+                # token) before starting the new one.
+                _old_stream = _headset_cal_stream[0]
+                if _old_stream is not None:
+                    try: _old_stream.stop(); _old_stream.close()
+                    except Exception: pass
+                _headset_cal_gen[0] += 1
+                _my_gen = _headset_cal_gen[0]
                 _headset_cal_loop[0] = True
                 # Target priority mirrors Pi: Radio Mode transmitting (PTT'd,
                 # on-air) beats Monitor (play to whatever device Monitor is
@@ -9406,7 +9422,7 @@ setInterval(upd, 2000);
                     _loop_out_dev = _selected_output_device[0]
                     _loop_via = "speaker"
 
-                def _loop(tx_radio=_loop_tx_radio, out_dev=_loop_out_dev):
+                def _loop(tx_radio=_loop_tx_radio, out_dev=_loop_out_dev, my_gen=_my_gen):
                     import tempfile as _tf, time as _t2
                     # Render the test phrase once at full amplitude (gain applied live).
                     phrase = "This is an audio test. One, two, three, four, five."
@@ -9465,12 +9481,17 @@ setInterval(upd, 2000);
                                     _t2.sleep(0.8)
                                     continue
                                 raise
+                        _headset_cal_stream[0] = _stream
                         try:
-                            while _headset_cal_loop[0]:
+                            while _headset_cal_loop[0] and _headset_cal_gen[0] == my_gen:
                                 _t2.sleep(0.05)
                         finally:
                             try: _stream.stop(); _stream.close()
                             except Exception: pass
+                            # Only clear if a newer loop-start hasn't already
+                            # replaced this with its own stream reference.
+                            if _headset_cal_stream[0] is _stream:
+                                _headset_cal_stream[0] = None
                     except Exception as e:
                         log.error("Test loop error: %s", e)
                     finally:
@@ -9484,6 +9505,7 @@ setInterval(upd, 2000);
 
             elif self.path == "/speaker-cal/loop-stop":
                 _headset_cal_loop[0] = False
+                _headset_cal_gen[0] += 1
                 _html(self, 200, "<p>Loop stopped.</p>")
 
             elif self.path == "/radio-mode":
@@ -9943,6 +9965,7 @@ Restart daemon after training to reload profiles.</p>
             elif self.path == "/speaker-cal/set":
                 import json as _json
                 _headset_cal_loop[0] = False
+                _headset_cal_gen[0] += 1
                 sys_vol  = _get_system_volume()
                 sw_vol   = _cal_sw_volume
                 out_dev  = _selected_output_device[0]

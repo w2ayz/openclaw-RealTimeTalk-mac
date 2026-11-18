@@ -1,5 +1,23 @@
 # Changelog
 
+## [3.30.3] — 2026-11-18
+
+### Fixed
+
+- **Play Test could stack multiple overlapping test-audio playbacks.**
+  Clicking `/speaker-cal/loop-start` more than once spawned a new thread each
+  time with no check for one already running — each opened its own
+  `sd.OutputStream` under the (briefly-held) `_audio_open_lock`, so multiple
+  streams played concurrently sharing one `_headset_cal_loop` stop flag.
+  Ported from the Pi fork (v3.30.4), adapted to this fork's
+  `sd.OutputStream`-callback loop instead of a subprocess: a generation token
+  (`_headset_cal_gen`, bumped on every start/stop) plus a new
+  `_headset_cal_stream` reference let a new loop-start stop the previous
+  stream immediately and invalidate the old thread's loop condition before
+  starting fresh, with a compare-and-clear guard to avoid a narrow
+  clobbering race between an old thread's cleanup and a new thread's stream
+  reference.
+
 ## [3.30.2] — 2026-11-17
 
 ### Changed
