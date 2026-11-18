@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.30.3"
+__version__ = "3.30.4"
 
 import argparse
 import asyncio
@@ -8757,9 +8757,11 @@ a:hover{{text-decoration:underline;}}
   <button onclick="setCalMode('speaker')" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if not is_headset and _override else ''}">Speaker</button>
   <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
   {_voice_id_btn}
+  {_config_btn}
+</div>
+<div style="display:flex;align-items:center;gap:8px;margin:0 0 10px;flex-wrap:nowrap;overflow-x:auto;white-space:nowrap;">
   {_radio_btn}
   {_monitor_btn}
-  {_config_btn}
   {_echotest_btn}
   {_dtmf_btns}
 </div>

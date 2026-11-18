@@ -1,5 +1,15 @@
 # Changelog
 
+## [3.30.4] — 2026-11-18
+
+### Changed
+
+- **Calibration page button layout regrouped** — RTT-Config moved onto the
+  same row as Voice ID/Headset/Speaker/Auto mode; Radio, Monitor, EchoTest
+  and DTMF buttons (everything radio-related) now sit together in their own
+  single non-wrapping row below, whether Radio Mode is on or off. Ported from
+  the Pi fork (v3.30.4) to match its layout.
+
 ## [3.30.3] — 2026-11-18
 
 ### Fixed
