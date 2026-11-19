@@ -1,5 +1,19 @@
 # Changelog
 
+## [3.30.5] — 2026-11-18
+
+### Fixed
+
+- **Daemon no longer dies if the gateway is slow to start at boot** — the
+  startup `gw.connect()` retry loop only caught refused connections/`OSError`,
+  so a websocket opening-handshake timeout (gateway process up but not yet
+  answering, as happens right after a reboot) raised an uncaught
+  `TimeoutError`, the daemon exited 1, and the LaunchAgent (`KeepAlive` on
+  `Crashed` only) never restarted it. The loop now also retries on
+  `asyncio.TimeoutError` and `websockets.exceptions.WebSocketException`.
+  Confirmed live on the Mac mini after a reboot. Ported to the Pi fork
+  (v3.30.5) with the same loop.
+
 ## [3.30.4] — 2026-11-18
 
 ### Changed
