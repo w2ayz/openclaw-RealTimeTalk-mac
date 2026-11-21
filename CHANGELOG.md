@@ -1,5 +1,15 @@
 # Changelog
 
+## [3.31.4] — 2026-11-20
+
+### Added
+
+- **Bare `"<name> sleep"` voice phrase** now puts the agent to sleep, alongside
+  `"<name> go to sleep"` (exact match only). Ported from the Pi fork (PR #1),
+  which also carries a CLAUDE.md note and no other functional change here —
+  its active-state wake-phrase and timeout read-along fixes were already
+  present on Mac.
+
 ## [3.31.3] — 2026-11-20
 
 ### Changed

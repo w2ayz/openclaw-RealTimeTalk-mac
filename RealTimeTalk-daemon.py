@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.31.3"
+__version__ = "3.31.4"
 
 # Dashboard header logo: voice-bar icon + RealTimeTalk with R/T/T enlarged and
 # the version in small type. Built from __version__ so it never goes stale.
@@ -3236,7 +3236,7 @@ WAKE_PHRASES     = {"zeebot wake up", "real time talk on", "real-time talk on", 
                     # be confirmed by a generic "Hey Jarvis"/"Jarvis" that was never actually
                     # directed at it. Step 2 now requires this agent's own name, full stop —
                     # see NAME_WAKE_TIMEOUT / _name_wake_deadline for the 20s bound on that.
-SLEEP_PHRASES    = {"zeebot go to sleep", "real time talk off", "real-time talk off", "realtimetalk off"}
+SLEEP_PHRASES    = {"zeebot go to sleep", "zeebot sleep", "real time talk off", "real-time talk off", "realtimetalk off"}
 
 # Wake confirmation — affirmative responses accepted after the agent asks
 # "<AGENT_NAME>?" (echoes its own name back, rather than a generic "Yes?",
@@ -11219,6 +11219,7 @@ if __name__ == "__main__":
     if args.wake_phrase:
         WAKE_PHRASES.add(f"{_agent_name_lc} wake up")  # keep name-derived phrase alongside custom one
     SLEEP_PHRASES = {f"{_agent_name_lc} go to sleep",
+                     f"{_agent_name_lc} sleep",
                      "real time talk off", "real-time talk off", "realtimetalk off"}
 
     _n = _agent_name_lc
