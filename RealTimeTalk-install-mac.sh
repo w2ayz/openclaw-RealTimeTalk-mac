@@ -15,6 +15,8 @@
 #   5. List audio devices and prompt user for input + output device indices,
 #      agent name, and wake phrase; optionally download the Voice ID
 #      speaker-embedding model
+#   5.6 Build the mic-permission wrapper app (RealTimeTalk.app) — required;
+#      pass --no-wrapper to skip it (bare python3 LaunchAgent, not recommended)
 #   6. Render and install the LaunchAgent plist
 #   7. Load the agent
 #
@@ -23,6 +25,14 @@
 # whole installer.
 
 set -euo pipefail
+
+NO_WRAPPER=false
+for _arg in "$@"; do
+    case "$_arg" in
+        --no-wrapper) NO_WRAPPER=true ;;
+        *) echo "Unknown option: $_arg (supported: --no-wrapper)" >&2; exit 2 ;;
+    esac
+done
 
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SKILL_DIR/venv"
@@ -282,21 +292,22 @@ USE_WRAPPER=false
 if [[ -x "$WRAPPER_BIN" ]]; then
     green "  ✓ mic-permission wrapper already built at $WRAPPER_APP"
     USE_WRAPPER=true
+elif [[ "$NO_WRAPPER" == "true" ]]; then
+    yellow "  → --no-wrapper: skipping. The LaunchAgent will run bare python3, so mic"
+    yellow "    access may fail to prompt or persist. Build later with:"
+    yellow "    bash $SKILL_DIR/RealTimeTalk-build-wrapper-mac.sh"
 else
-    echo "  A signed wrapper app gives the daemon a stable identity for macOS's"
-    echo "  mic-permission (TCC) system, so access prompts reliably and persists"
+    echo "  Building the signed wrapper app: it gives the daemon a stable identity for"
+    echo "  macOS's mic-permission (TCC) system, so access prompts reliably and persists"
     echo "  across restarts. Requires Xcode Command Line Tools (swiftc)."
-    read -r -p "Build the mic-permission wrapper app now (recommended)? [Y/n]: " BUILD_WRAPPER
-    if [[ ! "$BUILD_WRAPPER" =~ ^[Nn] ]]; then
-        if bash "$SKILL_DIR/RealTimeTalk-build-wrapper-mac.sh"; then
-            USE_WRAPPER=true
-            green "  ✓ wrapper built at $WRAPPER_APP"
-        else
-            yellow "  ✗ wrapper build failed — continuing with a bare python3 LaunchAgent."
-            yellow "    Retry later with: bash $SKILL_DIR/RealTimeTalk-build-wrapper-mac.sh"
-        fi
+    if bash "$SKILL_DIR/RealTimeTalk-build-wrapper-mac.sh"; then
+        USE_WRAPPER=true
+        green "  ✓ wrapper built at $WRAPPER_APP"
     else
-        yellow "  → Skipped. Build later with: bash $SKILL_DIR/RealTimeTalk-build-wrapper-mac.sh"
+        red "  ✗ wrapper build failed — the install needs it. Fix the error above"
+        red "    (usually: xcode-select --install) and re-run this installer, or pass"
+        red "    --no-wrapper to continue with a bare python3 LaunchAgent."
+        exit 1
     fi
 fi
 echo

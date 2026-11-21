@@ -53,7 +53,7 @@ internals, see [SKILL.md](SKILL.md).
 ├── dtmf_monitor.py                 # standalone DTMF Mon/Train/Retrain CLI (launched from the dashboard)
 ├── requirements.txt                # Python deps (installed into venv/)
 ├── RealTimeTalk-install-mac.sh     # installer — run once
-├── RealTimeTalk-build-wrapper-mac.sh   # builds the mic-permission wrapper app — run once, optional but recommended
+├── RealTimeTalk-build-wrapper-mac.sh   # builds the mic-permission wrapper app — run automatically by the installer (§5.6)
 ├── RealTimeTalk-toggle.sh          # start/stop/restart/disable/enable/status/log/devices — day-to-day control
 ├── ai.openclaw.realtimetalk.plist  # LaunchAgent template — installer copies + fills this in
 ├── test_speak.py                   # standalone TTS smoke-test script
@@ -67,7 +67,7 @@ internals, see [SKILL.md](SKILL.md).
 | Path | Purpose |
 |---|---|
 | `~/Library/LaunchAgents/ai.openclaw.realtimetalk.plist` | The actual LaunchAgent — a filled-in copy of the template above |
-| `~/Applications/RealTimeTalk.app` | Mic-permission wrapper (§5), if you build it |
+| `~/Applications/RealTimeTalk.app` | Mic-permission wrapper (§5), built by the installer |
 | `/tmp/openclaw/realtimetalk.log` | stdout+stderr log — `tail -f` this for everything |
 
 ### Runtime state (created by the daemon itself, first run)
@@ -286,7 +286,7 @@ Then open **http://localhost:19000/dashboard**.
 
 ---
 
-## 5. Microphone permissions (recommended)
+## 5. Microphone permissions (wrapper app)
 
 A bare `python3` process launched by a LaunchAgent has no stable app
 identity for macOS's TCC (privacy) subsystem — microphone access can fail
@@ -295,15 +295,16 @@ repo works around it with a small signed wrapper app that requests mic
 access under its own stable bundle identity before launching the daemon
 as a child process.
 
-**`RealTimeTalk-install-mac.sh` §5.6 now builds and wires this in for you**
+**`RealTimeTalk-install-mac.sh` §5.6 builds and wires this in for you**
 on a fresh install: it checks whether `~/Applications/RealTimeTalk.app`
-already exists, and if not, offers to run
-`RealTimeTalk-build-wrapper-mac.sh` and renders the LaunchAgent plist to
+already exists, and if not, runs
+`RealTimeTalk-build-wrapper-mac.sh` (no prompt — it is required; a failed
+build stops the install, and `--no-wrapper` skips it, not recommended) and renders the LaunchAgent plist to
 launch the wrapper binary directly — skipping the manual plist edit and
 reload below entirely. Re-running the installer later (e.g. to change
 devices) detects the existing wrapper and keeps it wired in rather than
 reverting to bare `python3`. The steps below are for building or wiring it
-in by hand — e.g. if you said no to the installer's prompt, or `SKILL_DIR`
+in by hand — e.g. if you installed with `--no-wrapper`, or `SKILL_DIR`
 moved and the baked-in paths need refreshing.
 
 ```bash

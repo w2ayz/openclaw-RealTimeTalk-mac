@@ -1,5 +1,18 @@
 # Changelog
 
+## [3.31.3] — 2026-11-20
+
+### Changed
+
+- **Mac installer now builds the mic-permission wrapper unconditionally** —
+  `RealTimeTalk-install-mac.sh` §5.6 no longer asks "Build the wrapper? [Y/n]".
+  It builds `RealTimeTalk.app` (or keeps an existing one) and wires the
+  LaunchAgent to it; a failed build now stops the install instead of silently
+  falling back to a bare `python3` LaunchAgent. New `--no-wrapper` flag skips
+  it (not recommended — mic access may not prompt or persist). `DEPLOYMENT.md`
+  §5 updated. The Pi fork has no wrapper; bumped to 3.31.3 for version lock
+  only.
+
 ## [3.31.2] — 2026-11-20
 
 ### Changed

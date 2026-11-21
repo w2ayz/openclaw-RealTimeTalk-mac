@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.31.2"
+__version__ = "3.31.3"
 
 # Dashboard header logo: voice-bar icon + RealTimeTalk with R/T/T enlarged and
 # the version in small type. Built from __version__ so it never goes stale.
