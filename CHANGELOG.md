@@ -1,5 +1,15 @@
 # Changelog
 
+## [3.31.2] — 2026-11-20
+
+### Changed
+
+- **RealTimeTalk.app icon** — the wrapper's icon (`assets/RealTimeTalk-icon.svg`)
+  now uses the five-bar voice icon from the dashboard logo, sky blue on the
+  existing dark navy squircle, instead of the two arcs and dot. Rebuilt with
+  `RealTimeTalk-build-wrapper-mac.sh`. The Pi fork has no app wrapper; bumped
+  to 3.31.2 for version lock only.
+
 ## [3.31.1] — 2026-11-20
 
 ### Changed
