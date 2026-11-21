@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.30.5"
+__version__ = "3.31.0"
 
 import argparse
 import asyncio
@@ -291,6 +291,7 @@ CAL_NEW_DEV_VOL   = 0.01         # Vol+SW for first-seen devices — start at mi
 CAL_NEW_DEV_SYS_VOL = 1          # macOS system volume (%) for new/unrecognised devices
 CAL_STORE_FILE    = os.path.expanduser("~/.openclaw/workspace/speaker_cal_store.json")
 DEVICE_PREFS_FILE = os.path.expanduser("~/.openclaw/workspace/device_prefs.json")
+MIC_GATE_STORE_FILE = os.path.expanduser("~/.openclaw/workspace/mic_gate_store.json")
 SLEEP_STATE_FILE  = os.path.expanduser("~/.openclaw/workspace/rtt_sleep_state.json")
 # Speaker verification (owner-only mode) — 3D-Speaker CAM++ zh-en model via
 # sherpa-onnx. Embeddings gate transcripts so only the enrolled owner's voice
@@ -646,6 +647,15 @@ def _ptt_alive() -> bool:
         return False
     found = _radio.find_radio_port()
     return bool(found and found[0].name == _active_radio_iface[0].name)
+
+
+def _radio_present() -> bool:
+    """True while a radio interface (AIOC) is physically connected, per the
+    hotplug watcher's serial-port check. Deliberately NOT
+    _radio.find_radio_audio_devices(): sounddevice's device list is cached
+    per-process and goes stale on unplug (and plug-in) until PortAudio is
+    reinitialized, so it can't be used to decide whether to hide UI."""
+    return bool(_radio_last_seen_connected[0])
 
 
 def _radio_hotplug_watcher(session_ref: list) -> None:
@@ -1838,6 +1848,8 @@ def _get_device_status() -> dict:
         "radio_active":    _radio_profile_active[0],
         "monitor_active":  _radio_monitor_active[0],
         "echotest_active": _echotest_active[0],
+        "radio_present":   _radio_present(),
+        "mic_gate_pending": _mic_gate_pending[0],
     }
     try:
         in_dev  = _selected_input_device[0]
@@ -3602,6 +3614,53 @@ def _save_device_cal(device_name: str, sw_vol: float, sys_vol: int = None) -> No
     _save_cal_store()
     log.info("Saved calibration for %r: Vol=%s%% SW=%.2f",
              device_name, sys_vol if sys_vol is not None else "?", sw_vol)
+
+# ── Per-input-device mic noise gate ──────────────────────────────────────────
+# Separate from _cal_store: that one is keyed by OUTPUT device name, and an
+# AIOC shows up as both an input and an output with the same name.
+
+_mic_gate_store: dict = {}      # {input_device_name: {"gate": int, "t": epoch}}
+_mic_gate_pending: list = [""]  # input name with no saved gate yet (dashboard prompts to calibrate)
+
+def _load_mic_gate_store() -> None:
+    global _mic_gate_store
+    try:
+        with open(MIC_GATE_STORE_FILE) as f:
+            _mic_gate_store = json.load(f)
+        log.info("Loaded mic gate store: %d device(s)", len(_mic_gate_store))
+    except (FileNotFoundError, json.JSONDecodeError):
+        _mic_gate_store = {}
+
+def _remember_mic_gate(gate: int, device_name: str = None) -> None:
+    """Record the current noise gate for an input device (default: the selected one)."""
+    name = device_name or _current_input_device_name()
+    if not name:
+        return
+    _mic_gate_store[name] = {"gate": int(gate), "t": time.time()}
+    if _mic_gate_pending[0] == name:
+        _mic_gate_pending[0] = ""
+    try:
+        os.makedirs(os.path.dirname(MIC_GATE_STORE_FILE), exist_ok=True)
+        with open(MIC_GATE_STORE_FILE, "w") as f:
+            json.dump(_mic_gate_store, f, indent=2)
+    except Exception as e:
+        log.warning("Could not save mic gate store: %s", e)
+
+def _restore_mic_gate_for(device_name: str) -> bool:
+    """Apply the saved gate for an input device. Returns False for an unknown
+    mic: the current gate is kept and the dashboard is asked to prompt."""
+    entry = _mic_gate_store.get(device_name)
+    if entry:
+        g = int(entry["gate"])
+        _mic_gate_ref[0] = g
+        globals()['MIC_GATE_PEAK'] = g
+        _mic_gate_pending[0] = ""
+        log.info("Restored mic gate %d for %r", g, device_name)
+        return True
+    _mic_gate_pending[0] = device_name
+    log.info("No saved mic gate for %r — keeping %d, dashboard will prompt to calibrate",
+             device_name, _mic_gate_ref[0])
+    return False
 
 def _apply_device_cal(device_name: str) -> bool:
     """Apply saved Vol + SW for an output device, or safe defaults if unknown.
@@ -5995,6 +6054,7 @@ class BaseVoiceSession:
         noise_peak, new_gate = _gate_from_peaks(peaks)
         MIC_GATE_PEAK = new_gate
         _save_trusted_gate(new_gate)
+        _remember_mic_gate(new_gate)
         log.info("Calibration: noise_peak=%d → MIC_GATE_PEAK=%d", noise_peak, new_gate)
         # Persist to service file so it survives restarts
         _update_service_gate(new_gate)
@@ -7507,6 +7567,10 @@ def _switch_mic_stream(session, new_idx: int) -> None:
     """
     import time as _t
     log.info("Switching mic stream → device %d", new_idx)
+    try:
+        _restore_mic_gate_for(sd.query_devices(new_idx)["name"])
+    except Exception as _e:
+        log.warning("Mic gate restore skipped: %s", _e)
 
     # Reset the watchdog timestamp first so _watch_mic_stream doesn't
     # trigger its own recovery while we're mid-switch.
@@ -7705,7 +7769,7 @@ def _dashboard_dynamic(sess) -> dict:
     device_panel = (
         f'<div id="dp">'
         f'&#127908; {_ds["mic"]} &ensp;'
-        f'&#128266; {_ds["speaker_name"]} &middot; Vol {_ds["spk_vol"]} &middot; SW {_ds["sw_pct"]}% &ensp;'
+        f'&#128266; {_ds["speaker_name"]} &middot; System Vol {_ds["spk_vol"]} &middot; Software Vol {_ds["sw_pct"]}% &ensp;'
         f'Gate {_ds["gate"]} &middot; Gain {_ds["gain"]}x'
         f' &ensp;&#128483; TTS: {_tts_seg}'
         f' &ensp;&#127897; STT: {_stt_eng}'
@@ -8548,8 +8612,6 @@ function confirmClear(btn, device) {{
                     is_headset = False
                 else:
                     is_headset = _detect_headset()
-                _mode_label = ("Headset" if is_headset else "Speaker") + \
-                              (" (auto)" if _override is None else " (manual)")
                 ds = _get_device_status()
                 gate = _mic_gate_ref[0]
                 prev = _speaker_cal_result
@@ -8568,8 +8630,8 @@ function confirmClear(btn, device) {{
                     warn = ('<div class="warn">Mic cannot hear speaker — use Manual adjustment below.</div>'
                             ) if prev.get("status") == "no_mic" else ""
                     prev_html = (warn +
-                        f'<p>Last result: Vol <b>{vol_pct}%</b> + SW <b>{sw_pct}%</b></p>'
-                        f'<table class="snrtbl"><tr><th>Vol</th><th>SW</th><th>Mic SNR</th></tr>{spk_rows}</table>')
+                        f'<p>Last result: System Vol <b>{vol_pct}%</b> + Software Vol <b>{sw_pct}%</b></p>'
+                        f'<table class="snrtbl"><tr><th>System Vol</th><th>Software Vol</th><th>Mic SNR</th></tr>{spk_rows}</table>')
                 headset_notice = ('<p class="info" style="margin:4px 0;color:#fa0;">'
                     'Headset mode — use Manual adjustment to set volume.</p>'
                     ) if is_headset else ""
@@ -8578,7 +8640,7 @@ function confirmClear(btn, device) {{
 {headset_notice}
 <table style="border-collapse:collapse;margin:4px 0;width:100%;">
   <tr>
-    <td style="color:#5a7088;font-size:13px;width:32px;font-family:'JetBrains Mono',monospace;">Vol</td>
+    <td style="color:#5a7088;font-size:13px;width:110px;font-family:'JetBrains Mono',monospace;">System Vol</td>
     <td style="font-weight:bold;font-size:1.1em;width:62px;font-family:'JetBrains Mono',monospace;" id="volval">{ds["spk_vol"]}</td>
     <td><div class="row" style="margin:0;gap:5px;">
       <button class="bQ" onclick="adjVol(-10)">− Quieter</button>
@@ -8586,7 +8648,7 @@ function confirmClear(btn, device) {{
     </div></td>
   </tr>
   <tr>
-    <td style="color:#5a7088;font-size:13px;font-family:'JetBrains Mono',monospace;">SW</td>
+    <td style="color:#5a7088;font-size:13px;font-family:'JetBrains Mono',monospace;">Software Vol</td>
     <td style="font-weight:bold;font-size:1.1em;font-family:'JetBrains Mono',monospace;" id="swval">{ds["sw_pct"]}%</td>
     <td><div class="row" style="margin:0;gap:5px;">
       <button class="bQ" onclick="adjSW(-10)">− Softer</button>
@@ -8596,7 +8658,7 @@ function confirmClear(btn, device) {{
   <tr>
     <td style="color:#5a7088;font-size:13px;font-family:'JetBrains Mono',monospace;">Eff</td>
     <td style="font-weight:bold;font-size:1.1em;color:#34d399;font-family:'JetBrains Mono',monospace;" id="effval">{ds["effective_pct"]}%</td>
-    <td style="color:#5a7088;font-size:12px;">Vol × SW combined</td>
+    <td style="color:#5a7088;font-size:12px;">System Vol × Software Vol combined</td>
   </tr>
 </table>
 <div class="row" style="margin:4px 0;">
@@ -8612,6 +8674,12 @@ function confirmClear(btn, device) {{
 {prev_html}
 <div class="row"><button id="acbtn" onclick="runCal()">Run auto calibration</button></div>
 </div>""")
+                _mic_pending_html = (
+                    '<div id="micpending" class="warn">New mic <b>' + _mic_gate_pending[0] + '</b> has no saved noise gate '
+                    '(using ' + str(gate) + ' from the previous mic). '
+                    '<button onclick="startMicCal()" style="padding:3px 10px;font-size:12px;">Calibrate now (3 sec quiet)</button> '
+                    '<button onclick="keepMicGate()" style="padding:3px 10px;font-size:12px;">Keep ' + str(gate) + '</button></div>'
+                ) if _mic_gate_pending[0] else ""
                 _voice_current_device = _current_input_device_name()
                 _voice_enrolled = _voice_current_device in _owner_profiles
                 _voice_owner_only = _owner_only[0]
@@ -8633,10 +8701,9 @@ function confirmClear(btn, device) {{
                           f"({len(_owner_profiles)} device(s) enrolled total)",
                     chk="&nbsp;&#10003;" if _voice_owner_only else "",
                 )
-                # Radio + Monitor render unconditionally (matches Pi exactly);
-                # DTMF/EchoTest are gated on _radio_profile_active[0], also
-                # matching Pi exactly — hardware presence alone doesn't show
-                # them, only actually having Radio Mode on does.
+                # The whole radio row is gated on AIOC presence (see _radio_row);
+                # within it, DTMF/EchoTest additionally need _radio_profile_active[0]
+                # — hardware presence alone doesn't show them, Radio Mode on does.
                 _radio_btn = (
                     '<button id="radiobtn" onclick="toggleRadioMode()" '
                     'style="padding:4px 11px;font-size:13px;'
@@ -8653,14 +8720,14 @@ function confirmClear(btn, device) {{
                     + ('color:#34d399;border-color:#34d399;background:#021a0e;'
                        if _radio_monitor_active[0] else
                        'color:#475569;border-color:#334155;')
-                    + '" title="Live RX passthrough: radio audio in &#8594; speaker out">'
-                    + '&#128266; Monitor' + ('&nbsp;&#10003;' if _radio_monitor_active[0] else '')
+                    + '" title="Radio Listen: play received radio audio (AIOC in) through a local speaker">'
+                    + '&#128266; Radio Listen' + ('&nbsp;&#10003;' if _radio_monitor_active[0] else '')
                     + '</button>'
                 )
                 _config_btn = (
-                    '<button id="configbtn" onclick="toggleConfigPanel()" '
+                    '<button id="configbtn" onclick="openRttConfig()" '
                     'style="padding:4px 11px;font-size:13px;color:#38bdf8;border-color:#38bdf8;" '
-                    'title="Show the command to add/change STT/TTS keys, engine order, or vocabulary">'
+                    'title="Open Terminal with the RTT-Config command typed in — press Enter to run it (add/change STT/TTS keys, engine order, vocabulary)">'
                     '&#9881; RTT-Config'
                     '</button>'
                 )
@@ -8689,6 +8756,13 @@ function confirmClear(btn, device) {{
                     + '&#9654; EchoTest' + ('&nbsp;&#10003;' if _echotest_active[0] else '')
                     + '</button>'
                 ) if _radio_profile_active[0] else ""
+                # Whole radio row is hidden unless an AIOC is present. Radio Mode
+                # being on counts too, so it can still be switched off if the
+                # hardware vanished while it was active.
+                _radio_row = (
+                    '<div class="radiorow">' + _radio_btn + _monitor_btn
+                    + _echotest_btn + _dtmf_btns + '</div>'
+                ) if (_radio_present() or _radio_profile_active[0]) else ""
                 body = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Calibration — RealTimeTalk</title>
@@ -8714,6 +8788,8 @@ canvas{{width:100%;height:38px;border-radius:5px;display:block;margin:6px 0;}}
 #calstatus{{margin:4px 0;font-size:13px;min-height:16px;color:var(--mu);font-family:'JetBrains Mono',monospace;}}
 #mstatus{{margin-top:4px;font-size:13px;color:var(--mu);}}
 .row{{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0;}}
+.radiorow{{display:flex;gap:6px;margin:0 0 10px;flex-wrap:nowrap;}}
+.radiorow>button,.radiorow>a{{flex:0 1 auto;min-width:0;white-space:nowrap;padding:4px 8px!important;font-size:12px!important;overflow:hidden;text-overflow:ellipsis;}}
 button{{padding:7px 14px;border:1px solid var(--bd);color:var(--mu);background:var(--sf2);border-radius:8px;font-family:'Outfit',sans-serif;font-size:14px;font-weight:500;cursor:pointer;transition:border-color .12s,color .12s,background .12s;}}
 button:hover{{border-color:var(--you);color:var(--you);background:#1e2d3d;}}
 button:disabled{{opacity:.4;cursor:default;border-color:var(--bd);color:var(--mu);background:var(--sf2);}}
@@ -8748,23 +8824,15 @@ a:hover{{text-decoration:underline;}}
 </div>
 <div class="devpanel" id="curdev">
   <b>Mic:</b> {ds["mic"]} &nbsp;&middot;&nbsp; Gate: <span id="panelgate">{ds["gate"]}</span> &nbsp;&middot;&nbsp; Gain: {ds["gain"]}x<br>
-  <b>Speaker:</b> {ds["speaker_name"]} &nbsp;&middot;&nbsp; Vol: <span id="panelvol">{ds["spk_vol"]}</span> &nbsp;&middot;&nbsp; SW: <span id="panelsw">{ds["sw_pct"]}%</span> &nbsp;&middot;&nbsp; <b>Eff: <span id="paneleff" style="color:var(--gn)">{ds["effective_pct"]}%</span></b>
+  <b>Speaker:</b> {ds["speaker_name"]} &nbsp;&middot;&nbsp; Sys Vol: <span id="panelvol">{ds["spk_vol"]}</span> &nbsp;&middot;&nbsp; SW Vol: <span id="panelsw">{ds["sw_pct"]}%</span> &nbsp;&middot;&nbsp; <b>Eff: <span id="paneleff" style="color:var(--gn)">{ds["effective_pct"]}%</span></b>
 </div>
 <div style="display:flex;align-items:center;gap:8px;margin:4px 0 10px;flex-wrap:wrap;">
   <span style="font-size:12px;color:var(--mu);font-family:'JetBrains Mono',monospace;">Cal mode:</span>
-  <b style="font-size:13px;color:{'#f59e0b' if is_headset else '#34d399'};">{_mode_label}</b>
-  <button onclick="setCalMode('headset')" style="padding:4px 11px;font-size:13px;{'color:#f59e0b;border-color:#f59e0b;background:#130e02;' if is_headset and _override else ''}">Headset</button>
-  <button onclick="setCalMode('speaker')" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if not is_headset and _override else ''}">Speaker</button>
-  <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
+  <button id="calmodebtn" onclick="setCalMode('{'speaker' if is_headset else 'headset'}')" style="padding:4px 11px;font-size:13px;{'color:#f59e0b;border-color:#f59e0b;background:#130e02;' if is_headset else 'color:#34d399;border-color:#34d399;background:#021a0e;'}" title="Click to switch to {'Speaker' if is_headset else 'Headset'} mode. Headset hides Auto calibration (the mic cannot hear a headset).">{'&#127911; Headset' if is_headset else '&#128266; Speaker'}{'' if _override is None else '&nbsp;&#9998;'}</button>
   {_voice_id_btn}
   {_config_btn}
 </div>
-<div style="display:flex;align-items:center;gap:8px;margin:0 0 10px;flex-wrap:nowrap;overflow-x:auto;white-space:nowrap;">
-  {_radio_btn}
-  {_monitor_btn}
-  {_echotest_btn}
-  {_dtmf_btns}
-</div>
+{_radio_row}
 <div id="configpanel" style="display:none;background:var(--sf2);border:1px solid #38bdf8;border-radius:var(--r);padding:10px 12px;margin:0 0 10px;">
   <div style="font-size:13px;color:var(--tx);margin-bottom:6px;">
     Run this in a terminal to add/change STT or TTS keys, reorder the TTS engine chain, or extend the STT vocabulary — safe to re-run anytime:
@@ -8785,6 +8853,7 @@ a:hover{{text-decoration:underline;}}
 </div>
 <div class="sect"><h4>Mic calibration</h4>
 <p class="info">Yellow line = gate threshold. Speech above passes; noise below is silenced.</p>
+{_mic_pending_html}
 <canvas id="meter" height="36"></canvas>
 <div id="micinfo"></div>
 <div style="display:flex;align-items:center;gap:8px;margin:6px 0;">
@@ -8811,6 +8880,8 @@ const MAX=32768, gate0={gate};
 let _lastRadioActive={str(_radio_profile_active[0]).lower()};
 let _lastMonitorActive={str(_radio_monitor_active[0]).lower()};
 let _lastEchotestActive={str(_echotest_active[0]).lower()};
+let _lastMicPending={json.dumps(_mic_gate_pending[0])};
+let _lastRadioPresent={str(_radio_present() or _radio_profile_active[0]).lower()};
 let calRunning=false;
 const canvas=document.getElementById('meter');
 const ctx=canvas.getContext('2d');
@@ -8858,6 +8929,9 @@ function saveGate(val){{
     document.getElementById('gateval').textContent=d.gate;
   }});
 }}
+function keepMicGate(){{
+  fetch('/mic-gate/keep').then(()=>{{const m=document.getElementById('micpending'); if(m) m.remove();}});
+}}
 function startMicCal(){{
   calRunning=true; micbtn.disabled=true;
   let secs=3; micinfo.textContent='Stay quiet… '+secs+'s';
@@ -8869,6 +8943,7 @@ function startMicCal(){{
       micinfo.textContent=d.error;
       return;
     }}
+    const mp=document.getElementById('micpending'); if(mp) mp.remove();
     micresult.style.display='block';
     micresult.innerHTML='Done! New gate: <b>'+d.gate+'</b> (noise peak: '+d.noise_peak+')';
     micinfo.textContent='Yellow line updated.';
@@ -8904,7 +8979,9 @@ function upd(){{fetch('/speaker-cal/vol').then(r=>r.json()).then(d=>{{
   // no click on this page — reload to pick up the buttons/sections that
   // depend on it once noticed, rather than requiring a manual refresh.
   if(d.radio_active!==_lastRadioActive || d.monitor_active!==_lastMonitorActive
-     || d.echotest_active!==_lastEchotestActive){{
+     || d.echotest_active!==_lastEchotestActive
+     || (d.radio_present||d.radio_active)!==_lastRadioPresent
+     || (d.mic_gate_pending||'')!==_lastMicPending){{
     location.reload();
   }}
 }});}}
@@ -8920,7 +8997,7 @@ function stopLoop(){{fetch('/speaker-cal/loop-stop').then(()=>{{
   const m=document.getElementById('mstatus');if(m)m.textContent='Stopped.';}});}}
 function setLevel(){{fetch('/speaker-cal/set').then(r=>r.json()).then(d=>{{
   const m=document.getElementById('mstatus');
-  if(m)m.textContent='Level saved: Vol '+d.spk_vol+' × SW '+d.sw_pct+'% = '+d.effective_pct+'% effective';
+  if(m)m.textContent='Level saved: System Vol '+d.spk_vol+' × Software Vol '+d.sw_pct+'% = '+d.effective_pct+'% effective';
   stopLoop(); setTimeout(()=>location.href='/dashboard',3000);}});}}
 function runCal(){{
   stopLoop();
@@ -8930,7 +9007,7 @@ function runCal(){{
   fetch('/speaker-cal/run').then(r=>r.json()).then(d=>{{
     if(btn)btn.disabled=false;
     if(st)st.innerHTML=d.status=='no_mic'?'Mic cannot hear speaker — adjust manually.':
-      'Set to PW <b>'+d.safe_vol+'%</b> SW <b>'+Math.round(d.safe_sw_vol*100)+'%</b>';
+      'Set to System Vol <b>'+d.safe_vol+'%</b> Software Vol <b>'+Math.round(d.safe_sw_vol*100)+'%</b>';
     setTimeout(()=>location.reload(),4000);
   }}).catch(e=>{{if(btn)btn.disabled=false;if(st)st.textContent='Error: '+e;}});
 }}
@@ -8970,15 +9047,25 @@ function toggleRadioMonitor(){{
     if(!b)return;
     if(d.active){{
       b.style.color='#34d399';b.style.borderColor='#34d399';b.style.background='#021a0e';
-      b.innerHTML='&#128266; Monitor&nbsp;&#10003;';
+      b.innerHTML='&#128266; Radio Listen&nbsp;&#10003;';
     }} else {{
       b.style.color='#475569';b.style.borderColor='#334155';b.style.background='';
-      b.innerHTML='&#128266; Monitor';
+      b.innerHTML='&#128266; Radio Listen';
     }}
   }});
 }}
 /* --- Device selection --- */
 let _devExpanded=false, _devTimer=null;
+function openRttConfig(){{
+  // Opens Terminal on the daemon's Mac with the command pre-typed; if that
+  // isn't possible (remote browser, no Terminal) fall back to the copy panel.
+  fetch('/rtt-config-open').then(r=>r.json()).then(d=>{{
+    if(!d.ok){{
+      const p=document.getElementById('configpanel');
+      p.style.display='block';
+    }}
+  }}).catch(()=>{{document.getElementById('configpanel').style.display='block';}});
+}}
 function toggleConfigPanel(){{
   const p=document.getElementById('configpanel');
   p.style.display=(p.style.display==='none')?'block':'none';
@@ -9019,7 +9106,7 @@ function loadDevices(){{
     if(d.error){{out.innerHTML='<span style="color:#f55">Error: '+d.error+'</span>';return;}}
     let h='';
     h+='<p style="margin:4px 0 8px;color:#9cf;font-weight:bold">Speakers</p>';
-    h+='<table class="snrtbl"><tr><th>Name</th><th>Card</th><th>State</th><th></th><th>&#128266; Monitor</th></tr>';
+    h+='<table class="snrtbl"><tr><th>Name</th><th>Card</th><th>State</th><th></th>'+(d.radio_available?'<th>&#128266; Radio Listen</th>':'')+'</tr>';
     (d.sinks||[]).forEach(s=>{{
       if(s.name.startsWith('rtt_agc')||s.name.includes('monitor')) return;
       const active=(s.name===d.default_sink);
@@ -9036,10 +9123,10 @@ function loadDevices(){{
         +' onclick="setDevice(this.dataset.dtype,this.dataset.dname)"'
         +(active?' disabled':'')
         +'>'+(active?'Active':'Use')+'</button></td>'
-        +'<td>'+(d.radio_available
-          ?'<button class="use-btn'+(monHere?' active':'')+'" onclick="toggleMonitorFor(\\''+encodeURIComponent(s.desc||s.name)+'\\')">'
-           +(monHere?'&#10003; On':'On')+'</button>'
-          :'&mdash;')+'</td></tr>';
+        +(d.radio_available
+          ?'<td><button class="use-btn'+(monHere?' active':'')+'" onclick="toggleMonitorFor(\\''+encodeURIComponent(s.desc||s.name)+'\\')">'
+           +(monHere?'&#10003; On':'On')+'</button></td>'
+          :'')+'</tr>';
     }});
     h+='</table>';
     h+='<p style="margin:12px 0 8px;color:#9cf;font-weight:bold">Microphones</p>';
@@ -9075,10 +9162,10 @@ function toggleMonitorFor(name){{
     if(!b)return;
     if(d.active){{
       b.style.color='#34d399';b.style.borderColor='#34d399';b.style.background='#021a0e';
-      b.innerHTML='&#128266; Monitor&nbsp;&#10003;';
+      b.innerHTML='&#128266; Radio Listen&nbsp;&#10003;';
     }} else {{
       b.style.color='#475569';b.style.borderColor='#334155';b.style.background='';
-      b.innerHTML='&#128266; Monitor';
+      b.innerHTML='&#128266; Radio Listen';
     }}
   }});
 }}
@@ -9107,6 +9194,33 @@ function setCalMode(mode){{
 }}
 </script></body></html>"""
                 _html(self, 200, body)
+            elif self.path == "/rtt-config-open":
+                import json as _json, shlex as _shlex, subprocess as _sp
+                _ok = False
+                _local = self.client_address[0] in ("127.0.0.1", "::1")
+                if _local:
+                    # vared pre-fills the prompt with the command, so the user
+                    # only has to press Enter (nothing runs until then).
+                    _cmd = "bash " + _shlex.quote(RTT_CONFIG_SCRIPT)
+                    _sh = f"RTTCMD={_shlex.quote(_cmd)}; vared -p '$ ' RTTCMD; eval \"$RTTCMD\""
+                    try:
+                        _sp.run(["osascript",
+                                 "-e", "on run argv",
+                                 "-e", 'tell application "Terminal"',
+                                 "-e", "activate",
+                                 "-e", "do script (item 1 of argv)",
+                                 "-e", "end tell",
+                                 "-e", "end run", _sh],
+                                check=True, timeout=10, capture_output=True)
+                        _ok = True
+                    except Exception as exc:
+                        log.warning("RTT-Config Terminal launch failed: %s", exc)
+                resp = _json.dumps({"ok": _ok}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
             elif self.path.startswith("/cal-mode"):
                 import json as _json, urllib.parse as _up
                 qs   = _up.parse_qs(_up.urlparse(self.path).query)
@@ -9129,8 +9243,19 @@ function setCalMode(mode){{
                 _mic_gate_ref[0] = val
                 globals()['MIC_GATE_PEAK'] = val
                 _update_service_gate(val)
+                _remember_mic_gate(val)
                 log.info("Mic gate set to %d via slider", val)
                 resp = _json.dumps({"gate": val}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path == "/mic-gate/keep":
+                import json as _json
+                _remember_mic_gate(_mic_gate_ref[0], _mic_gate_pending[0] or None)
+                resp = _json.dumps({"gate": _mic_gate_ref[0]}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(resp)))
@@ -9174,6 +9299,7 @@ function setCalMode(mode){{
                 _save_trusted_gate(new_gate)
                 _mic_gate_ref[0] = new_gate
                 MIC_GATE_PEAK = new_gate
+                _remember_mic_gate(new_gate)
                 log.info("HTTP calibration: noise_peak=%d → gate=%d", noise_peak, new_gate)
                 _update_service_gate(new_gate)
                 # Speak confirmation only if a session is actually up to speak through —
@@ -9812,7 +9938,7 @@ Restart daemon after training to reload profiles.</p>
                         "monitor_active": _radio_monitor_active[0],
                         "monitor_out": (str(_radio_monitor_out_dev[0])
                                         if _radio_monitor_out_dev[0] is not None else None),
-                        "radio_available": bool(_radio.find_radio_audio_devices()),
+                        "radio_available": _radio_present(),
                     }
                 except Exception as e:
                     data = {"error": str(e)}
@@ -11210,12 +11336,22 @@ if __name__ == "__main__":
     # Sleeping-only listener window for the same constraint), so calibration
     # must fully open-measure-close before the daemon's real stream starts.
     _mic_gate_explicit = any(a == "--mic-gate" or a.startswith("--mic-gate=") for a in sys.argv)
-    if not args.no_auto_calibrate:
+    _load_mic_gate_store()
+    _startup_mic = _current_input_device_name()
+    _saved_mic_gate = _mic_gate_store.get(_startup_mic)
+    if not args.no_auto_calibrate and _saved_mic_gate:
+        # This mic was calibrated before — reuse its gate instead of
+        # re-measuring (recalibrate from the dashboard if the room changed).
+        MIC_GATE_PEAK = int(_saved_mic_gate["gate"])
+        log.info("Using saved mic gate %d for %r (skipping startup measurement)",
+                 MIC_GATE_PEAK, _startup_mic)
+    elif not args.no_auto_calibrate:
         try:
             _measured_gate = calibrate_mic(input_device=_selected_input_device[0],
                                             duration=2.0, verbose=False)
             _measured_gate = _vet_startup_gate(_measured_gate)
             MIC_GATE_PEAK = _measured_gate
+            _remember_mic_gate(_measured_gate, _startup_mic)
             log.info("Auto-calibrated mic gate for this boot: %d "
                      "(override with --mic-gate, or pass --no-auto-calibrate to stop "
                      "re-measuring on every restart)", _measured_gate)
@@ -11225,6 +11361,8 @@ if __name__ == "__main__":
                         MIC_GATE_PEAK)
 
     _mic_gate_ref[0] = MIC_GATE_PEAK
+    if args.no_auto_calibrate and _startup_mic and _startup_mic not in _mic_gate_store:
+        _mic_gate_pending[0] = _startup_mic
     log.info("Audio: in=%s out=%s gain=%.1f gate=%d",
              _device_label(_selected_input_device[0]),
              _device_label(_selected_output_device[0]),

@@ -1,5 +1,39 @@
 # Changelog
 
+## [3.31.0] — 2026-11-20
+
+### Added
+
+- **Per-input-device mic noise gate** — the gate is now saved per input device
+  (`~/.openclaw/workspace/mic_gate_store.json`) whenever it is set (slider,
+  Auto-calibrate, voice calibration, startup measurement) and restored whenever
+  the mic stream switches (Audio Devices picker, AIOC hotplug auto-enable,
+  Radio Mode off). Startup reuses a saved gate for the current mic instead of
+  re-measuring every boot. A mic with no saved gate keeps the current gate and
+  shows a "New mic … has no saved noise gate" notice on the Calibration page
+  with **Calibrate now** / **Keep N** buttons. Not ported to the Pi fork: its
+  WebRTC AGC path uses a fixed `AGC_MIC_GATE` for every mic, so there is no
+  per-mic gate to restore.
+- **RTT-Config opens Terminal** with the command pre-typed (zsh `vared`), so
+  only Enter is needed; falls back to the copy panel for remote browsers.
+  Mac-only — the Pi is headless/SSH.
+
+### Changed
+
+- **Radio buttons only show when a radio is connected** — the whole radio row
+  (Radio, Radio Listen, EchoTest, DTMF) is hidden unless the AIOC is present
+  (or Radio Mode is on) and appears/disappears live via the status poll. On
+  the Mac the check uses the hotplug watcher's serial state, not sounddevice's
+  per-process device cache, which goes stale on unplug. The row is a single
+  non-wrapping line. Ported to the Pi fork (v3.31.0, `find_radio_port()`).
+- **"Monitor" renamed "Radio Listen"** (button and Speakers table column; the
+  column is omitted when no radio is present) — the DTMF "monitoring" wake
+  mode is a different feature. Ported to Pi.
+- **Cal mode is now one toggle button** (Speaker / Headset, ✎ when manually
+  overridden) replacing the Headset / Speaker / Auto buttons. Ported to Pi.
+- **Volume labels**: Vol → System Vol, SW → Software Vol (Sys Vol / SW Vol in
+  the top panel). Ported to Pi.
+
 ## [3.30.5] — 2026-11-18
 
 ### Fixed
