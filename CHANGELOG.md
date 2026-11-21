@@ -1,5 +1,30 @@
 # Changelog
 
+## [3.31.5] — 2026-11-21
+
+### Changed
+
+- **Software Vol is now on a dB scale.** The dashboard position (1–100) maps to
+  0 dB … about −40 dB, so each +/− step of 10 is ~4 dB and sounds evenly spaced
+  (the old linear steps did almost nothing in the top half and jumped 20 dB at
+  the bottom). `_cal_sw_volume` and the saved `sw_vol` stay linear gains, so
+  existing calibrations keep their exact loudness — only the displayed
+  percentage and the step size changed (linear 0.7 now reads 92%, 0.2 reads 65%).
+  Helpers: `_sw_gain_to_pos` / `_sw_pos_to_gain`, `SW_DB_RANGE`.
+- **Removed the "Eff" (effective volume) readout** from the status panel and
+  speaker-calibration table; a product of percentages is meaningless on a log
+  scale. Audio gain is unchanged.
+
+### Fixed
+
+- **/speak readout cut off at the start.** A `replace` stream event arriving
+  while a `/speak` readout owned the turn called `StreamingSpeaker.reset()`,
+  which armed `_http_interrupt` and stopped the readout that had just begun
+  (whole reply parked behind Continue). `reset()` now takes `cut_playback`;
+  the `replace` handler passes `False` when `_speak_used_this_turn` is set.
+
+Version-lock bump with the Pi fork (same changes ported, adapted to its idioms).
+
 ## [3.31.4] — 2026-11-20
 
 ### Added

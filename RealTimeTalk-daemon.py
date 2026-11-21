@@ -32,7 +32,7 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.31.4"
+__version__ = "3.31.5"
 
 # Dashboard header logo: voice-bar icon + RealTimeTalk with R/T/T enlarged and
 # the version in small type. Built from __version__ so it never goes stale.
@@ -53,6 +53,7 @@ import collections
 import datetime
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -1842,17 +1843,35 @@ def _mac_notify(title: str, msg: str) -> None:
         pass
 
 
+# Software Vol is shown/stepped on a dB scale: position 100 = 0 dB, position 1 ≈ -40 dB,
+# so each dashboard step of 10 is ~4 dB. _cal_sw_volume and the saved sw_vol stay
+# LINEAR gains (0-1), so existing calibrations keep their loudness — only the
+# percentage shown to the user and the step size are logarithmic.
+SW_DB_RANGE = 40.0
+
+def _sw_gain_to_pos(gain: float) -> int:
+    """Linear SW gain (0-1) -> dashboard position 1-100 on the dB scale."""
+    if gain <= 0:
+        return 1
+    pos = 100.0 + 100.0 * (20.0 * math.log10(gain)) / SW_DB_RANGE
+    return max(1, min(100, int(round(pos))))
+
+def _sw_pos_to_gain(pos: float) -> float:
+    """Dashboard position 1-100 -> linear SW gain (0-1)."""
+    pos = max(1.0, min(100.0, float(pos)))
+    return 10.0 ** (((pos - 100.0) / 100.0) * SW_DB_RANGE / 20.0)
+
+
 def _get_device_status() -> dict:
     """Return current audio device info for the dashboard status panel."""
     vol_pct = _cal_sys_vol_pct[0]
-    sw_pct  = int(_cal_sw_volume * 100)
+    sw_pct  = _sw_gain_to_pos(_cal_sw_volume)
     result = {
         "mic": "?",
         "speaker_alsa": ALSA_OUTPUT,
         "speaker_name": "default output",
         "spk_vol":      f"{vol_pct}%",
         "sw_pct":       sw_pct,
-        "effective_pct": max(1, round(vol_pct * sw_pct / 100)),
         "loop_playing":  _headset_cal_loop[0],
         "gate": 500,
         "gain": 3.0,
@@ -2059,6 +2078,7 @@ def run_speaker_calibration(alsa_output: str = None,
     return {
         "safe_vol":     found_sys_vol,
         "safe_sw_vol":  found_sw,
+        "safe_sw_pct":  _sw_gain_to_pos(found_sw),
         "speaker_alsa": ALSA_OUTPUT,
         "measurements": measurements,
         "mic_source":   _device_label(in_dev),
@@ -5230,17 +5250,25 @@ class StreamingSpeaker:
             self._final_given = True
         log.info("Streaming speaker abandoned — /speak is reading this turn")
 
-    def reset(self):
+    def reset(self, cut_playback: bool = True):
         """Model restarted its answer (``replace`` event) — stop and discard the
-        current generation; a fresh pipeline starts on the next feed()."""
+        current generation; a fresh pipeline starts on the next feed().
+
+        cut_playback=False when a /speak readout owns this turn: whatever is
+        playing is that readout, not this speaker's audio, so arming
+        _http_interrupt would cut it (seen live: "please read it again" —
+        /speak started playing, a `replace` event arrived the same second,
+        and the readout was parked behind Continue)."""
         self._gen_stop.set()
-        _http_interrupt[0] = True       # cut any part that is mid-playback right now
+        if cut_playback:
+            _http_interrupt[0] = True   # cut any part that is mid-playback right now
         # If nothing was mid-playback the flag stays armed and used to cut the
         # REWRITTEN answer's first sentence ~2 s later ("HTTP interrupt —
         # stopping TTS (during guard)", whole reply parked behind Continue).
         # Mark it as reset-armed so the new generation's playback worker can
         # tell it apart from a real Stop and clear it before it plays.
-        _reset_armed[0] = True
+        if cut_playback:
+            _reset_armed[0] = True
         self._drain()
         with self._lock:
             self._buffered = ""
@@ -6858,7 +6886,8 @@ class BaseVoiceSession:
                     data = payload or {}
                     text = data.get("text") or ""
                     if data.get("replace"):
-                        speaker.reset()               # model restarted its answer
+                        # Don't cut playback if /speak is already reading this turn.
+                        speaker.reset(cut_playback=not _speak_used_this_turn[0])
                         with _live_speech_lock:
                             _live_speech[0] = None
                     if not text or _speak_used_this_turn[0]:
@@ -8634,10 +8663,10 @@ function confirmClear(btn, device) {{
                         snr = m.get("snr", 0)
                         col = "#5f5" if snr >= snr_target else "#aaa"
                         return (f'<tr><td>{m.get("vol","-")}%</td>'
-                                f'<td>{int(m.get("sw",1)*100)}%</td>'
+                                f'<td>{_sw_gain_to_pos(m.get("sw",1))}%</td>'
                                 f'<td style="color:{col}">SNR {snr:.1f}x</td></tr>')
                     spk_rows = "".join(_row(m) for m in prev.get("measurements", []))
-                    sw_pct  = int(prev.get("safe_sw_vol", 1.0) * 100)
+                    sw_pct  = _sw_gain_to_pos(prev.get("safe_sw_vol", 1.0))
                     vol_pct = prev.get("safe_vol", "-")
                     warn = ('<div class="warn">Mic cannot hear speaker — use Manual adjustment below.</div>'
                             ) if prev.get("status") == "no_mic" else ""
@@ -8666,11 +8695,6 @@ function confirmClear(btn, device) {{
       <button class="bQ" onclick="adjSW(-10)">− Softer</button>
       <button class="bL" onclick="adjSW(+10)">+ Louder</button>
     </div></td>
-  </tr>
-  <tr>
-    <td style="color:#5a7088;font-size:13px;font-family:'JetBrains Mono',monospace;">Eff</td>
-    <td style="font-weight:bold;font-size:1.1em;color:#34d399;font-family:'JetBrains Mono',monospace;" id="effval">{ds["effective_pct"]}%</td>
-    <td style="color:#5a7088;font-size:12px;">System Vol × Software Vol combined</td>
   </tr>
 </table>
 <div class="row" style="margin:4px 0;">
@@ -8836,7 +8860,7 @@ a:hover{{text-decoration:underline;}}
 </div>
 <div class="devpanel" id="curdev">
   <b>Mic:</b> {ds["mic"]} &nbsp;&middot;&nbsp; Gate: <span id="panelgate">{ds["gate"]}</span> &nbsp;&middot;&nbsp; Gain: {ds["gain"]}x<br>
-  <b>Speaker:</b> {ds["speaker_name"]} &nbsp;&middot;&nbsp; Sys Vol: <span id="panelvol">{ds["spk_vol"]}</span> &nbsp;&middot;&nbsp; SW Vol: <span id="panelsw">{ds["sw_pct"]}%</span> &nbsp;&middot;&nbsp; <b>Eff: <span id="paneleff" style="color:var(--gn)">{ds["effective_pct"]}%</span></b>
+  <b>Speaker:</b> {ds["speaker_name"]} &nbsp;&middot;&nbsp; Sys Vol: <span id="panelvol">{ds["spk_vol"]}</span> &nbsp;&middot;&nbsp; SW Vol: <span id="panelsw">{ds["sw_pct"]}%</span>
 </div>
 <div style="display:flex;align-items:center;gap:8px;margin:4px 0 10px;flex-wrap:wrap;">
   <span style="font-size:12px;color:var(--mu);font-family:'JetBrains Mono',monospace;">Cal mode:</span>
@@ -8972,18 +8996,14 @@ function startMicCal(){{
 function upd(){{fetch('/speaker-cal/vol').then(r=>r.json()).then(d=>{{
   const vv=document.getElementById('volval');
   const sv=document.getElementById('swval');
-  const ev=document.getElementById('effval');
   if(vv) vv.textContent=d.spk_vol;
   if(sv) sv.textContent=d.sw_pct+'%';
-  if(ev) ev.textContent=d.effective_pct+'%';
   // Keep top panel in sync
   const pv=document.getElementById('panelvol');
   const ps=document.getElementById('panelsw');
-  const pe=document.getElementById('paneleff');
   const pg=document.getElementById('panelgate');
   if(pv) pv.textContent=d.spk_vol;
   if(ps) ps.textContent=d.sw_pct+'%';
-  if(pe) pe.textContent=d.effective_pct+'%';
   if(pg) pg.textContent=d.gate;
   const bp=document.getElementById('btnPlay');
   if(bp) bp.disabled=d.loop_playing;
@@ -9009,7 +9029,7 @@ function stopLoop(){{fetch('/speaker-cal/loop-stop').then(()=>{{
   const m=document.getElementById('mstatus');if(m)m.textContent='Stopped.';}});}}
 function setLevel(){{fetch('/speaker-cal/set').then(r=>r.json()).then(d=>{{
   const m=document.getElementById('mstatus');
-  if(m)m.textContent='Level saved: System Vol '+d.spk_vol+' × Software Vol '+d.sw_pct+'% = '+d.effective_pct+'% effective';
+  if(m)m.textContent='Level saved: System Vol '+d.spk_vol+' · Software Vol '+d.sw_pct+'%';
   stopLoop(); setTimeout(()=>location.href='/dashboard',3000);}});}}
 function runCal(){{
   stopLoop();
@@ -9019,7 +9039,7 @@ function runCal(){{
   fetch('/speaker-cal/run').then(r=>r.json()).then(d=>{{
     if(btn)btn.disabled=false;
     if(st)st.innerHTML=d.status=='no_mic'?'Mic cannot hear speaker — adjust manually.':
-      'Set to System Vol <b>'+d.safe_vol+'%</b> Software Vol <b>'+Math.round(d.safe_sw_vol*100)+'%</b>';
+      'Set to System Vol <b>'+d.safe_vol+'%</b> Software Vol <b>'+d.safe_sw_pct+'%</b>';
     setTimeout(()=>location.reload(),4000);
   }}).catch(e=>{{if(btn)btn.disabled=false;if(st)st.textContent='Error: '+e;}});
 }}
@@ -9398,10 +9418,10 @@ setInterval(upd, 2000);
                             snr = m.get("snr", 0)
                             col = "#5f5" if snr >= snr_target else "#aaa"
                             return (f'<tr><td>{m.get("vol","-")}%</td>'
-                                    f'<td>{int(m.get("sw",1)*100)}%</td>'
+                                    f'<td>{_sw_gain_to_pos(m.get("sw",1))}%</td>'
                                     f'<td style="color:{col}">SNR {snr:.1f}×</td></tr>')
                         rows    = "".join(_row(m) for m in prev.get("measurements", []))
-                        sw_pct  = int(prev.get("safe_sw_vol", 1.0) * 100)
+                        sw_pct  = _sw_gain_to_pos(prev.get("safe_sw_vol", 1.0))
                         vol_pct = prev.get("safe_vol", "-")
                         warn = ('<div style="background:#5a1a00;border-radius:6px;padding:8px;'
                                 'margin-bottom:6px;">Mic cannot hear speaker — use Manual adjustment below.</div>'
@@ -9472,7 +9492,7 @@ function runCal(){{
     document.getElementById('btn').disabled=false;
     document.getElementById('status').innerHTML=
       (d.status=='no_mic' ? 'Mic cannot hear speaker — adjust manually.' :
-      'Set to Vol <b>'+d.safe_vol+'%</b> SW <b>'+Math.round(d.safe_sw_vol*100)+'%</b>');
+      'Set to Vol <b>'+d.safe_vol+'%</b> SW <b>'+d.safe_sw_pct+'%</b>');
     setTimeout(()=>location.reload(),4000);
   }}).catch(e=>{{
     document.getElementById('btn').disabled=false;
@@ -9514,7 +9534,7 @@ setInterval(upd, 2000);
                                    "Use Manual adjustment to set the volume.")
                         elif st == "ok":
                             msg = (f"Calibration done. "
-                                   f"Volume set to {vol} percent, software level {int(sw*100)} percent.")
+                                   f"Volume set to {vol} percent, software level {_sw_gain_to_pos(sw)} percent.")
                         else:
                             msg = ("Calibration could not complete. "
                                    "Speaker set to minimum. Use Manual adjustment.")
@@ -9857,9 +9877,9 @@ Restart daemon after training to reload profiles.</p>
                     return max(1, min(100, result))
 
                 if kind == "sw":
-                    cur_sw  = int(_cal_sw_volume * 100)
+                    cur_sw  = _sw_gain_to_pos(_cal_sw_volume)
                     new_sw  = _snap10(cur_sw, delta)
-                    globals()['_cal_sw_volume'] = new_sw / 100.0
+                    globals()['_cal_sw_volume'] = _sw_pos_to_gain(new_sw)
                 else:
                     cur_vol = _cal_sys_vol_pct[0]
                     new_vol = _snap10(cur_vol, delta)
@@ -10117,12 +10137,12 @@ Restart daemon after training to reload profiles.</p>
                     pass
                 _save_device_cal(out_name, sw_vol, sys_vol)
                 log.info("Manual cal saved: %r Vol=%d%% SW=%d%%",
-                         out_name, sys_vol, int(sw_vol * 100))
+                         out_name, sys_vol, _sw_gain_to_pos(sw_vol))
                 if sess:
                     import threading as _t3
                     _t3.Thread(
                         target=speak,
-                        args=(f"Audio settings saved. Volume {sys_vol} percent, software {int(sw_vol*100)} percent.",
+                        args=(f"Audio settings saved. Volume {sys_vol} percent, software {_sw_gain_to_pos(sw_vol)} percent.",
                               sess.alsa_output),
                         daemon=True,
                     ).start()
