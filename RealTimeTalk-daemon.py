@@ -32,7 +32,19 @@ Requires:
 
 from __future__ import annotations
 
-__version__ = "3.31.0"
+__version__ = "3.31.1"
+
+# Dashboard header logo: voice-bar icon + RealTimeTalk with R/T/T enlarged and
+# the version in small type. Built from __version__ so it never goes stale.
+_RTT_LOGO = (
+    '<span class="brand" role="img" aria-label="RealTimeTalk version ' + __version__ + '">'
+    '<svg width="22" height="22" viewBox="0 0 52 52" aria-hidden="true" fill="#38bdf8">'
+    '<rect x="3" y="20" width="6" height="12" rx="3"/><rect x="13" y="12" width="6" height="28" rx="3"/>'
+    '<rect x="23" y="4" width="6" height="44" rx="3"/><rect x="33" y="14" width="6" height="24" rx="3"/>'
+    '<rect x="43" y="21" width="6" height="10" rx="3"/></svg>'
+    '<span class="lgrow" aria-hidden="true"><span class="lg"><b>R</b>EAL<b>T</b>IME<b>T</b>ALK</span>'
+    '<span class="lv">v' + __version__ + '</span></span></span>'
+)
 
 import argparse
 import asyncio
@@ -10214,7 +10226,12 @@ html,body{{height:100%;}}
 body{{font-family:'Outfit',system-ui,sans-serif;font-size:16px;background:var(--bg);color:var(--tx);display:flex;flex-direction:column;overflow:hidden;-webkit-text-size-adjust:100%;}}
 #top{{flex-shrink:0;background:var(--sf);border-bottom:1px solid var(--bd);padding:10px 14px 8px;}}
 .hrow{{display:flex;align-items:center;gap:8px;margin-bottom:8px;}}
-.brand{{font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;color:var(--tx);letter-spacing:.08em;text-transform:uppercase;}}
+.brand{{display:inline-flex;align-items:center;gap:9px;font-family:'JetBrains Mono',monospace;font-weight:700;}}
+.brand svg{{flex:none}}
+.lgrow{{display:flex;align-items:baseline;gap:8px;white-space:nowrap}}
+.lg{{font-size:11px;color:#8aa0b8;letter-spacing:.08em}}
+.lg b{{font-size:20px;color:var(--you);font-weight:700;letter-spacing:0}}
+.lv{{font-size:10px;font-weight:500;color:#8aa0b8}}
 .spill{{margin-left:10px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:5px 14px;border-radius:20px;border:2px solid transparent;white-space:nowrap;}}
 .nav{{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:7px;}}
 a.btn{{display:inline-flex;align-items:center;gap:3px;padding:5px 9px;border-radius:7px;font-family:'Outfit',sans-serif;font-size:12px;font-weight:500;color:var(--mu);background:var(--sf2);border:1px solid var(--bd);text-decoration:none;min-height:28px;white-space:nowrap;transition:background .12s,border-color .12s,color .12s;}}
@@ -10286,7 +10303,7 @@ a.cnl:hover{{background:var(--mu);color:#000;}}
 @media(min-width:900px){{body{{font-size:17px;}}#top{{padding:14px 24px 10px;}}a.btn{{font-size:13px;padding:6px 12px;}}#dp{{font-size:13px;}}#log{{padding:14px 24px;}}}}
 </style></head><body>
 <div id="top">
-<div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" id="pill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" style="margin-left:10px;" data-hint="{_hint_calibrate}">&#9999; Calibrate</a><a href="#" class="btn" id="orderbtn" style="margin-left:6px;" data-hint="Flip the log between newest-on-top and newest-at-bottom (like a document)">&#11015; Newest first</a></div>
+<div class="hrow">{_RTT_LOGO}<span class="spill" id="pill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" style="margin-left:10px;" data-hint="{_hint_calibrate}">&#9999; Calibrate</a><a href="#" class="btn" id="orderbtn" style="margin-left:6px;" data-hint="Flip the log between newest-on-top and newest-at-bottom (like a document)">&#11015; Newest first</a></div>
 <div class="nav" id="navbar">{nav_html}</div>
 {device_panel}{device_banner}<div id="hzone" style="min-height:28px;padding:5px 10px;border-radius:8px;background:var(--sf2);border:1px solid var(--bd);color:var(--mu);font-size:15px;opacity:0;transition:opacity .15s;pointer-events:none;">&nbsp;</div></div>
 <div id="nowreading" hidden></div>

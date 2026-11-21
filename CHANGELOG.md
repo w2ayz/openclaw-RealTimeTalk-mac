@@ -1,5 +1,14 @@
 # Changelog
 
+## [3.31.1] — 2026-11-20
+
+### Changed
+
+- **Dashboard header logo** — the plain "● RealTimeTalk" title is now a logo:
+  a five-bar voice icon, REALTIMETALK in capitals with R, T and T enlarged in
+  sky blue, and the version number (from `__version__`) in small type at the
+  end. Mirrored on the Pi fork (v3.31.1).
+
 ## [3.31.0] — 2026-11-20
 
 ### Added
